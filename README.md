@@ -37,9 +37,10 @@ docker compose --profile serve up -d
 - **Decode benchmark** (HumanEval, n=256, direct engine): ~87 tok/s on dual RTX 3090 vs
   ~130 tok/s single-GPU reference in upstream `server/RESULTS.md` (Qwen3.5). Gap is mostly
   Qwen3.6 + dual-GPU draft placement; still ~2.3× over AR (~38 tok/s).
-- **PFlash** (speculative prefill for 16k+ prompts): optional — `./scripts/enable-pflash.sh`
-  then recreate. Default off: loading the 0.6B prefill drafter on GPU1 next to the DFlash draft
-  costs ~15% decode unless `DFLASH_LAZY=0` and threshold is high. Never set `DFLASH_LAZY=1` on dual-GPU.
+- **PFlash** (speculative prefill): defaults in `.env.example` target **agent turns** (`auto` @ 3k tokens).
+  - `./scripts/enable-pflash-agent.sh` — Hermes-sized prompts (~3k+); ~10× faster prefill, ~5% decode cost.
+  - `./scripts/enable-pflash.sh` — long context only (16k+ threshold); best decode on dual 3090.
+  Never set `DFLASH_LAZY=1` on dual-GPU.
 - **Power**: upstream sweet spot is `nvidia-smi -pl 220` (needs root on the host).
 - Image: `ghcr.io/luce-org/lucebox-hub:cuda12`
 - Watchdog and client API are in **ai-platform**, not this repo.

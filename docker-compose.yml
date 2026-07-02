@@ -49,11 +49,10 @@ services:
       DFLASH_DRAFT_GPU: ${DFLASH_DRAFT_GPU:-1}
       DFLASH_PEER_ACCESS: ${DFLASH_PEER_ACCESS:-1}
       DFLASH_PREFIX_CACHE_SLOTS: ${DFLASH_PREFIX_CACHE_SLOTS:-4}
-      # PFlash off by default for best decode on dual 3090. Enable for long-context
-      # agent workloads: DFLASH_PREFILL_MODE=auto DFLASH_PREFILL_THRESHOLD=16384
-      DFLASH_PREFILL_MODE: ${DFLASH_PREFILL_MODE:-off}
-      DFLASH_PREFILL_DRAFTER: ${DFLASH_PREFILL_DRAFTER:-}
-      DFLASH_PREFILL_THRESHOLD: ${DFLASH_PREFILL_THRESHOLD:-16384}
+      # Agent defaults in .env.example: PFlash auto @ 3k tokens. Long-context-only: threshold 16384.
+      DFLASH_PREFILL_MODE: ${DFLASH_PREFILL_MODE:-auto}
+      DFLASH_PREFILL_DRAFTER: ${DFLASH_PREFILL_DRAFTER:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/pflash/Qwen3-0.6B-BF16.gguf}
+      DFLASH_PREFILL_THRESHOLD: ${DFLASH_PREFILL_THRESHOLD:-3000}
       DFLASH_PREFILL_KEEP: ${DFLASH_PREFILL_KEEP:-0.10}
       DFLASH_LAZY: ${DFLASH_LAZY:-0}
     deploy:
