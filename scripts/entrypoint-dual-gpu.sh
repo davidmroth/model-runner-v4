@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# Tool-split path uses Python server_tools + test_dflash daemon (RESTORE_CHAIN / SNAPSHOT_THIN).
+if [ "${DFLASH_TOOL_SPLIT_ENABLED:-0}" = "1" ]; then
+  exec /scripts/entrypoint-tool-split-serve.sh "$@"
+fi
+
 STOCK="/opt/lucebox-hub/server/scripts/entrypoint.sh"
 PATCHED="/tmp/lucebox-entrypoint-dual-gpu.sh"
 MARKER="# model-runner-v4 dual-gpu patch v2"

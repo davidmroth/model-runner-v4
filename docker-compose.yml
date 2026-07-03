@@ -32,7 +32,11 @@ services:
     volumes:
       - ${MODEL_DIR:-../models-cache}:/opt/lucebox-hub/server/models
       - ./scripts/entrypoint-dual-gpu.sh:/scripts/entrypoint-dual-gpu.sh:ro
+      - ./scripts/entrypoint-tool-split-serve.sh:/scripts/entrypoint-tool-split-serve.sh:ro
+      - ${LUCEBOX_PATCH_DIR:-../lucebox-hub-patch/dflash/scripts}:/opt/lucebox-hub/patch/dflash/scripts:ro
+      - ${LUCEBOX_DFLASH_BUILD:-../lucebox-hub-src/dflash/build}:/opt/lucebox-hub/dflash-build:ro
     environment:
+      DFLASH_DAEMON_BIN: ${DFLASH_DAEMON_BIN:-/opt/lucebox-hub/dflash-build/test_dflash}
       DFLASH_TARGET: ${DFLASH_TARGET:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/unsloth-q4km/Qwen3.6-27B-Q4_K_M.gguf}
       DFLASH_DRAFT: ${DFLASH_DRAFT:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/dflash-lucebox/dflash-draft-3.6-q4_k_m.gguf}
       DFLASH_MODEL_NAME: ${DFLASH_MODEL_NAME:-dflash}
@@ -48,13 +52,19 @@ services:
       DFLASH_TARGET_GPU: ${DFLASH_TARGET_GPU:-0}
       DFLASH_DRAFT_GPU: ${DFLASH_DRAFT_GPU:-1}
       DFLASH_PEER_ACCESS: ${DFLASH_PEER_ACCESS:-1}
-      DFLASH_PREFIX_CACHE_SLOTS: ${DFLASH_PREFIX_CACHE_SLOTS:-4}
+      DFLASH_PREFIX_CACHE_SLOTS: ${DFLASH_PREFIX_CACHE_SLOTS:-1}
       # Agent defaults in .env.example: PFlash auto @ 3k tokens. Long-context-only: threshold 16384.
       DFLASH_PREFILL_MODE: ${DFLASH_PREFILL_MODE:-auto}
       DFLASH_PREFILL_DRAFTER: ${DFLASH_PREFILL_DRAFTER:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/pflash/Qwen3-0.6B-BF16.gguf}
       DFLASH_PREFILL_THRESHOLD: ${DFLASH_PREFILL_THRESHOLD:-3000}
       DFLASH_PREFILL_KEEP: ${DFLASH_PREFILL_KEEP:-0.10}
       DFLASH_LAZY: ${DFLASH_LAZY:-0}
+      DFLASH_PREFILL_CACHE_SLOTS: ${DFLASH_PREFILL_CACHE_SLOTS:-2}
+      DFLASH_TOOL_SPLIT_ENABLED: ${DFLASH_TOOL_SPLIT_ENABLED:-0}
+      DFLASH_TOOL_SPLIT_PROFILE: ${DFLASH_TOOL_SPLIT_PROFILE:-auto}
+      DFLASH_TOOL_SPLIT_PLUGIN_DIR: ${DFLASH_TOOL_SPLIT_PLUGIN_DIR:-}
+      DFLASH_TOOL_SPLIT_PINNED_SLOTS: ${DFLASH_TOOL_SPLIT_PINNED_SLOTS:-2}
+      DFLASH_TOOL_SPLIT_COMPRESS_CONV: ${DFLASH_TOOL_SPLIT_COMPRESS_CONV:-1}
     deploy:
       resources:
         reservations:
