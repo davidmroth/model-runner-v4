@@ -32,37 +32,63 @@ eliminated a 700ms/step cross-GPU feature copy and a ~13ms/step logits
 bridge. Decode got 2–9× faster — but the trade left 24GB of VRAM and a full
 GA102 die doing nothing.
 
-## 2. The Naive Idea, and Why It Fails
+### Interconnect: NVLink NV4 (measured)
+
+The two 3090s are bridged with NVLink, confirmed on the host:
+
+```
+$ nvidia-smi topo -m        →  GPU0 ↔ GPU1: NV4
+$ nvidia-smi nvlink -s      →  4 links × 14.062 GB/s per GPU
+```
+
+That is **~56 GB/s per direction (~112 GB/s bidirectional)** between the
+GPUs — roughly 2× the effective PCIe 4.0 x16 path. `DFLASH_PEER_ACCESS=1`
+is already set, so P2P copies route over the bridge. Every cross-GPU
+number in this document uses the measured NVLink figure, not PCIe.
+
+## 2. The Naive Idea, and Why It Fails (Even With NVLink)
 
 **"Use GPU1 exclusively for the KV cache."**
 
 The KV cache is not a passive buffer. Every attention layer reads the
 *entire attended KV window* on every forward pass. Compute must be where
-the data is:
+the data is — and the comparison that matters is not NVLink vs PCIe, it is
+NVLink vs **local VRAM**:
 
-| Path | Bandwidth |
-|---|---|
-| GPU0 VRAM ↔ GPU0 SMs (local) | **~936 GB/s** |
-| GPU0 ↔ GPU1 over PCIe 4.0 x16 (P2P) | ~16–32 GB/s |
+| Path | Bandwidth | Relative |
+|---|---|---|
+| GPU0 VRAM ↔ GPU0 SMs (local) | **~936 GB/s** | 1× |
+| GPU0 ↔ GPU1 over NVLink NV4 (measured) | ~56 GB/s | **~17× slower** |
+| GPU0 ↔ GPU1 over PCIe 4.0 x16 (P2P) | ~25–30 GB/s | ~35× slower |
 
 ```mermaid
 flowchart TD
-  subgraph bad["✗ Remote live KV (not viable)"]
+  subgraph bad["✗ Remote live KV (still not worth it)"]
     C0["GPU0: all 64 layers compute"]
     K1["GPU1: KV cache"]
-    C0 -- "entire KV window,<br/>every layer, every step<br/>over ~30GB/s PCIe" --> K1
+    C0 -- "entire KV window,<br/>every layer, every step<br/>~56GB/s NVLink (vs 936GB/s local)" --> K1
   end
-  bad --> R["Result: 30–60× bandwidth penalty on the<br/>hottest loop — decode collapses to low single-digit TPS"]
+  bad --> R["Result: ~25ms added per decode step at 24K ctx<br/>(optimistic streaming case) — all cost, zero gain"]
 ```
 
-At 24K context the TQ3 KV window is read by every one of 64 layers each
-decode step. Streaming that over PCIe instead of local VRAM would erase the
-entire tuning win and then some. This is why no mainstream engine (vLLM,
-TensorRT-LLM, llama.cpp) offers "KV on a different GPU than its layers" —
-KV placement always follows layer placement.
+Quantified at 24K context: one decode step reads on the order of 1–1.5 GB
+of TQ3 KV across all layers. Locally that is ~1.5ms of memory traffic
+folded into the ~110ms step. Pulled over NVLink it is **~25ms added per
+step** — and that is the optimistic streaming number. Attention's access
+pattern is latency-sensitive and scattered, so real-world remote-memory
+attention degrades worse than raw bandwidth suggests. 51 TPS at 24K would
+drop to roughly 35–40, in exchange for nothing: GPU0 still performs all
+the compute, so no resource is actually freed.
 
-**Verdict: not possible** in any useful form. The live KV must stay
-adjacent to the layers that consume it.
+NVLink therefore moves the verdict from *catastrophic* (PCIe) to *strictly
+worse than local* — mitigated, but never beneficial. This is why no
+mainstream engine (vLLM, TensorRT-LLM, llama.cpp) offers "KV on a
+different GPU than its layers": KV placement always follows layer
+placement. Where NVLink genuinely pays off is Options A and C below, which
+it makes cheaper and firmer respectively.
+
+**Verdict: not useful** in any form. The live KV must stay adjacent to the
+layers that consume it.
 
 ## 3. What GPU1 *Can* Do
 
@@ -86,23 +112,24 @@ flowchart LR
     S2["thin tool pins"]
     S3["PFlash slots"]
   end
-  KVa -- "P2P D2D restore<br/>(~2-4× faster than H2D)" --> gpu1a
-  gpu1a -- "P2P D2D snapshot" --> KVa
+  KVa -- "NVLink D2D restore<br/>(~56 GB/s vs ~12 GB/s H2D)" --> gpu1a
+  gpu1a -- "NVLink D2D snapshot" --> KVa
 ```
 
-| | CPU-RAM snapshots (today) | GPU1 snapshots |
+| | CPU-RAM snapshots (today) | GPU1 snapshots over NVLink |
 |---|---|---|
-| Restore path | host → device (~12 GB/s effective) | device → device P2P (~25 GB/s) |
-| Warm-turn saving | — | ~0.2–0.3s of the ~0.5s restore |
+| Restore path | host → device (~12 GB/s effective) | device → device NVLink (~56 GB/s) |
+| Warm-turn restore | ~0.5 s | **~0.1 s** |
 | Capacity ceiling | system RAM (effectively unlimited slots) | 24 GB — reintroduces a slot budget |
 | Failure mode | none new | OOM pressure returns at deep contexts |
 
-**Benefit: real but modest.** Restores happen once per turn and already
-cost ~0.5s against a turn that was 44s before caching. Shaving 250ms is a
-~6% warm-turn improvement, paid for with a capacity ceiling that CPU RAM
-doesn't have. Worth doing only after Option C, if at all — or as a *hybrid*
-(hot slots on GPU1, overflow to CPU RAM), which is the more interesting
-research shape.
+**Benefit: upgraded from marginal to worthwhile by NVLink.** With PCIe-only
+P2P this option shaved ~250ms per warm turn; the measured NV4 bridge makes
+restores ~4–5× faster than host-to-device, cutting the ~0.5s restore to
+~0.1s. The capacity trade remains — CPU RAM has no slot ceiling, GPU1 does
+— so the strongest shape is a **hybrid**: hot slots resident on GPU1,
+overflow (and everything during memory pressure) in CPU RAM. Snapshots are
+passive, so unlike §2 this use of remote VRAM has no per-step cost.
 
 ### Option B — Pin the PFlash drafter to GPU1
 
@@ -142,8 +169,11 @@ The dominant cost of every decode step is `verify_compute` — the batched
 target forward over the DDTree (60–85ms/step depending on context). Placing
 layers 0–31 on GPU0 and 32–63 on GPU1 puts both dies to work; KV for each
 half lives beside its layers, so the bandwidth argument from §2 doesn't
-apply. Only the small inter-layer activation crosses PCIe (~KB per step,
-not GB).
+apply. Only the small inter-layer activation crosses the interconnect
+(~KB per step, not GB) — and on this host that hop rides the measured
+NVLink NV4 bridge at ~56 GB/s with lower latency than PCIe, shrinking the
+split's overhead term and making the projections below firmer. NVLink is
+the standard fabric for exactly this pattern.
 
 ```mermaid
 flowchart LR
@@ -179,17 +209,21 @@ out to both shards atomically, and depth bookkeeping per shard.
 
 ## 4. Decision Matrix
 
+All rows assume the measured NVLink NV4 interconnect (~56 GB/s):
+
 | Option | Possible? | Effort | Decode TPS | Warm-turn latency | Risk |
 |---|---|---|---|---|---|
-| Live KV exclusively on GPU1 | **No** — bandwidth physics | — | catastrophic loss | — | — |
-| A: Snapshot store on GPU1 | Yes | Small | none | −0.2–0.3s | VRAM slot ceiling returns |
+| Live KV exclusively on GPU1 | **No** — ~17× slower than local VRAM even over NVLink | — | −20–30% (all cost, no gain) | — | — |
+| A: Snapshot store on GPU1 (hybrid w/ CPU RAM) | Yes | Small | none | −~0.4s (0.5s → 0.1s restore) | VRAM slot ceiling returns (mitigated by hybrid) |
 | B: PFlash drafter on GPU1 | Yes | Small | none | −seconds, rare cases | negligible |
 | C: Layer-split + sharded snapshots | Yes | **Large** | **+50–60%** | unchanged | protocol work in C++ daemon |
 
 ## 5. Proposed Next-Gen Architecture
 
-The end state combines C with B, keeping snapshots in CPU RAM (unbounded
-slots) unless profiling shows restore time matters after the split:
+The end state combines C with B over the NVLink fabric, keeping snapshots
+in CPU RAM (unbounded slots) with optional hot-slot residency in leftover
+GPU VRAM (Option A hybrid) if post-split profiling shows restore time
+matters:
 
 ```mermaid
 flowchart LR
@@ -204,7 +238,7 @@ flowchart LR
   subgraph ramf["System RAM"]
     FS["Sharded snapshot slots<br/>(pairs: shard0 + shard1 per logical slot)"]
   end
-  F0 <--> F1
+  F0 <-- "NVLink NV4 ~56 GB/s<br/>(activations)" --> F1
   F0 -- "snap/restore shard 0" --> FS
   F1 -- "snap/restore shard 1" --> FS
 ```
