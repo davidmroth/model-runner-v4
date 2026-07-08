@@ -30,8 +30,10 @@ docker compose --profile serve up -d
 
 ## Notes
 
-- **Text only** — no vision/mmproj (use v3 for vision workloads).
-- Dual 3090: target on GPU0, draft on GPU1 via `DFLASH_TARGET_GPU=0` / `DFLASH_DRAFT_GPU=1`.
+- **Vision** — BeeLlama mmproj sidecar on GPU1 (`vision` service) + gateway router on `:8080`.
+  Text stays on Lucebox DFlash; multimodal requests route to the sidecar. Disable with
+  `DFLASH_VISION_ENABLED=0`. Validate: `python scripts/vision_smoke_test.py`.
+- Dual 3090: target on GPU0, draft colocated on GPU0; vision encoder on GPU1.
   Lucebox's stock entrypoint ignores those env vars; this repo's `entrypoint-dual-gpu.sh`
   wrapper injects `--target-device cuda:0` / `--draft-device cuda:1` for `dflash_server`.
 - **Decode benchmark** (HumanEval, n=256, direct engine): ~87 tok/s on dual RTX 3090 vs

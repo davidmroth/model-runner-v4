@@ -3,6 +3,8 @@
 # Client traffic goes through ai-platform proxy on :8000.
 # Do not run v3 and v4 engines at the same time (GPU exclusive).
 #
+# Vision (DFLASH_VISION_ENABLED=1): BeeLlama mmproj sidecar on GPU1, gateway on :8080.
+#
 #   docker network create ai-inference   # once (shared with ai-platform)
 #   docker compose --profile download run --rm download
 #   docker compose --profile serve up -d
@@ -26,16 +28,23 @@ services:
     image: ${LUCEBOX_IMAGE:-ghcr.io/luce-org/lucebox-hub:cuda12}
     container_name: model-runner-v4-lucebox
     restart: ${RESTART:-unless-stopped}
-    entrypoint: ["/bin/bash", "/scripts/entrypoint-dual-gpu.sh"]
+    entrypoint: ["/bin/bash", "/scripts/entrypoint-vision-gateway.sh"]
     expose:
       - "8080"
     volumes:
       - ${MODEL_DIR:-../models-cache}:/opt/lucebox-hub/server/models
       - ./scripts/entrypoint-dual-gpu.sh:/scripts/entrypoint-dual-gpu.sh:ro
       - ./scripts/entrypoint-tool-split-serve.sh:/scripts/entrypoint-tool-split-serve.sh:ro
+      - ./scripts/entrypoint-vision-gateway.sh:/scripts/entrypoint-vision-gateway.sh:ro
+      - ./scripts/vision-gateway.py:/scripts/vision-gateway.py:ro
       - ${LUCEBOX_PATCH_DIR:-../lucebox-hub-patch/dflash/scripts}:/opt/lucebox-hub/patch/dflash/scripts:ro
       - ${LUCEBOX_DFLASH_BUILD:-../lucebox-hub-src/dflash/build}:/opt/lucebox-hub/dflash-build:ro
     environment:
+      DFLASH_VISION_ENABLED: ${DFLASH_VISION_ENABLED:-1}
+      DFLASH_VISION_BACKEND: ${DFLASH_VISION_BACKEND:-http://vision:8081}
+      DFLASH_TEXT_PORT: ${DFLASH_TEXT_PORT:-18080}
+      DFLASH_GATEWAY_PORT: ${DFLASH_GATEWAY_PORT:-8080}
+      DFLASH_PATCH_SCRIPTS: /opt/lucebox-hub/patch/dflash/scripts
       DFLASH_DAEMON_BIN: ${DFLASH_DAEMON_BIN:-/opt/lucebox-hub/dflash-build/test_dflash}
       DFLASH_TARGET: ${DFLASH_TARGET:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/unsloth-q4km/Qwen3.6-27B-Q4_K_M.gguf}
       DFLASH_DRAFT: ${DFLASH_DRAFT:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/dflash-lucebox/dflash-draft-3.6-q4_k_m.gguf}
@@ -78,7 +87,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: ${GPU_COUNT:-2}
+              device_ids: ["${LUCEBOX_GPU:-0}"]
               capabilities: [compute, utility]
     networks:
       ai-inference:
@@ -86,6 +95,42 @@ services:
           - engine-v4
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+  vision:
+    profiles: ["serve"]
+    image: ${VISION_IMAGE:-ghcr.io/anbeeld/beellama.cpp:server-cuda@sha256:d30b39211212899055c5d14ef67cdd29d8453c06a35e6e1c0c8ee4aeacc28f8b}
+    container_name: model-runner-v4-vision
+    restart: ${RESTART:-unless-stopped}
+    entrypoint: ["/bin/sh", "/scripts/vision-entrypoint.sh"]
+    expose:
+      - "8081"
+    volumes:
+      - ${MODEL_DIR:-../models-cache}:/opt/lucebox-hub/server/models:ro
+      - ./scripts/vision-entrypoint.sh:/scripts/vision-entrypoint.sh:ro
+    environment:
+      VISION_HOST: 0.0.0.0
+      VISION_PORT: 8081
+      VISION_MODEL_ROOT: /opt/lucebox-hub/server/models/qwen3.6-27b-gguf
+      IMAGE_MIN_TOKENS: ${IMAGE_MIN_TOKENS:-1024}
+      IMAGE_MAX_TOKENS: ${IMAGE_MAX_TOKENS:-1024}
+      VISION_CTX_SIZE: ${VISION_CTX_SIZE:-16384}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VISION_GPU:-1}"]
+              capabilities: [compute, utility]
+    networks:
+      ai-inference:
+        aliases:
+          - vision
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 5
