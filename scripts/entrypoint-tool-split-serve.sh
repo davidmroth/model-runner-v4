@@ -44,6 +44,13 @@ if [ -n "${DRAFT}" ] && [ -f "${DRAFT}" ]; then
   ARGS+=(--draft "${DRAFT}")
 fi
 
+# Keep an F32 mirror of the draft's target-feature window on the draft GPU.
+# Without it, every decode step re-copies the whole 4096-row BF16 feature
+# window across GPUs through the CPU (~700ms/step at 8K+ context).
+if [ "${DFLASH_DRAFT_FEATURE_MIRROR:-1}" = "1" ]; then
+  ARGS+=(--draft-feature-mirror)
+fi
+
 if [ "${DFLASH_PREFILL_MODE:-off}" != "off" ]; then
   ARGS+=(
     --prefill-compression "${DFLASH_PREFILL_MODE}"
@@ -78,6 +85,21 @@ if [ -n "${DFLASH_TOOL_SPLIT_PLUGIN_DIR:-}" ]; then
 fi
 
 export PYTHONPATH="${PATCH_SCRIPTS}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# server_tools.py speaks the legacy inline daemon protocol (SNAPSHOT_THIN with
+# kv ranges, RESTORE_CHAIN, "[snap] inline" acks). Keep test_dflash on the
+# legacy loop instead of run_qwen35_daemon.
+export DFLASH_LEGACY_DAEMON="${DFLASH_LEGACY_DAEMON:-1}"
+
+# The daemon binary links shared ggml libs from its build tree; its RUNPATH
+# points at the build container's /src path, which doesn't exist here. Put the
+# mounted build's ggml dirs first so the patched libs win over any stock copy.
+BUILD_DIR="$(cd "$(dirname "${BIN}")" && pwd)"
+GGML_DIR="${BUILD_DIR}/deps/llama.cpp/ggml/src"
+if [ -d "${GGML_DIR}" ]; then
+  export LD_LIBRARY_PATH="${GGML_DIR}:${GGML_DIR}/ggml-cuda${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 cd "${PATCH_SCRIPTS}"
 
 exec uv run --no-sync --directory /opt/lucebox-hub python "${ARGS[@]}"

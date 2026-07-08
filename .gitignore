@@ -1,6 +1,7 @@
 .env
 .data/
 models/
+.checkpoints/
 **/__pycache__/
 .env*
 !.env.example*
