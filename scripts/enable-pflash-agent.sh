@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Enable PFlash for typical Hermes agent prompts (3k–8k tokens).
-# Trades ~15% decode for much faster prefill on dual-GPU layer-split setups.
+# Enable PFlash for short interactive prompts (3k–8k tokens).
+# WARNING: breaks multi-step Hermes agent/cron jobs — see docs/feedback-pflash-agent-regression.md.
+# Use only for one-shot chat or benchmarks, not production agent workloads.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="${ROOT}/.env"

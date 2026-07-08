@@ -40,10 +40,17 @@ services:
       DFLASH_TARGET: ${DFLASH_TARGET:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/unsloth-q4km/Qwen3.6-27B-Q4_K_M.gguf}
       DFLASH_DRAFT: ${DFLASH_DRAFT:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/dflash-lucebox/dflash-draft-3.6-q4_k_m.gguf}
       DFLASH_MODEL_NAME: ${DFLASH_MODEL_NAME:-dflash}
+      # 32k leaves VRAM for prefix snapshots on 2×24GB (131k starves KV cache).
       DFLASH_MAX_CTX: ${DFLASH_MAX_CTX:-131072}
       DFLASH27B_KV_TQ3: ${DFLASH27B_KV_TQ3:-1}
       DFLASH_GPU_DRAFT_TOPK: ${DFLASH_GPU_DRAFT_TOPK:-1}
       DFLASH_GPU_VERIFY_ARGMAX: ${DFLASH_GPU_VERIFY_ARGMAX:-1}
+      # Spec-decode tuning: DDTree verify budget, draft attention window, and
+      # the draft-GPU F32 feature mirror (avoids ~700ms/step cross-GPU copies).
+      DFLASH_DDTREE_BUDGET: ${DFLASH_DDTREE_BUDGET:-22}
+      DFLASH27B_DRAFT_CTX_MAX: ${DFLASH27B_DRAFT_CTX_MAX:-4096}
+      DFLASH_DRAFT_FEATURE_MIRROR: ${DFLASH_DRAFT_FEATURE_MIRROR:-1}
+      DFLASH27B_FA_WINDOW: ${DFLASH27B_FA_WINDOW:-0}
       # Layer-split target across both GPUs (Qwen3.6-27B = 64 layers → 32+32).
       # Requires peer-access between shards. Draft stays on DFLASH_DRAFT_GPU.
       DFLASH_LAYER_SPLIT: ${DFLASH_LAYER_SPLIT:-1}
@@ -52,19 +59,20 @@ services:
       DFLASH_TARGET_GPU: ${DFLASH_TARGET_GPU:-0}
       DFLASH_DRAFT_GPU: ${DFLASH_DRAFT_GPU:-1}
       DFLASH_PEER_ACCESS: ${DFLASH_PEER_ACCESS:-1}
-      DFLASH_PREFIX_CACHE_SLOTS: ${DFLASH_PREFIX_CACHE_SLOTS:-1}
-      # Agent defaults in .env.example: PFlash auto @ 3k tokens. Long-context-only: threshold 16384.
-      DFLASH_PREFILL_MODE: ${DFLASH_PREFILL_MODE:-auto}
+      DFLASH_PREFIX_CACHE_SLOTS: ${DFLASH_PREFIX_CACHE_SLOTS:-4}
+      # PFlash off by default — lossy 10:1 compress breaks agent/cron workloads (see docs/feedback-pflash-agent-regression.md).
+      DFLASH_PREFILL_MODE: ${DFLASH_PREFILL_MODE:-off}
       DFLASH_PREFILL_DRAFTER: ${DFLASH_PREFILL_DRAFTER:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/pflash/Qwen3-0.6B-BF16.gguf}
       DFLASH_PREFILL_THRESHOLD: ${DFLASH_PREFILL_THRESHOLD:-3000}
       DFLASH_PREFILL_KEEP: ${DFLASH_PREFILL_KEEP:-0.10}
       DFLASH_LAZY: ${DFLASH_LAZY:-0}
+      # Prefer prefix/tool snaps over prefill-cache slots when VRAM is tight.
       DFLASH_PREFILL_CACHE_SLOTS: ${DFLASH_PREFILL_CACHE_SLOTS:-2}
       DFLASH_TOOL_SPLIT_ENABLED: ${DFLASH_TOOL_SPLIT_ENABLED:-0}
       DFLASH_TOOL_SPLIT_PROFILE: ${DFLASH_TOOL_SPLIT_PROFILE:-auto}
       DFLASH_TOOL_SPLIT_PLUGIN_DIR: ${DFLASH_TOOL_SPLIT_PLUGIN_DIR:-}
       DFLASH_TOOL_SPLIT_PINNED_SLOTS: ${DFLASH_TOOL_SPLIT_PINNED_SLOTS:-2}
-      DFLASH_TOOL_SPLIT_COMPRESS_CONV: ${DFLASH_TOOL_SPLIT_COMPRESS_CONV:-1}
+      DFLASH_TOOL_SPLIT_COMPRESS_CONV: ${DFLASH_TOOL_SPLIT_COMPRESS_CONV:-0}
     deploy:
       resources:
         reservations:

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Enable split tool KV + conversation PFlash in model-runner-v4 .env
+# WARNING: prefix-cache restore can serve stale benchmark KV to agent requests
+# (empty replies or HumanEval code). See docs/feedback-prefix-cache-regression.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
