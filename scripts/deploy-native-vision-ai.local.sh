@@ -14,6 +14,7 @@ MR_BRANCH="${MODEL_RUNNER_BRANCH:-feat/vision}"
 LB_BRANCH="${LUCEBOX_BRANCH:-feat/native-mmproj}"
 BUILD_REMOTE="${SRC_REMOTE}/server/build-mmproj"
 CUDA_IMAGE="${CUDA_BUILD_IMAGE:-nvidia/cuda:12.8.0-devel-ubuntu22.04}"
+CUDA_PLATFORM="${CUDA_BUILD_PLATFORM:-linux/amd64}"
 CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-86}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,7 +37,7 @@ set -euo pipefail
 cd '${SRC_REMOTE}'
 find . -name '._*' -delete 2>/dev/null || true
 find . -name '.DS_Store' -delete 2>/dev/null || true
-docker run --rm --gpus all \\
+docker run --rm --platform '${CUDA_PLATFORM}' --gpus all \\
   -v '${SRC_REMOTE}:/src' \\
   -w /src/server \\
   '${CUDA_IMAGE}' \\
@@ -100,7 +101,7 @@ done
 echo "== 5/5 verification: /props + vision smoke + text decode bench =="
 ssh "${BOT_USER}@${AI_HOST}" bash -s <<EOF
 set -euo pipefail
-curl -sf http://model-runner-v4-lucebox:8080/props | python3 -c "
+docker exec model-runner-v4-lucebox curl -sf http://127.0.0.1:8080/props | python3 -c "
 import json,sys
 p=json.load(sys.stdin)
 caps=p.get('capabilities') or {}
