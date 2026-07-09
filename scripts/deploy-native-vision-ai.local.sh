@@ -108,15 +108,16 @@ docker exec model-runner-v4-lucebox curl -sf http://127.0.0.1:8080/props | pytho
 import json,sys
 p=json.load(sys.stdin)
 caps=p.get('capabilities') or {}
+runtime=p.get('runtime') or {}
 vs=caps.get('vision_supported') or p.get('vision_supported')
+sharding=runtime.get('target_sharding', caps.get('target_sharding', p.get('target_sharding')))
 spec=p.get('speculative') or {}
-draft=p.get('draft_path') or p.get('dflash',{}).get('draft_path')
+draft=p.get('draft_path') or p.get('dflash',{}).get('draft_path') or (p.get('model') or {}).get('draft_path')
 print('vision_supported=', vs)
-print('target_sharding=', caps.get('target_sharding', p.get('target_sharding')))
+print('target_sharding=', sharding)
 print('speculative.enabled=', spec.get('enabled'))
 print('draft_path=', draft)
 assert vs, 'vision_supported must be true'
-sharding=caps.get('target_sharding', p.get('target_sharding'))
 assert sharding, 'target_sharding must be true for dual-GPU layer-split'
 "
 docker run --rm --network ai-inference \\
