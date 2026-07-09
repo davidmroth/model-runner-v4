@@ -31,6 +31,7 @@ services:
       - "8080"
     volumes:
       - ${MODEL_DIR:-../models-cache}:/opt/lucebox-hub/server/models
+      - ${LUCEBOX_HUB_SRC:-../lucebox-hub-src}/server/scripts/entrypoint.sh:/opt/lucebox-hub/server/scripts/entrypoint.sh:ro
       - ./scripts/entrypoint-dual-gpu.sh:/scripts/entrypoint-dual-gpu.sh:ro
       - ./scripts/entrypoint-tool-split-serve.sh:/scripts/entrypoint-tool-split-serve.sh:ro
       - ${LUCEBOX_PATCH_DIR:-../lucebox-hub-patch/dflash/scripts}:/opt/lucebox-hub/patch/dflash/scripts:ro

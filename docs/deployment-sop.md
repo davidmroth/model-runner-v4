@@ -14,6 +14,10 @@ and is **not** in git. Everything else is reproducible from branches.
 | `lucebox-hub` | `github.com/davidmroth/lucebox-hub` | `/media/data/projects/lucebox-hub-src` | `feat/native-mmproj` |
 | `model-runner-v4` | `github.com/davidmroth/model-runner-v4` | `/media/data/projects/model-runner-v4` | `feat/vision` |
 
+`docker-compose.yml` bind-mounts `lucebox-hub-src/server/scripts/entrypoint.sh` so
+runtime flags (`--mmproj`, etc.) match the pulled branch — the stock GHCR image
+entrypoint alone is not sufficient for native vision.
+
 ## Do / Don't
 
 | Do | Don't |
