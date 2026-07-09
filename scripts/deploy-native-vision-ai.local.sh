@@ -22,9 +22,9 @@ echo "== 1/5 git pull lucebox-hub (${LB_BRANCH}) on ${AI_USER}@${AI_HOST} =="
 ssh "${AI_USER}@${AI_HOST}" bash -s <<EOF
 set -euo pipefail
 cd '${SRC_REMOTE}'
-git fetch origin
-git checkout '${LB_BRANCH}'
-git pull --ff-only origin '${LB_BRANCH}'
+git fetch origin '${LB_BRANCH}'
+git checkout -B '${LB_BRANCH}' "origin/${LB_BRANCH}"
+git reset --hard "origin/${LB_BRANCH}"
 git submodule update --init --recursive server/deps/llama.cpp
 echo "lucebox-hub HEAD=\$(git rev-parse --short HEAD)"
 EOF
@@ -56,9 +56,9 @@ echo "== 3/5 git pull model-runner-v4 (${MR_BRANCH}) + compose recreate =="
 ssh "${AI_USER}@${AI_HOST}" bash -s <<EOF
 set -euo pipefail
 cd '${ROOT_REMOTE}'
-git fetch origin
-git checkout '${MR_BRANCH}'
-git pull --ff-only origin '${MR_BRANCH}'
+git fetch origin '${MR_BRANCH}'
+git checkout -B '${MR_BRANCH}' "origin/${MR_BRANCH}"
+git reset --hard "origin/${MR_BRANCH}"
 echo "model-runner-v4 HEAD=\$(git rev-parse --short HEAD)"
 chmod +x scripts/*.sh 2>/dev/null || true
 touch .env

@@ -19,10 +19,13 @@ and is **not** in git. Everything else is reproducible from branches.
 | Do | Don't |
 |----|-------|
 | Commit + push from dev machine | Edit source under `lucebox-hub-src` or `model-runner-v4` on ai.local |
-| `git pull --ff-only origin <branch>` on ai.local | `scp` / `tar` source trees to ai.local |
+| `git fetch origin <branch>` + `git reset --hard origin/<branch>` on ai.local | `scp` / `tar` source trees to ai.local |
 | Edit `.env` on ai.local for runtime knobs | Patch Python/C++ on the host without committing |
 | Rebuild C++ in CUDA devel container after pull | Build on macOS and copy binaries |
 | Run verification sidecars after deploy | Assume healthy because container started |
+
+On ai.local, **`git reset --hard`** is intentional — it discards any drift from
+hand-edits and matches the pushed branch exactly.
 
 ## Standard deploy sequence (native vision + DFlash)
 
