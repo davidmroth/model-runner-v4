@@ -15,12 +15,27 @@ fi
 # Native build mount (model-runner-v4): prefer dflash_server + patched ggml from bind mount.
 if [ -d /opt/lucebox-hub/dflash-build ]; then
   export DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-/opt/lucebox-hub/dflash-build/dflash_server}"
-  GGML_DIR=/opt/lucebox-hub/dflash-build/deps/llama.cpp/ggml/src
+  BUILD_ROOT=/opt/lucebox-hub/dflash-build
+  GGML_DIR="${BUILD_ROOT}/deps/llama.cpp/ggml/src"
+  MTMD_DIR="${BUILD_ROOT}/deps/llama.cpp/tools/mtmd"
+  LLAMA_DIR="${BUILD_ROOT}/bin"
+  _libpath="${MTMD_DIR}:${LLAMA_DIR}"
   if [ -d "${GGML_DIR}/ggml-cuda" ]; then
-    export LD_LIBRARY_PATH="${GGML_DIR}:${GGML_DIR}/ggml-cuda${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    _libpath="${_libpath}:${GGML_DIR}:${GGML_DIR}/ggml-cuda"
   elif [ -d "${GGML_DIR}" ]; then
-    export LD_LIBRARY_PATH="${GGML_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    _libpath="${_libpath}:${GGML_DIR}"
   fi
+  export LD_LIBRARY_PATH="${_libpath}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+# mmproj-enabled dflash_server links libmtmd — ensure it is on the loader path even if
+# the bind mount layout changes slightly between build trees.
+if [ -n "${DFLASH_MMPROJ:-}" ]; then
+  for _mtmd in /opt/lucebox-hub/dflash-build/deps/llama.cpp/tools/mtmd \
+               /opt/lucebox-hub/dflash-build/bin; do
+    if [ -d "$_mtmd" ]; then
+      export LD_LIBRARY_PATH="${_mtmd}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
+  done
 fi
 
 STOCK="/opt/lucebox-hub/server/scripts/entrypoint.sh"
