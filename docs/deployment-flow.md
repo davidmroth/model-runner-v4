@@ -5,6 +5,10 @@ model runner on `ai.local` (192.168.87.153, 2×RTX 3090), and how they are
 verified. Everything runs in Docker on the remote host; nothing is executed
 in the remote host's bare environment beyond `docker` and file sync.
 
+**SOP:** Git remote is the single source of truth — see
+[deployment-sop.md](./deployment-sop.md). Do not `scp` or hand-edit source
+on ai.local; commit, push, then `git pull` on the host.
+
 ## Topology
 
 ```mermaid

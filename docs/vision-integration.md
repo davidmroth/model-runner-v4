@@ -1,44 +1,63 @@
-# Vision integration (v4)
+# Native vision (mmproj) in Lucebox v4
 
-Hybrid vision for model-runner-v4: **Lucebox DFlash stays on GPU0** for text;
-**BeeLlama mmproj sidecar on GPU1** handles multimodal requests.
+Vision is implemented **inside Lucebox Hub** via mtmd/mmproj — not a BeeLlama sidecar.
 
-## Architecture
+Upstream code lives on `lucebox-hub` branch `feat/native-mmproj`:
 
-```
-Client (:8000 ai-platform)
-    → model-runner-v4-lucebox :8080 (vision-gateway)
-        ├─ text  → :18080 stock Lucebox dflash_server
-        └─ image → vision:8081 BeeLlama llama-server + mmproj
-```
+- `VisionEncoder` — mtmd wrapper (`server/src/vision/`)
+- `http_server.cpp` — parses `image_url` / base64, builds `MultimodalPrompt`
+- `Qwen35Backend::do_prefill_multimodal` — injects image embeddings into DFlash graph prefill
+- `/props` → `capabilities.vision_supported` when `--mmproj` is loaded
 
-## Enable
+## Build requirement
+
+Stock GHCR image is compiled with `DFLASH27B_MMPROJ=OFF`. Production needs a **local rebuild**:
 
 ```bash
-DFLASH_VISION_ENABLED=1
-LUCEBOX_GPU=0
-VISION_GPU=1
-docker compose --profile serve up -d
+./scripts/build-native-mmproj-ai.local.sh
 ```
+
+This produces `server/build-mmproj/dflash_server` bind-mounted into the runner.
+
+## model-runner-v4 wiring
+
+```ini
+# .env
+LUCEBOX_DFLASH_BUILD=../lucebox-hub-src/server/build-mmproj
+DFLASH_SERVER_BIN=/opt/lucebox-hub/dflash-build/dflash_server
+DFLASH_DAEMON_BIN=/opt/lucebox-hub/dflash-build/test_dflash
+DFLASH_MMPROJ=/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/mmproj-F16.gguf
+DFLASH_MMPROJ_NO_OFFLOAD=1          # keep mmproj on GPU (v3 parity)
+IMAGE_MIN_TOKENS=1024
+IMAGE_MAX_TOKENS=1024
+DFLASH_VISION_ENABLED=0             # sidecar path — do not use with native mmproj
+```
+
+`download-models.sh` fetches `mmproj-F16.gguf` from `unsloth/Qwen3.6-27B-GGUF`.
 
 ## Validate
 
 ```bash
 python scripts/vision_smoke_test.py
-# via proxy:
-INFERENCE_BASE=http://ai.local:8000 python scripts/vision_smoke_test.py
+INFERENCE_BASE=http://model-runner-v4-lucebox:8080 python scripts/vision_smoke_test.py
 ```
+
+`/props` should show `vision_supported: true` from native server (not gateway injection).
+
+## Known tradeoffs (upstream)
+
+| Behavior | Detail |
+|----------|--------|
+| **Spec decode + mmproj** | Both load together; text-only requests use DFlash, image requests use AR decode |
+| **Layer-split + vision** | Not supported yet — use single-GPU or non-split placement for vision testing |
+| **Prefix cache + vision** | Multimodal restore not implemented (`kv_offset != 0` rejected) |
+| **PFlash + vision** | Compression path is text-only |
 
 ## Rollback
 
 ```bash
-DFLASH_VISION_ENABLED=0
-# use entrypoint-dual-gpu.sh only (set in compose or recreate without vision service)
+# Use stock build (no mmproj)
+unset DFLASH_MMPROJ
+LUCEBOX_DFLASH_BUILD=../lucebox-hub-src/server/build
 docker compose --profile serve up -d --force-recreate lucebox
-docker compose --profile serve stop vision
 ```
-
-## Future work
-
-Native mmproj inside the Lucebox dflash daemon (single process, shared KV) is
-not in this PR — the sidecar path proves the routing and Hermes contract first.

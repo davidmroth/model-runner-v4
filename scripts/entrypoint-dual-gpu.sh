@@ -12,6 +12,17 @@ if [ "${DFLASH_TOOL_SPLIT_ENABLED:-0}" = "1" ]; then
   exec /scripts/entrypoint-tool-split-serve.sh "$@"
 fi
 
+# Native build mount (model-runner-v4): prefer dflash_server + patched ggml from bind mount.
+if [ -d /opt/lucebox-hub/dflash-build ]; then
+  export DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-/opt/lucebox-hub/dflash-build/dflash_server}"
+  GGML_DIR=/opt/lucebox-hub/dflash-build/deps/llama.cpp/ggml/src
+  if [ -d "${GGML_DIR}/ggml-cuda" ]; then
+    export LD_LIBRARY_PATH="${GGML_DIR}:${GGML_DIR}/ggml-cuda${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  elif [ -d "${GGML_DIR}" ]; then
+    export LD_LIBRARY_PATH="${GGML_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  fi
+fi
+
 STOCK="/opt/lucebox-hub/server/scripts/entrypoint.sh"
 PATCHED="/tmp/lucebox-entrypoint-dual-gpu.sh"
 MARKER="# model-runner-v4 dual-gpu patch v2"

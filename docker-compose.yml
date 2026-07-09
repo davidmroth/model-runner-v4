@@ -1,9 +1,7 @@
 # model-runner-v4 — Lucebox Hub inference engine (internal :8080 only)
 #
 # Client traffic goes through ai-platform proxy on :8000.
-# Do not run v3 and v4 engines at the same time (GPU exclusive).
-#
-# Vision (DFLASH_VISION_ENABLED=1): BeeLlama mmproj sidecar on GPU1, gateway on :8080.
+# Native vision: build dflash_server with -DDFLASH27B_MMPROJ=ON, set DFLASH_MMPROJ.
 #
 #   docker network create ai-inference   # once (shared with ai-platform)
 #   docker compose --profile download run --rm download
@@ -28,40 +26,34 @@ services:
     image: ${LUCEBOX_IMAGE:-ghcr.io/luce-org/lucebox-hub:cuda12}
     container_name: model-runner-v4-lucebox
     restart: ${RESTART:-unless-stopped}
-    entrypoint: ["/bin/bash", "/scripts/entrypoint-vision-gateway.sh"]
+    entrypoint: ["/bin/bash", "/scripts/entrypoint-dual-gpu.sh"]
     expose:
       - "8080"
     volumes:
       - ${MODEL_DIR:-../models-cache}:/opt/lucebox-hub/server/models
       - ./scripts/entrypoint-dual-gpu.sh:/scripts/entrypoint-dual-gpu.sh:ro
       - ./scripts/entrypoint-tool-split-serve.sh:/scripts/entrypoint-tool-split-serve.sh:ro
-      - ./scripts/entrypoint-vision-gateway.sh:/scripts/entrypoint-vision-gateway.sh:ro
-      - ./scripts/vision-gateway.py:/scripts/vision-gateway.py:ro
       - ${LUCEBOX_PATCH_DIR:-../lucebox-hub-patch/dflash/scripts}:/opt/lucebox-hub/patch/dflash/scripts:ro
-      - ${LUCEBOX_DFLASH_BUILD:-../lucebox-hub-src/dflash/build}:/opt/lucebox-hub/dflash-build:ro
+      - ${LUCEBOX_DFLASH_BUILD:-../lucebox-hub-src/server/build-mmproj}:/opt/lucebox-hub/dflash-build:ro
     environment:
-      DFLASH_VISION_ENABLED: ${DFLASH_VISION_ENABLED:-1}
-      DFLASH_VISION_BACKEND: ${DFLASH_VISION_BACKEND:-http://vision:8081}
-      DFLASH_TEXT_PORT: ${DFLASH_TEXT_PORT:-18080}
-      DFLASH_GATEWAY_PORT: ${DFLASH_GATEWAY_PORT:-8080}
-      DFLASH_PATCH_SCRIPTS: /opt/lucebox-hub/patch/dflash/scripts
+      DFLASH_MMPROJ: ${DFLASH_MMPROJ:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/mmproj-F16.gguf}
+      DFLASH_MMPROJ_NO_OFFLOAD: ${DFLASH_MMPROJ_NO_OFFLOAD:-1}
+      DFLASH_MMPROJ_THREADS: ${DFLASH_MMPROJ_THREADS:-4}
+      IMAGE_MIN_TOKENS: ${IMAGE_MIN_TOKENS:-1024}
+      IMAGE_MAX_TOKENS: ${IMAGE_MAX_TOKENS:-1024}
+      DFLASH_SERVER_BIN: ${DFLASH_SERVER_BIN:-/opt/lucebox-hub/dflash-build/dflash_server}
       DFLASH_DAEMON_BIN: ${DFLASH_DAEMON_BIN:-/opt/lucebox-hub/dflash-build/test_dflash}
       DFLASH_TARGET: ${DFLASH_TARGET:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/unsloth-q4km/Qwen3.6-27B-Q4_K_M.gguf}
       DFLASH_DRAFT: ${DFLASH_DRAFT:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/dflash-lucebox/dflash-draft-3.6-q4_k_m.gguf}
       DFLASH_MODEL_NAME: ${DFLASH_MODEL_NAME:-dflash}
-      # 32k leaves VRAM for prefix snapshots on 2×24GB (131k starves KV cache).
       DFLASH_MAX_CTX: ${DFLASH_MAX_CTX:-131072}
       DFLASH27B_KV_TQ3: ${DFLASH27B_KV_TQ3:-1}
       DFLASH_GPU_DRAFT_TOPK: ${DFLASH_GPU_DRAFT_TOPK:-1}
       DFLASH_GPU_VERIFY_ARGMAX: ${DFLASH_GPU_VERIFY_ARGMAX:-1}
-      # Spec-decode tuning: DDTree verify budget, draft attention window, and
-      # the draft-GPU F32 feature mirror (avoids ~700ms/step cross-GPU copies).
       DFLASH_DDTREE_BUDGET: ${DFLASH_DDTREE_BUDGET:-22}
       DFLASH27B_DRAFT_CTX_MAX: ${DFLASH27B_DRAFT_CTX_MAX:-4096}
       DFLASH_DRAFT_FEATURE_MIRROR: ${DFLASH_DRAFT_FEATURE_MIRROR:-1}
       DFLASH27B_FA_WINDOW: ${DFLASH27B_FA_WINDOW:-0}
-      # Layer-split target across both GPUs (Qwen3.6-27B = 64 layers → 32+32).
-      # Requires peer-access between shards. Draft stays on DFLASH_DRAFT_GPU.
       DFLASH_LAYER_SPLIT: ${DFLASH_LAYER_SPLIT:-1}
       DFLASH_TARGET_DEVICES: ${DFLASH_TARGET_DEVICES:-cuda:0,cuda:1}
       DFLASH_TARGET_LAYER_SPLIT: ${DFLASH_TARGET_LAYER_SPLIT:-32,32}
@@ -69,13 +61,11 @@ services:
       DFLASH_DRAFT_GPU: ${DFLASH_DRAFT_GPU:-1}
       DFLASH_PEER_ACCESS: ${DFLASH_PEER_ACCESS:-1}
       DFLASH_PREFIX_CACHE_SLOTS: ${DFLASH_PREFIX_CACHE_SLOTS:-4}
-      # PFlash off by default — lossy 10:1 compress breaks agent/cron workloads (see docs/feedback-pflash-agent-regression.md).
       DFLASH_PREFILL_MODE: ${DFLASH_PREFILL_MODE:-off}
       DFLASH_PREFILL_DRAFTER: ${DFLASH_PREFILL_DRAFTER:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/pflash/Qwen3-0.6B-BF16.gguf}
       DFLASH_PREFILL_THRESHOLD: ${DFLASH_PREFILL_THRESHOLD:-3000}
       DFLASH_PREFILL_KEEP: ${DFLASH_PREFILL_KEEP:-0.10}
       DFLASH_LAZY: ${DFLASH_LAZY:-0}
-      # Prefer prefix/tool snaps over prefill-cache slots when VRAM is tight.
       DFLASH_PREFILL_CACHE_SLOTS: ${DFLASH_PREFILL_CACHE_SLOTS:-2}
       DFLASH_TOOL_SPLIT_ENABLED: ${DFLASH_TOOL_SPLIT_ENABLED:-0}
       DFLASH_TOOL_SPLIT_PROFILE: ${DFLASH_TOOL_SPLIT_PROFILE:-auto}
@@ -87,7 +77,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${LUCEBOX_GPU:-0}"]
+              count: ${GPU_COUNT:-2}
               capabilities: [compute, utility]
     networks:
       ai-inference:
@@ -95,42 +85,6 @@ services:
           - engine-v4
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 600s
-
-  vision:
-    profiles: ["serve"]
-    image: ${VISION_IMAGE:-ghcr.io/anbeeld/beellama.cpp:server-cuda@sha256:d30b39211212899055c5d14ef67cdd29d8453c06a35e6e1c0c8ee4aeacc28f8b}
-    container_name: model-runner-v4-vision
-    restart: ${RESTART:-unless-stopped}
-    entrypoint: ["/bin/sh", "/scripts/vision-entrypoint.sh"]
-    expose:
-      - "8081"
-    volumes:
-      - ${MODEL_DIR:-../models-cache}:/opt/lucebox-hub/server/models:ro
-      - ./scripts/vision-entrypoint.sh:/scripts/vision-entrypoint.sh:ro
-    environment:
-      VISION_HOST: 0.0.0.0
-      VISION_PORT: 8081
-      VISION_MODEL_ROOT: /opt/lucebox-hub/server/models/qwen3.6-27b-gguf
-      IMAGE_MIN_TOKENS: ${IMAGE_MIN_TOKENS:-1024}
-      IMAGE_MAX_TOKENS: ${IMAGE_MAX_TOKENS:-1024}
-      VISION_CTX_SIZE: ${VISION_CTX_SIZE:-16384}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${VISION_GPU:-1}"]
-              capabilities: [compute, utility]
-    networks:
-      ai-inference:
-        aliases:
-          - vision
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 5
