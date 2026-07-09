@@ -67,10 +67,13 @@ git reset --hard "origin/${MR_BRANCH}"
 echo "model-runner-v4 HEAD=\$(git rev-parse --short HEAD)"
 chmod +x scripts/*.sh 2>/dev/null || true
 touch .env
-grep -q '^DFLASH_VISION_ENABLED=' .env 2>/dev/null || echo 'DFLASH_VISION_ENABLED=0' >> .env
-sed -i 's/^DFLASH_VISION_ENABLED=.*/DFLASH_VISION_ENABLED=0/' .env
+grep -q '^DFLASH_LAYER_SPLIT=' .env 2>/dev/null || echo 'DFLASH_LAYER_SPLIT=1' >> .env
+sed -i 's/^DFLASH_LAYER_SPLIT=.*/DFLASH_LAYER_SPLIT=1/' .env
+grep -q '^DFLASH_DRAFT_GPU=' .env 2>/dev/null || echo 'DFLASH_DRAFT_GPU=1' >> .env
+sed -i 's/^DFLASH_DRAFT_GPU=.*/DFLASH_DRAFT_GPU=1/' .env
 grep -q '^DFLASH_TOOL_SPLIT_ENABLED=' .env 2>/dev/null || echo 'DFLASH_TOOL_SPLIT_ENABLED=0' >> .env
 sed -i 's/^DFLASH_TOOL_SPLIT_ENABLED=.*/DFLASH_TOOL_SPLIT_ENABLED=0/' .env
+grep -q '^DFLASH_PREFIX_CACHE_SLOTS=' .env 2>/dev/null || echo 'DFLASH_PREFIX_CACHE_SLOTS=4' >> .env
 grep -q '^DFLASH_MMPROJ=' .env 2>/dev/null || \\
   echo 'DFLASH_MMPROJ=/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/mmproj-F16.gguf' >> .env
 grep -q '^LUCEBOX_DFLASH_BUILD=' .env 2>/dev/null || echo "LUCEBOX_DFLASH_BUILD=${BUILD_REMOTE}" >> .env
@@ -109,9 +112,12 @@ vs=caps.get('vision_supported') or p.get('vision_supported')
 spec=p.get('speculative') or {}
 draft=p.get('draft_path') or p.get('dflash',{}).get('draft_path')
 print('vision_supported=', vs)
+print('target_sharding=', caps.get('target_sharding', p.get('target_sharding')))
 print('speculative.enabled=', spec.get('enabled'))
 print('draft_path=', draft)
 assert vs, 'vision_supported must be true'
+sharding=caps.get('target_sharding', p.get('target_sharding'))
+assert sharding, 'target_sharding must be true for dual-GPU layer-split'
 "
 docker run --rm --network ai-inference \\
   -e INFERENCE_BASE=http://model-runner-v4-lucebox:8080 \\
@@ -124,5 +130,21 @@ if [ -f ${ROOT_REMOTE}/scripts/decode_bench.py ]; then
 fi
 EOF
 
-echo "Done. Native vision + DFlash on :8080."
+echo "Done. Layer-split + native vision + DFlash on :8080."
 echo "Logs: ssh ${BOT_USER}@${AI_HOST} docker logs -f model-runner-v4-lucebox"
+
+echo "== 6/6 ai-platform proxy: vision-safe first-token timeout =="
+ssh "${AI_USER}@${AI_HOST}" bash -s <<'PROXYEOF'
+set -euo pipefail
+AP_ROOT="${AI_PLATFORM_ROOT:-/media/data/projects/ai-platform}"
+if [ -d "$AP_ROOT" ]; then
+  touch "$AP_ROOT/.env"
+  grep -q '^BACKEND_FIRST_TOKEN_TIMEOUT_SEC=' "$AP_ROOT/.env" 2>/dev/null || \
+    echo 'BACKEND_FIRST_TOKEN_TIMEOUT_SEC=600' >> "$AP_ROOT/.env"
+  sed -i 's/^BACKEND_FIRST_TOKEN_TIMEOUT_SEC=.*/BACKEND_FIRST_TOKEN_TIMEOUT_SEC=600/' "$AP_ROOT/.env"
+  (cd "$AP_ROOT" && docker compose up -d proxy) || true
+  echo "ai-platform BACKEND_FIRST_TOKEN_TIMEOUT_SEC=$(grep BACKEND_FIRST_TOKEN "$AP_ROOT/.env")"
+else
+  echo "skip: $AP_ROOT not found"
+fi
+PROXYEOF

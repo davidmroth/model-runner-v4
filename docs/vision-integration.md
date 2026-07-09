@@ -46,6 +46,49 @@ INFERENCE_BASE=http://model-runner-v4-lucebox:8080 python scripts/vision_smoke_t
 
 `/props` should show `vision_supported: true` from native server (not gateway injection).
 
+## WebUI / Hermes stack
+
+End-to-end path: **WebUI** → Hermes gateway (webchat plugin) → **ai-platform proxy** `:8000` → **lucebox** `:8080`.
+
+Hermes settings (in `config.yaml`):
+
+```yaml
+agent:
+  image_input_mode: native   # attach pixels on the user turn (not vision_analyze)
+model:
+  provider: custom
+  base_url: http://<ai.local>:8000/v1
+```
+
+**Proxy first-token timeout:** multimodal prefill can take **30–120+ seconds** before the first SSE chunk (no tokens during prefill). Set on ai-platform:
+
+```bash
+# ai-platform/.env
+BACKEND_FIRST_TOKEN_TIMEOUT_SEC=600   # was 180 — Hermes gateway_timeout is 1800s
+BACKEND_REQUEST_TIMEOUT_SEC=600
+```
+
+Without this, Hermes sees `Remote end closed connection` / empty responses after ~3 retries even when lucebox would succeed.
+
+**Repro tests** (run on ai.local):
+
+```bash
+# Tiny PNG + 38-tool Hermes-scale payload via proxy
+INFERENCE_BASE=http://127.0.0.1:8000 python scripts/vision_hermes_repro_test.py
+
+# Direct lucebox smoke
+INFERENCE_BASE=http://model-runner-v4-lucebox:8080 python scripts/vision_smoke_test.py
+```
+
+**Common failures:**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| HTTP 400 `vision input requires --mmproj` | Native build not deployed | `./scripts/deploy-native-vision-ai.local.sh` |
+| `cudaMalloc` / `error=prefill` | GPU0 OOM on large tool+image prefill | lucebox `feat/native-mmproj` text chunking; eventually layer-split+vision |
+| Empty Hermes response, lucebox `ok=true` | Proxy 180s first-token timeout | `BACKEND_FIRST_TOKEN_TIMEOUT_SEC=600` |
+| `vision_analyze` timeout ~181s | `image_input_mode` not `native` | Set `agent.image_input_mode: native` |
+
 ## Known tradeoffs (upstream)
 
 | Behavior | Detail |
