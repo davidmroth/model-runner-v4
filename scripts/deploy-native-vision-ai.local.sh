@@ -42,7 +42,9 @@ docker run --rm --gpus all \\
   '${CUDA_IMAGE}' \\
   bash -c '
     set -euo pipefail
-    apt-get update -qq && apt-get install -y -qq cmake ninja-build git >/dev/null
+    apt-get update -qq && apt-get install -y -qq cmake ninja-build git libgomp1 >/dev/null
+    git config --global --add safe.directory /src/server/deps/llama.cpp
+    rm -rf build-mmproj
     cmake -B build-mmproj -G Ninja \\
       -DCMAKE_BUILD_TYPE=Release \\
       -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \\
