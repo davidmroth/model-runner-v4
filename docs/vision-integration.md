@@ -14,16 +14,18 @@ Upstream code lives on `lucebox-hub` branch `feat/native-mmproj`:
 Stock GHCR image is compiled with `DFLASH27B_MMPROJ=OFF`. Production needs a **local rebuild**:
 
 ```bash
-./scripts/build-native-mmproj-ai.local.sh
+./scripts/build-native-vision-ai.local.sh
+# or full pipeline (sync + build + deploy + smoke):
+./scripts/deploy-native-vision-ai.local.sh
 ```
 
-This produces `server/build-mmproj/dflash_server` bind-mounted into the runner.
+This produces `server/build/dflash_server` bind-mounted into the runner.
 
 ## model-runner-v4 wiring
 
 ```ini
 # .env
-LUCEBOX_DFLASH_BUILD=../lucebox-hub-src/server/build-mmproj
+LUCEBOX_DFLASH_BUILD=../lucebox-hub-src/server/build
 DFLASH_SERVER_BIN=/opt/lucebox-hub/dflash-build/dflash_server
 DFLASH_DAEMON_BIN=/opt/lucebox-hub/dflash-build/test_dflash
 DFLASH_MMPROJ=/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/mmproj-F16.gguf

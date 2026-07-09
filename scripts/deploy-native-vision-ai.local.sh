@@ -85,7 +85,7 @@ EOF
 
 echo "== 4/5 waiting for health (up to 15 min) =="
 for i in $(seq 1 90); do
-  if ssh "${BOT_USER}@${AI_HOST}" "curl -sf http://model-runner-v4-lucebox:8080/health" >/dev/null 2>&1; then
+  if ssh "${BOT_USER}@${AI_HOST}" "docker exec model-runner-v4-lucebox curl -sf http://127.0.0.1:8080/health" >/dev/null 2>&1; then
     echo "lucebox healthy (${i}0s)"
     break
   fi
