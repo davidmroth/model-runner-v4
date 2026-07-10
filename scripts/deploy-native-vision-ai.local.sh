@@ -71,6 +71,9 @@ grep -q '^DFLASH_LAYER_SPLIT=' .env 2>/dev/null || echo 'DFLASH_LAYER_SPLIT=1' >
 sed -i 's/^DFLASH_LAYER_SPLIT=.*/DFLASH_LAYER_SPLIT=1/' .env
 grep -q '^DFLASH_DRAFT_GPU=' .env 2>/dev/null || echo 'DFLASH_DRAFT_GPU=1' >> .env
 sed -i 's/^DFLASH_DRAFT_GPU=.*/DFLASH_DRAFT_GPU=1/' .env
+grep -q '^IMAGE_MIN_TOKENS=' .env 2>/dev/null || echo 'IMAGE_MIN_TOKENS=256' >> .env
+sed -i 's/^IMAGE_MIN_TOKENS=.*/IMAGE_MIN_TOKENS=256/' .env
+grep -q '^IMAGE_MAX_TOKENS=' .env 2>/dev/null || echo 'IMAGE_MAX_TOKENS=1024' >> .env
 grep -q '^DFLASH_TOOL_SPLIT_ENABLED=' .env 2>/dev/null || echo 'DFLASH_TOOL_SPLIT_ENABLED=0' >> .env
 sed -i 's/^DFLASH_TOOL_SPLIT_ENABLED=.*/DFLASH_TOOL_SPLIT_ENABLED=0/' .env
 grep -q '^DFLASH_PREFIX_CACHE_SLOTS=' .env 2>/dev/null || echo 'DFLASH_PREFIX_CACHE_SLOTS=4' >> .env
@@ -129,6 +132,17 @@ if [ -f ${ROOT_REMOTE}/scripts/decode_bench.py ]; then
     -v ${ROOT_REMOTE}/scripts/decode_bench.py:/tmp/b.py:ro \\
     python:3.12-slim python /tmp/b.py
 fi
+echo "== hermes vision repro (direct lucebox) =="
+docker run --rm --network ai-inference \\
+  -e INFERENCE_BASE=http://model-runner-v4-lucebox:8080 \\
+  -v ${ROOT_REMOTE}/scripts:/scripts:ro \\
+  python:3.12-slim python /scripts/vision_hermes_repro_test.py
+echo "== hermes vision repro (ai-platform proxy) =="
+docker run --rm --network ai-inference \\
+  -e INFERENCE_BASE=http://ai-platform-proxy:8000 \\
+  -v ${ROOT_REMOTE}/scripts:/scripts:ro \\
+  python:3.12-slim python /scripts/vision_hermes_repro_test.py || \\
+  echo "WARN: proxy repro failed (queue saturation or proxy down)"
 EOF
 
 echo "Done. Layer-split + native vision + DFlash on :8080."

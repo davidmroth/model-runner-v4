@@ -40,7 +40,7 @@ services:
       DFLASH_MMPROJ: ${DFLASH_MMPROJ:-/opt/lucebox-hub/server/models/qwen3.6-27b-gguf/mmproj-F16.gguf}
       DFLASH_MMPROJ_NO_OFFLOAD: ${DFLASH_MMPROJ_NO_OFFLOAD:-1}
       DFLASH_MMPROJ_THREADS: ${DFLASH_MMPROJ_THREADS:-4}
-      IMAGE_MIN_TOKENS: ${IMAGE_MIN_TOKENS:-1024}
+      IMAGE_MIN_TOKENS: ${IMAGE_MIN_TOKENS:-256}
       IMAGE_MAX_TOKENS: ${IMAGE_MAX_TOKENS:-1024}
       DFLASH_SERVER_BIN: ${DFLASH_SERVER_BIN:-/opt/lucebox-hub/dflash-build/dflash_server}
       DFLASH_DAEMON_BIN: ${DFLASH_DAEMON_BIN:-/opt/lucebox-hub/dflash-build/test_dflash}
