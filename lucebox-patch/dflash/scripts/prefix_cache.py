@@ -509,6 +509,36 @@ def scope_skips_prefix_snap(scope: str) -> bool:
     return (scope or "").startswith("ephemeral:")
 
 
+def deferred_conv_snap_after_cold_tool(
+    *,
+    prefix_cache: "PrefixCache",
+    prompt_ids: list[int],
+    scope: str,
+    snap_prep: tuple[int, int] | None,
+    tool_snap_prep: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Plan thick conv snap after cold turn 1 when tool inline pin took snap=.
+
+    Turn 1 cold prefill can only attach one ``snap=`` per daemon command; the
+    tool pin wins.  A follow-up ``RESTORE_CHAIN -1 <thin> … 0 snap=`` registers
+    the conversation thick slot so turn 2+ can use ``thick=0`` instead of
+    ``thick=-1`` (full chain prefill).
+    """
+    if snap_prep is not None or tool_snap_prep is None:
+        return None
+    cache_scope = scope or "global"
+    if scope_skips_prefix_snap(cache_scope) or prefix_cache.disabled:
+        return None
+    prep = prefix_cache.prepare_inline_snap(prompt_ids, scope=cache_scope)
+    if prep is None:
+        return None
+    conv_slot, _ = prep
+    if conv_slot == tool_snap_prep[0]:
+        prefix_cache.abort_inline_snap(conv_slot, scope=cache_scope)
+        return None
+    return prep
+
+
 def resolve_cache_scope(
     *,
     conversation_id: str | None,

@@ -55,6 +55,7 @@ from transformers import AutoTokenizer
 from prefix_cache import (
     DaemonStdoutBus,
     PrefixCache,
+    deferred_conv_snap_after_cold_tool,
     extract_conversation_id,
     resolve_cache_scope,
 )
@@ -663,6 +664,70 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 scope=cache_scope,
             )
 
+    async def _drain_prefill_timings(timeout: float = 120.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if bus.request_timings().get("prefill_ms") is not None:
+                return
+            await asyncio.sleep(0.005)
+
+    async def _commit_deferred_conv_snap_after_cold_tool(
+        *,
+        prompt_ids: list[int],
+        prompt_bin: Path,
+        cache_scope: str,
+        tool_snap_prep: tuple[int, int],
+        snap_prep: tuple[int, int] | None,
+    ) -> None:
+        conv_prep = deferred_conv_snap_after_cold_tool(
+            prefix_cache=prefix_cache,
+            prompt_ids=prompt_ids,
+            scope=cache_scope,
+            snap_prep=snap_prep,
+            tool_snap_prep=tool_snap_prep,
+        )
+        if conv_prep is None:
+            return
+        conv_slot, conv_cut = conv_prep
+        tool_slot, _tool_kv_end = tool_snap_prep
+        print(
+            f"  [pc] deferred conv snap after cold tool pin "
+            f"thick_slot={conv_slot} cut={conv_cut} thin={tool_slot}",
+            flush=True,
+        )
+        line = (
+            f"RESTORE_CHAIN -1 {tool_slot} {prompt_bin} 0 "
+            f"snap={conv_cut}:{conv_slot}\n"
+        )
+        drain_pipe_residual(r_pipe)
+        bus.begin_request()
+        daemon_proc.stdin.write(line.encode("utf-8"))
+        daemon_proc.stdin.flush()
+        try:
+            await asyncio.to_thread(
+                lambda: list(
+                    iter_pipe_tokens(
+                        r_pipe,
+                        0,
+                        stop_ids,
+                        bus=bus,
+                        wall_timeout=120.0,
+                    )
+                ),
+            )
+            await _drain_prefill_timings(timeout=120.0)
+            await bus.drain_inline_snap(timeout=30.0)
+            prefix_cache.finish_inline_snap(
+                conv_prep,
+                prompt_ids,
+                inline_slot=bus.inline_snap_slot(),
+                scope=cache_scope,
+            )
+        except Exception as exc:
+            print(f"  [pc] deferred conv snap failed: {exc}", flush=True)
+            prefix_cache.abort_inline_snap(conv_slot, scope=cache_scope)
+
     def _abort_full_snap_if_needed(full_snap_prep) -> None:
         if full_snap_prep is not None:
             fslot, _ = full_snap_prep
@@ -691,12 +756,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             await _finish_inline_snap(snap_prep, prompt_ids, cache_scope=cache_scope)
         elif snap_prep:
             prefix_cache.abort_inline_snap(snap_prep[0], scope=cache_scope)
+        tool_pinned = False
         if success and tool_snap_prep and tool_split and tool_ctx and tool_ctx.fingerprint:
-            await finish_tool_inline_snap(
+            tool_pinned = await finish_tool_inline_snap(
                 orchestrator=tool_split,
                 bus=bus,
                 fingerprint=tool_ctx.fingerprint,
                 tool_snap_prep=tool_snap_prep,
+            )
+        if (
+            success
+            and tool_pinned
+            and tool_snap_prep
+            and snap_prep is None
+            and tool_split
+            and tool_ctx
+        ):
+            await _commit_deferred_conv_snap_after_cold_tool(
+                prompt_ids=prompt_ids,
+                prompt_bin=cur_bin,
+                cache_scope=cache_scope,
+                tool_snap_prep=tool_snap_prep,
+                snap_prep=snap_prep,
             )
 
     def _request_cache_scope(

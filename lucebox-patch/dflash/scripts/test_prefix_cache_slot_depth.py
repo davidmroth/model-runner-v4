@@ -2,7 +2,13 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from prefix_cache import PrefixCache, hash_prefix, resolve_cache_scope, scope_skips_prefix_snap
+from prefix_cache import (
+    PrefixCache,
+    deferred_conv_snap_after_cold_tool,
+    hash_prefix,
+    resolve_cache_scope,
+    scope_skips_prefix_snap,
+)
 
 
 class _FakeTokenizer:
@@ -154,6 +160,54 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
         self.assertIn(conv_key, pc.entries)
         self.assertEqual(pc._slot_prefix_len[0], 376)
         self.assertEqual(pc._slot_scope[0], conv_scope)
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_deferred_conv_snap_after_cold_tool(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376]
+        scope = "sess-a"
+        tool_snap = (4, 376)
+
+        prep = deferred_conv_snap_after_cold_tool(
+            prefix_cache=pc,
+            prompt_ids=ids,
+            scope=scope,
+            snap_prep=None,
+            tool_snap_prep=tool_snap,
+        )
+        self.assertEqual(prep, (0, 50))
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_deferred_conv_snap_skipped_when_conv_snap_on_cmd(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376]
+        self.assertIsNone(
+            deferred_conv_snap_after_cold_tool(
+                prefix_cache=pc,
+                prompt_ids=ids,
+                scope="sess-a",
+                snap_prep=(0, 376),
+                tool_snap_prep=(4, 376),
+            )
+        )
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_deferred_conv_snap_skipped_for_ephemeral(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376]
+        ephemeral = resolve_cache_scope(conversation_id=None, prompt_ids=ids)
+        self.assertIsNone(
+            deferred_conv_snap_after_cold_tool(
+                prefix_cache=pc,
+                prompt_ids=ids,
+                scope=ephemeral,
+                snap_prep=None,
+                tool_snap_prep=(4, 376),
+            )
+        )
 
     def test_abort_full_snap_purges_stale_lookup(self):
         pc = self._make_cache()
