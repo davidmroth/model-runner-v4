@@ -165,7 +165,7 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
     def test_deferred_conv_snap_after_cold_tool(self, mock_bounds):
         pc = self._make_cache()
         ids = list(range(400))
-        mock_bounds.return_value = [50, 376]
+        mock_bounds.return_value = [50, 376, 390]
         scope = "sess-a"
         tool_snap = (4, 376)
 
@@ -176,7 +176,22 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
             snap_prep=None,
             tool_snap_prep=tool_snap,
         )
-        self.assertEqual(prep, (0, 50))
+        self.assertEqual(prep, (0, 390))
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_deferred_conv_snap_skips_tool_only_boundary(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(376))
+        mock_bounds.return_value = [50, 376]
+        self.assertIsNone(
+            deferred_conv_snap_after_cold_tool(
+                prefix_cache=pc,
+                prompt_ids=ids,
+                scope="sess-a",
+                snap_prep=None,
+                tool_snap_prep=(4, 376),
+            )
+        )
 
     @patch("prefix_cache.find_all_boundaries_markers")
     def test_deferred_conv_snap_skipped_when_conv_snap_on_cmd(self, mock_bounds):

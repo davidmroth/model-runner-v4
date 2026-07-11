@@ -664,14 +664,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 scope=cache_scope,
             )
 
-    async def _drain_prefill_timings(timeout: float = 120.0) -> None:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            if bus.request_timings().get("prefill_ms") is not None:
-                return
-            await asyncio.sleep(0.005)
-
     async def _commit_deferred_conv_snap_after_cold_tool(
         *,
         prompt_ids: list[int],
@@ -696,10 +688,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             f"thick_slot={conv_slot} cut={conv_cut} thin={tool_slot}",
             flush=True,
         )
-        line = (
-            f"RESTORE_CHAIN -1 {tool_slot} {prompt_bin} 0 "
-            f"snap={conv_cut}:{conv_slot}\n"
-        )
+        # Daemon rejects gen_len=0 on RESTORE_CHAIN; use 1 token (discarded).
+        line = append_inline_snap(
+            f"RESTORE_CHAIN -1 {tool_slot} {prompt_bin} 1",
+            (conv_slot, conv_cut),
+        ) + "\n"
         drain_pipe_residual(r_pipe)
         bus.begin_request()
         daemon_proc.stdin.write(line.encode("utf-8"))
@@ -709,15 +702,20 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 lambda: list(
                     iter_pipe_tokens(
                         r_pipe,
-                        0,
+                        1,
                         stop_ids,
                         bus=bus,
                         wall_timeout=120.0,
                     )
                 ),
             )
-            await _drain_prefill_timings(timeout=120.0)
+            await bus.drain_timings(timeout=120.0)
             await bus.drain_inline_snap(timeout=30.0)
+            if bus.inline_snap_slot() != conv_slot:
+                raise RuntimeError(
+                    f"inline snap ack slot={bus.inline_snap_slot()!r} "
+                    f"expected={conv_slot}"
+                )
             prefix_cache.finish_inline_snap(
                 conv_prep,
                 prompt_ids,

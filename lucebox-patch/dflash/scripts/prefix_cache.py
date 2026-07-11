@@ -509,6 +509,23 @@ def scope_skips_prefix_snap(scope: str) -> bool:
     return (scope or "").startswith("ephemeral:")
 
 
+def _conv_snap_cut_after_tool(
+    prefix_cache: "PrefixCache",
+    prompt_ids: list[int],
+    tool_prefix_len: int,
+) -> int | None:
+    """Deepest turn-1 boundary strictly after the thin tool prefix."""
+    candidates = prefix_cache._all_boundaries(prompt_ids)
+    if not candidates:
+        return len(prompt_ids) if len(prompt_ids) > tool_prefix_len else None
+    after_tool = [c for c in candidates if c > tool_prefix_len]
+    if after_tool:
+        return after_tool[-1]
+    if len(prompt_ids) > tool_prefix_len:
+        return len(prompt_ids)
+    return None
+
+
 def deferred_conv_snap_after_cold_tool(
     *,
     prefix_cache: "PrefixCache",
@@ -520,7 +537,7 @@ def deferred_conv_snap_after_cold_tool(
     """Plan thick conv snap after cold turn 1 when tool inline pin took snap=.
 
     Turn 1 cold prefill can only attach one ``snap=`` per daemon command; the
-    tool pin wins.  A follow-up ``RESTORE_CHAIN -1 <thin> … 0 snap=`` registers
+    tool pin wins.  A follow-up ``RESTORE_CHAIN -1 <thin> … snap=`` registers
     the conversation thick slot so turn 2+ can use ``thick=0`` instead of
     ``thick=-1`` (full chain prefill).
     """
@@ -529,14 +546,18 @@ def deferred_conv_snap_after_cold_tool(
     cache_scope = scope or "global"
     if scope_skips_prefix_snap(cache_scope) or prefix_cache.disabled:
         return None
+    tool_slot, tool_prefix_len = tool_snap_prep
+    conv_cut = _conv_snap_cut_after_tool(prefix_cache, prompt_ids, tool_prefix_len)
+    if conv_cut is None or conv_cut <= tool_prefix_len:
+        return None
     prep = prefix_cache.prepare_inline_snap(prompt_ids, scope=cache_scope)
     if prep is None:
         return None
     conv_slot, _ = prep
-    if conv_slot == tool_snap_prep[0]:
+    if conv_slot == tool_slot:
         prefix_cache.abort_inline_snap(conv_slot, scope=cache_scope)
         return None
-    return prep
+    return (conv_slot, conv_cut)
 
 
 def resolve_cache_scope(
