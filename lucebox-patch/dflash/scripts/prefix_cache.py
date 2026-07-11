@@ -499,6 +499,16 @@ def hash_prefix(prefix_ids, kv_k_type, fa_window, scope: str = ""):
     return h.digest()[:16]
 
 
+def scope_skips_prefix_snap(scope: str) -> bool:
+    """Ephemeral (no conversation id) traffic must not commit prefix snapshots.
+
+    Benchmark probes share the daemon but lack a stable session scope; letting
+    them inline-snap would evict conversation LRU entries and overwrite KV in
+    the same slot (turn 2+ thick restore miss).
+    """
+    return (scope or "").startswith("ephemeral:")
+
+
 def resolve_cache_scope(
     *,
     conversation_id: str | None,
@@ -695,6 +705,9 @@ class PrefixCache:
         if best is not None:
             print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
                   f"scope={cache_scope!r} (of {len(prompt_ids)} total)", flush=True)
+        elif not scope_skips_prefix_snap(cache_scope) and candidates:
+            print(f"{self.log_prefix} lookup miss scope={cache_scope!r} "
+                  f"(of {len(prompt_ids)} total)", flush=True)
         return best
 
     def slot_populated(self, slot: int) -> bool:
@@ -713,6 +726,9 @@ class PrefixCache:
     ) -> None:
         """Confirm or abort an inline snap reservation based on daemon ack."""
         if not snap_prep:
+            return
+        if scope_skips_prefix_snap(scope or "global"):
+            self.abort_inline_snap(snap_prep[0], scope=scope)
             return
         slot, target_cut = snap_prep
         if inline_slot == slot:
@@ -747,6 +763,8 @@ class PrefixCache:
         if self.disabled:
             return None
         cache_scope = scope or "global"
+        if scope_skips_prefix_snap(cache_scope):
+            return None
         candidates = self._all_boundaries(prompt_ids)
         if not candidates:
             return None
@@ -790,6 +808,10 @@ class PrefixCache:
         if self.disabled:
             return
         cache_scope = scope or "global"
+        if scope_skips_prefix_snap(cache_scope):
+            if self._pending_evict_key is not None:
+                self._pending_evict_key = None
+            return
         if self._pending_evict_key is not None:
             self.entries.pop(self._pending_evict_key, None)
             self._pending_evict_key = None

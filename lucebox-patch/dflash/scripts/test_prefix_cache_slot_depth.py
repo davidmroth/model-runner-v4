@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from prefix_cache import PrefixCache, hash_prefix, resolve_cache_scope
+from prefix_cache import PrefixCache, hash_prefix, resolve_cache_scope, scope_skips_prefix_snap
 
 
 class _FakeTokenizer:
@@ -123,6 +123,37 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
 
         self.assertNotIn(entry_key, pc.entries)
         self.assertNotIn(0, pc._slot_prefix_len)
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_ephemeral_prepare_skips_inline_snap(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376]
+        ephemeral = resolve_cache_scope(conversation_id=None, prompt_ids=ids)
+
+        self.assertTrue(scope_skips_prefix_snap(ephemeral))
+        self.assertIsNone(pc.prepare_inline_snap(ids, scope=ephemeral))
+        self.assertEqual(len(pc.entries), 0)
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_ephemeral_confirm_does_not_evict_conversation_slot(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376]
+        conv_scope = "e078410b-cd79-4685-8b7b-8d760dc370e8"
+        conv_key = self._scoped_entry(pc, ids, 376, conv_scope)
+
+        pc.entries[conv_key] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 376
+        pc._slot_scope[0] = conv_scope
+
+        ephemeral = resolve_cache_scope(conversation_id=None, prompt_ids=ids[:60])
+        pc.confirm_inline_snap(0, 59, ids[:60], scope=ephemeral)
+
+        self.assertIn(conv_key, pc.entries)
+        self.assertEqual(pc._slot_prefix_len[0], 376)
+        self.assertEqual(pc._slot_scope[0], conv_scope)
 
     def test_abort_full_snap_purges_stale_lookup(self):
         pc = self._make_cache()
