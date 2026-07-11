@@ -42,6 +42,7 @@ DFLASH_PREFILL_MODE=off              # PFlash conv compress breaks tool calls
 DFLASH_TOOL_SPLIT_COMPRESS_CONV=0
 DFLASH_DRAFT_FEATURE_MIRROR=1
 DFLASH_LEGACY_DAEMON=1               # SNAPSHOT_THIN / RESTORE_CHAIN protocol
+DFLASH_TOOL_INLINE_SNAP_PIN=1        # Phase 1c: pin tool KV via inline snap= (20K+ schemas)
 ```
 
 Agent traffic must send `X-Conversation-Id: <uuid>` per session.

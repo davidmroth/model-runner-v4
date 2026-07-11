@@ -51,7 +51,7 @@ docker run --rm --network ai-inference \
 echo ""
 echo "--- Lucebox log markers (last 30m) ---"
 docker logs "$LUCEBOX" --since 30m 2>&1 \
-  | grep -E 'empty prompt|inline snap failed|RESTORE_CHAIN|cache scope|tool-split' \
+  | grep -E 'empty prompt|inline snap failed|RESTORE_CHAIN|tool KV pinned|lookup hit|cache scope|tool-split' \
   | tail -50 \
   | tee "$OUT_DIR/lucebox-markers.log" || true
 

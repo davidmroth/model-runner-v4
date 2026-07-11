@@ -191,11 +191,14 @@ def count_markers(log: str) -> dict[str, int]:
         "RESTORE_CHAIN",
         "SNAPSHOT_THIN",
         "tool KV pinned",
+        "tool KV pinned (inline)",
         "inline-snap committed",
+        "lookup hit",
         "lookup stale",
         "released reservation",
         "split failed",
         "inline snap failed",
+        "inline tool pin failed",
     ]
     return {k: log.count(k) for k in keys}
 
@@ -377,6 +380,14 @@ def main() -> int:
     add_check(report, "restore_chain_seen",
               report.markers.get("RESTORE_CHAIN", 0) >= 1,
               f"count={report.markers.get('RESTORE_CHAIN', 0)}")
+    pinned = (
+        report.markers.get("tool KV pinned (inline)", 0)
+        + report.markers.get("tool KV pinned", 0)
+    )
+    add_check(report, "tool_kv_pinned",
+              pinned >= 1,
+              f"inline={report.markers.get('tool KV pinned (inline)', 0)} "
+              f"thin={report.markers.get('tool KV pinned', 0)}")
     add_check(report, "inline_snap_seen",
               report.markers.get("inline-snap committed", 0) >= 1,
               f"count={report.markers.get('inline-snap committed', 0)}")

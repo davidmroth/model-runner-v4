@@ -55,8 +55,9 @@ export DFLASH_TOOL_SPLIT_PLUGIN_DIR=$HOME/.lucebox/tool_split_plugins
 
 ## Daemon flow (wired)
 
-1. **First request** with a tool fingerprint: full prefill, then
-   ``SNAPSHOT_THIN <slot> 0 <tool_prefix_len>`` commits pinned tool KV.
+1. **First request** with a tool fingerprint: full prefill with inline
+   ``snap=<tool_prefix_len>:<pin_slot>`` (default, ``DFLASH_TOOL_INLINE_SNAP_PIN=1``),
+   or legacy ``SNAPSHOT_THIN <slot> 0 <tool_prefix_len>`` when inline pin is off.
 2. **Later requests** with the same tools: ``RESTORE_CHAIN -1 <tool_slot> <prompt> <n_gen>``
    restores tool KV and prefills only the conversation suffix.
 3. **Conversation prefix hit** + tool hit:

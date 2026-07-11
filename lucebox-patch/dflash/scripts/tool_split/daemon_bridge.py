@@ -2,8 +2,58 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
-from handler_reliability import tool_snapshot_max_kv_tokens
+from handler_reliability import tool_inline_snap_pin_enabled, tool_snapshot_max_kv_tokens
+
+
+def tool_snap_prep_from_pending(
+    pending_tool_snap: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Return ``(pin_slot, kv_end)`` for inline tool pin on cold prefill, or ``None``."""
+    if not tool_inline_snap_pin_enabled() or pending_tool_snap is None:
+        return None
+    slot, kv_end = pending_tool_snap
+    if kv_end <= 0:
+        return None
+    return (slot, kv_end)
+
+
+def append_inline_snap(cmd: str, snap: tuple[int, int] | None) -> str:
+    """Append ``snap=cut:slot`` to a daemon command line (no trailing newline)."""
+    if snap is None:
+        return cmd
+    slot, cut = snap
+    return f"{cmd} snap={cut}:{slot}"
+
+
+async def finish_tool_inline_snap(
+    *,
+    orchestrator,
+    bus: Any,
+    fingerprint: str,
+    tool_snap_prep: tuple[int, int] | None,
+) -> bool:
+    """Confirm tool KV pin after inline ``snap=`` ack, or release the reservation."""
+    if tool_snap_prep is None or not fingerprint:
+        return False
+    slot, kv_end = tool_snap_prep
+    await bus.drain_inline_snap()
+    if bus.inline_snap_slot() == slot:
+        orchestrator.tool_slots.confirm(fingerprint, slot)
+        print(
+            f"[tool-split] tool KV pinned (inline) slot={slot} len={kv_end} "
+            f"fp={fingerprint[:12]}…",
+            flush=True,
+        )
+        return True
+    orchestrator.tool_slots.release_reservation(fingerprint, slot)
+    print(
+        f"[tool-split] inline tool pin failed slot={slot} "
+        f"(ack={bus.inline_snap_slot()!r}) fp={fingerprint[:12]}…",
+        flush=True,
+    )
+    return False
 
 
 async def snapshot_thin(
@@ -41,6 +91,8 @@ async def commit_pending_tool_snap(
     if kv_end <= 0:
         orchestrator.tool_slots.release_reservation(fingerprint, slot)
         return
+    if orchestrator.tool_slots.pinned_slot(fingerprint) is not None:
+        return
     max_kv = tool_snapshot_max_kv_tokens()
     if max_kv > 0 and kv_end > max_kv:
         orchestrator.tool_slots.release_reservation(fingerprint, slot)
@@ -65,7 +117,6 @@ async def commit_pending_tool_snap(
             flush=True,
         )
     else:
-        # Reservation must not look like a populated hit on the next request.
         orchestrator.tool_slots.release_reservation(fingerprint, slot)
         print(
             f"[tool-split] SNAPSHOT_THIN failed; released reservation "

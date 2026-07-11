@@ -39,6 +39,12 @@ def tool_snapshot_max_kv_tokens() -> int:
         return 16384
 
 
+def tool_inline_snap_pin_enabled() -> bool:
+    """Pin tool KV via inline ``snap=`` on cold prefill (Phase 1c; avoids SNAPSHOT_THIN)."""
+    raw = os.environ.get("DFLASH_TOOL_INLINE_SNAP_PIN", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def request_wall_timeout_seconds() -> float:
     raw = os.environ.get("DFLASH_REQUEST_WALL_TIMEOUT_SEC", "600")
     try:

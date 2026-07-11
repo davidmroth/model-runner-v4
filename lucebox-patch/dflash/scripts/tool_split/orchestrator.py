@@ -101,6 +101,10 @@ class ToolSlotCache:
     def lookup(self, fingerprint: str) -> int | None:
         if fingerprint in self._pending:
             return None
+        return self.pinned_slot(fingerprint)
+
+    def pinned_slot(self, fingerprint: str) -> int | None:
+        """Return confirmed thin-slot id for ``fingerprint``, or ``None``."""
         if fingerprint in self._confirmed:
             self._confirmed.move_to_end(fingerprint)
             return self._confirmed[fingerprint]

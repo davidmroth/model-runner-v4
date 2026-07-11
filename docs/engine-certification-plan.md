@@ -71,6 +71,8 @@ prefix cache can reuse conversation snapshots without cross-session pollution.
 
 ## Certification pipeline
 
+See also: [restore-chain-phases-1-3.md](./restore-chain-phases-1-3.md) (RESTORE_CHAIN recovery plan).
+
 Run on any host with `model-runner-v4-lucebox` + `ai-platform-proxy` on
 network `ai-inference`:
 

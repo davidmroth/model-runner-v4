@@ -61,7 +61,12 @@ from prefix_cache import (
 from tool_split.config import ToolSplitConfig, add_cli_flags as add_tool_split_flags
 from tool_split.config import config_from_env_and_args as tool_split_config_from_args
 from tool_split.base import ToolRequestContext
-from tool_split.daemon_bridge import commit_pending_tool_snap
+from tool_split.daemon_bridge import (
+    append_inline_snap,
+    commit_pending_tool_snap,
+    finish_tool_inline_snap,
+    tool_snap_prep_from_pending,
+)
 from tool_split.orchestrator import ToolSplitOrchestrator
 from tool_split.registry import resolve_adapter as resolve_tool_split_adapter
 
@@ -647,6 +652,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cur_ids: list[int] | None,
         success: bool,
         cache_scope: str,
+        tool_snap_prep: tuple[int, int] | None = None,
+        tool_ctx: ToolRequestContext | None = None,
     ) -> None:
         if full_snap_prep is not None:
             if success and cur_ids is not None:
@@ -659,6 +666,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             await _finish_inline_snap(snap_prep, prompt_ids, cache_scope=cache_scope)
         elif snap_prep:
             prefix_cache.abort_inline_snap(snap_prep[0], scope=cache_scope)
+        if success and tool_snap_prep and tool_split and tool_ctx and tool_ctx.fingerprint:
+            await finish_tool_inline_snap(
+                orchestrator=tool_split,
+                bus=bus,
+                fingerprint=tool_ctx.fingerprint,
+                tool_snap_prep=tool_snap_prep,
+            )
 
     def _request_cache_scope(
         headers: dict[str, str] | None,
@@ -706,22 +720,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cur_ids: list[int] | None,
         tool_ctx: ToolRequestContext | None,
         cache_scope: str,
-    ) -> tuple[str, object | None, int | None]:
-        """Build daemon stdin line, optional inline snap_prep, conv prefix len."""
+    ) -> tuple[str, tuple[int, int] | None, int | None, tuple[int, int] | None]:
+        """Build daemon stdin line, optional inline snap_prep, conv prefix len, tool snap."""
         if full_hit is not None:
             slot, cached_cur_bin, cached_len = full_hit
-            return f"RESTORE {slot} {cached_cur_bin} {gen_len}\n", None, cached_len
+            return f"RESTORE {slot} {cached_cur_bin} {gen_len}\n", None, cached_len, None
         if compression_fired:
             if full_snap_prep is not None:
                 fslot, _ = full_snap_prep
-                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n", None, None
-            return f"{cur_bin} {gen_len}\n", None, None
+                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n", None, None, None
+            return f"{cur_bin} {gen_len}\n", None, None, None
 
         hit = prefix_cache.lookup(prompt_ids, scope=cache_scope)
         conv_prefix_len = hit[1] if hit else None
         reuse = hit[0] if hit else None
         snap_prep = prefix_cache.prepare_inline_snap(
             prompt_ids, reuse_slot=reuse, scope=cache_scope)
+        tool_snap_prep = None
+        if tool_split and tool_ctx:
+            tool_snap_prep = tool_snap_prep_from_pending(tool_ctx.pending_tool_snap)
+            if tool_snap_prep is not None:
+                # One snap= per daemon command; tool pin wins on cold turn 1.
+                snap_prep = None
 
         if tool_split and tool_ctx and tool_ctx.tool_slot_hit is not None:
             plan = tool_split.build_plan(
@@ -751,14 +771,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 f"thin={plan.thin_slot_ids} prompt_tokens={len(prompt_ids)}",
                 flush=True,
             )
-            return cmd, snap_prep, conv_prefix_len
+            return cmd, snap_prep, conv_prefix_len, None
 
         if tool_split and tool_ctx:
             if tool_ctx.pending_tool_snap is not None:
                 slot, kv_end = tool_ctx.pending_tool_snap
+                pin_mode = "inline" if tool_snap_prep else "SNAPSHOT_THIN"
                 print(
                     f"  [tool-split] cold tool prefill slot={slot} "
-                    f"tool_prefix_len={kv_end} prompt_tokens={len(prompt_ids)}",
+                    f"tool_prefix_len={kv_end} pin={pin_mode} "
+                    f"prompt_tokens={len(prompt_ids)}",
                     flush=True,
                 )
             elif tool_ctx.tool_slot_hit is None and tool_ctx.fingerprint:
@@ -773,9 +795,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             cmd = f"RESTORE {slot} {cur_bin} {gen_len}"
         else:
             cmd = f"{cur_bin} {gen_len}"
-        if snap_prep:
-            cmd += f" snap={snap_prep[1]}:{snap_prep[0]}"
-        return cmd + "\n", snap_prep, conv_prefix_len
+        if tool_snap_prep is not None:
+            cmd = append_inline_snap(cmd, tool_snap_prep)
+        elif snap_prep:
+            cmd = append_inline_snap(cmd, snap_prep)
+        return cmd + "\n", snap_prep, conv_prefix_len, tool_snap_prep
 
     async def _commit_tool_snap_if_needed(tool_ctx: ToolRequestContext | None) -> None:
         if not tool_split or not tool_ctx or not tool_ctx.pending_tool_snap:
@@ -1138,7 +1162,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         try:
             async with _daemon_request_lock("chat"):
                 await _restart_daemon_if_dead()
-                cmd_line, snap_prep, conv_prefix_len = _compose_daemon_cmd(
+                cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     cur_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
                     compression_fired=compression_fired,
@@ -1176,6 +1200,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         cur_ids=cur_ids,
                         success=False,
                         cache_scope=cache_scope,
+                        tool_snap_prep=tool_snap_prep,
+                        tool_ctx=tool_ctx,
                     )
                     raise
                 except Exception:
@@ -1187,6 +1213,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         cur_ids=cur_ids,
                         success=False,
                         cache_scope=cache_scope,
+                        tool_snap_prep=tool_snap_prep,
+                        tool_ctx=tool_ctx,
                     )
                     raise
                 await _finalize_request_snaps(
@@ -1197,6 +1225,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cur_ids=cur_ids,
                     success=snap_ok,
                     cache_scope=cache_scope,
+                    tool_snap_prep=tool_snap_prep,
+                    tool_ctx=tool_ctx,
                 )
                 await _commit_tool_snap_if_needed(tool_ctx)
         except DaemonBusyError:
@@ -1298,6 +1328,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         async def sse() -> AsyncIterator[str]:
             snap_prep = None
+            tool_snap_prep = None
             conv_prefix_len = None
             completion_tokens = 0
             finish_reason = "stop"
@@ -1318,6 +1349,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cur_ids=cur_ids,
                     success=success,
                     cache_scope=cache_scope,
+                    tool_snap_prep=tool_snap_prep,
+                    tool_ctx=tool_ctx,
                 )
                 if success:
                     await _commit_tool_snap_if_needed(tool_ctx)
@@ -1325,7 +1358,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             try:
                 async with _daemon_request_lock("chat-stream"):
                     await _restart_daemon_if_dead()
-                    cmd_line, snap_prep, conv_prefix_len = _compose_daemon_cmd(
+                    cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                         prompt_bin, gen_len, prompt_ids,
                         full_hit=full_hit,
                         compression_fired=compression_fired,
@@ -2156,6 +2189,12 @@ def main():
             tool_split_orchestrator.tool_slots = ToolSlotCache(
                 pinned_slots=tool_split_cfg.pinned_tool_slots,
                 slot_base=args.prefix_cache_slots + args.prefill_cache_slots,
+            )
+            from handler_reliability import tool_inline_snap_pin_enabled
+            print(
+                f"  [cfg] tool-inline-snap-pin="
+                f"{1 if tool_inline_snap_pin_enabled() else 0}",
+                flush=True,
             )
 
     extra_daemon: list[str] = []
