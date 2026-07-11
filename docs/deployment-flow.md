@@ -27,8 +27,7 @@ flowchart LR
     end
   end
   LH -- "git push + remote fetch" --> SRC
-  LH -- "scp *.py" --> PATCH
-  MR -- "scp compose/entrypoint/.env edits" --> RUN
+  MR -- "git push + git pull" --> RUN
   SRC -- "bind mount server/build → /opt/lucebox-hub/dflash-build" --> LB
   PATCH -- "bind mount → /opt/lucebox-hub/patch/dflash/scripts (ro)" --> LB
   SC -- "HTTP :8080" --> LB
@@ -38,7 +37,7 @@ Two remote users, one host:
 
 | User | Purpose |
 |---|---|
-| `bot@192.168.87.153` | Read-only ops: `docker logs`, `docker run` sidecars, `nvidia-smi`, scp to `/tmp` |
+| `bot@192.168.87.153` | Read-only ops: `docker logs`, `docker run` sidecars, `nvidia-smi` |
 | `david@192.168.87.153` | Writes under `/media/data/projects/*` and `docker compose` lifecycle |
 
 ## Container Mounts (what the runner actually executes)
@@ -52,27 +51,36 @@ From `docker inspect model-runner-v4-lucebox`:
 | `models-cache` | `/opt/lucebox-hub/server/models` (rw) | GGUF weights (target, draft, PFlash drafter) |
 | `model-runner-v4/scripts/entrypoint-*.sh` | `/scripts/…` (ro) | Entrypoints |
 
-Key consequence: **Python changes need only an scp + container restart;
-C++ changes need a remote rebuild.**
+Key consequence: **Python patch changes need `git pull` on ai.local +
+`docker compose up -d --force-recreate lucebox`; C++ changes need a remote
+rebuild.** See [deployment-sop.md](./deployment-sop.md) — no `scp`.
 
-## Flow A — Python server change (seconds)
+## Flow A — Python patch change (seconds)
 
 ```mermaid
 sequenceDiagram
   participant Dev as dev machine
+  participant Git as git remote
   participant AI as ai.local
-  Dev->>Dev: edit lucebox-hub/server/scripts/*.py, py_compile check
-  Dev->>AI: scp *.py david@…:/media/data/projects/model-runner-v4/lucebox-patch/dflash/scripts/
-  Dev->>AI: ssh bot@… docker restart model-runner-v4-lucebox
+  Dev->>Dev: edit model-runner-v4/lucebox-patch/…, py_compile check
+  Dev->>Git: git commit + push
+  AI->>Git: git pull
+  AI->>AI: docker compose up -d --force-recreate lucebox
   Note over AI: ~60s model load
-  Dev->>AI: run benchmark sidecar (Flow D)
+  Dev->>AI: run verification (Flow D)
 ```
 
 ```bash
-python3 -m py_compile server/scripts/prefix_cache.py server/scripts/server_tools.py
-scp server/scripts/{prefix_cache,server_tools}.py \
-    david@192.168.87.153:/media/data/projects/model-runner-v4/lucebox-patch/dflash/scripts/
-ssh bot@192.168.87.153 "docker restart model-runner-v4-lucebox"
+# dev machine
+cd ~/development/projects/model-runner-v4
+python3 -m py_compile lucebox-patch/dflash/scripts/server_tools.py
+git add lucebox-patch/ && git commit -m "…" && git push origin feat/vision
+
+# ai.local
+ssh david@ai.local
+cd /media/data/projects/model-runner-v4
+git pull origin feat/vision
+docker compose up -d --force-recreate lucebox
 ```
 
 ## Flow B — C++ daemon change (minutes)
@@ -107,13 +115,12 @@ host; `docker-compose.yml` passes them through with defaults; the entrypoint
 ssh david@192.168.87.153 \
   "cd /media/data/projects/model-runner-v4 && sed -i 's/^DFLASH_DDTREE_BUDGET=.*/DFLASH_DDTREE_BUDGET=22/' .env"
 
-# compose/entrypoint edits are made locally, then synced
-scp docker-compose.yml scripts/entrypoint-tool-split-serve.sh \
-    david@192.168.87.153:/media/data/projects/model-runner-v4/…
-
-# recreate (plain `up -d` won't reread .env into a running container)
-ssh david@192.168.87.153 \
-  "cd /media/data/projects/model-runner-v4 && docker compose --profile serve up -d --force-recreate"
+# compose/entrypoint edits: commit + push locally, then on ai.local:
+ssh david@ai.local
+cd /media/data/projects/model-runner-v4
+git pull
+# edit .env on host if needed (not in git)
+docker compose --profile serve up -d --force-recreate
 ```
 
 Note the `--profile serve` — the compose file gates the runner behind a
@@ -126,23 +133,24 @@ DFLASH_MAX_CTX=131072          DFLASH_PREFIX_CACHE_SLOTS=4
 DFLASH_TOOL_SPLIT_ENABLED=1    DFLASH_TOOL_SPLIT_PINNED_SLOTS=2
 DFLASH_PREFILL_CACHE_SLOTS=2   DFLASH_PREFILL_THRESHOLD=16384
 DFLASH_DRAFT_GPU=0             DFLASH27B_DRAFT_CTX_MAX=2048
-DFLASH_DDTREE_BUDGET=22        DFLASH_DRAFT_FEATURE_MIRROR=0
+DFLASH_DDTREE_BUDGET=22        DFLASH_DRAFT_FEATURE_MIRROR=1
 DFLASH27B_FA_WINDOW=0          DFLASH_LAYER_SPLIT=0
 DFLASH_LEGACY_DAEMON=1 (set by entrypoint)
 ```
 
 ## Flow D — Verification (every deploy)
 
-The API is only reachable inside the `ai-inference` Docker network, so
-benchmarks run as a throwaway sidecar container on that network. Scripts are
-scp'd to `/tmp` and mounted read-only (editing in place fails with
-"Device or resource busy").
+The API is only reachable inside the `ai-inference` Docker network.
+Benchmark scripts live in the pulled repo under `scripts/` — mount from the
+host checkout (no `scp`):
 
 ```bash
-scp scripts/decode_bench.py bot@192.168.87.153:/tmp/decode_bench.py
-ssh bot@192.168.87.153 \
-  "docker run --rm --network ai-inference \
-     -v /tmp/decode_bench.py:/tmp/b.py:ro python:3.12-slim python /tmp/b.py"
+ssh david@ai.local
+cd /media/data/projects/model-runner-v4
+git pull   # ensures scripts/decode_bench.py is current
+docker run --rm --network ai-inference \
+  -v /media/data/projects/model-runner-v4/scripts/decode_bench.py:/tmp/b.py:ro \
+  python:3.12-slim python /tmp/b.py
 ```
 
 Standard checks, in order:
@@ -165,7 +173,7 @@ Every layer is independently revertible:
 
 | Layer | Rollback |
 |---|---|
-| Python server | `git checkout <prev> -- server/scripts/…` locally, re-scp, restart |
+| Python patch (`lucebox-patch/`) | `git checkout <prev>` on ai.local, recreate lucebox |
 | Daemon binary | `git checkout <prev>` in `lucebox-hub-src`, rebuild (or keep the old `server/build` dir aside before rebuilding) |
 | Config | edit `.env`, `docker compose --profile serve up -d --force-recreate` |
 | Everything | compose still defaults to the stock GHCR image path when the tool-split entrypoint is disabled (`DFLASH_TOOL_SPLIT_ENABLED=0`) |

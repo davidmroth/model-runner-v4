@@ -219,5 +219,5 @@ that ran for months before tool-split was enabled without the scoped-cache fix.
 
 - [whitepaper-agent-inference-cache.md](./whitepaper-agent-inference-cache.md) — architecture + benchmarks
 - [feedback-prefix-cache-regression.md](./feedback-prefix-cache-regression.md)
-- [deployment-flow.md](./deployment-flow.md) — scp / compose lifecycle
+- [deployment-flow.md](./deployment-flow.md) — git pull / compose lifecycle
 - `scripts/run-engine-certification.sh` — one-command cert runner

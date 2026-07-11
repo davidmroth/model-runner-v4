@@ -356,6 +356,7 @@ Program is **done** when all of the following are true:
 | [feedback-prefix-cache-regression.md](./feedback-prefix-cache-regression.md) | Cache pollution root cause + fix |
 | [feedback-pflash-agent-regression.md](./feedback-pflash-agent-regression.md) | Why PFlash stays off for agents |
 | [deployment-flow.md](./deployment-flow.md) | How patches reach `ai.local` |
+| [deployment-sop.md](./deployment-sop.md) | Git-only deploy rule (no scp) |
 | [deployment-sop.md](./deployment-sop.md) | Git-as-source-of-truth ops |
 
 **Scripts:**

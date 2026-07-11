@@ -1,108 +1,191 @@
 # Deployment SOP — Git Is the Single Source of Truth
 
-**Rule:** All code on `ai.local` comes from **git remote**, never from hand-edited
-files, `scp`, or `tar` sync on the host. The dev machine commits and pushes;
-`ai.local` only `git fetch` / `git checkout` / `git pull`.
+**Effective:** July 2026  
+**Applies to:** All humans and AI assistants working on the inference stack.
 
-Host-specific state (`.env`, model weights, Docker volumes) lives on the host
-and is **not** in git. Everything else is reproducible from branches.
+## Rule (non-negotiable)
 
-## Repos and paths on ai.local
+**Never deploy source code to `ai.local` via `scp`, `rsync`, hand-edits, or
+`tar`.** Commit on the dev machine, push to the remote, then `git pull` on
+`ai.local`. The host runs what is in git — nothing else.
 
-| Repo | Remote | Path on ai.local | Deploy branch (vision stack) |
-|------|--------|------------------|--------------------------------|
-| `lucebox-hub` | `github.com/davidmroth/lucebox-hub` | `/media/data/projects/lucebox-hub-src` | `feat/native-mmproj` |
-| `model-runner-v4` | `github.com/davidmroth/model-runner-v4` | `/media/data/projects/model-runner-v4` | `feat/vision` |
+This rule exists because untracked `scp` copies cause `git pull` failures
+(“untracked working tree files would be overwritten by merge”), hide drift from
+the team, and make rollback impossible.
 
-`docker-compose.yml` bind-mounts `lucebox-hub-src/server/scripts/entrypoint.sh` so
-runtime flags (`--mmproj`, etc.) match the pulled branch — the stock GHCR image
-entrypoint alone is not sufficient for native vision.
+### Allowed on `ai.local` without git
+
+| Path | What | Example |
+|------|------|---------|
+| `model-runner-v4/.env` | Runtime knobs | `DFLASH_DRAFT_FEATURE_MIRROR=1` |
+| `ai-platform/.env` | Proxy knobs | `SMART_BENCHMARK_REFERENCE_ENABLED=0` |
+| Docker volumes | Weights, caches | `models-cache/` |
+| Build artifacts | Rebuilt after C++ pull | `lucebox-hub-src/server/build-mmproj/` |
+
+**Do not** edit `lucebox-patch/`, `server/scripts/`, compose files, or
+entrypoints on the host. Change them in git, push, pull.
+
+---
+
+## Repos on `ai.local`
+
+| Repo | Path on host | Typical branch | Container |
+|------|--------------|----------------|-----------|
+| `model-runner-v4` | `/media/data/projects/model-runner-v4` | `feat/vision` | `model-runner-v4-lucebox` |
+| `lucebox-hub` | `/media/data/projects/lucebox-hub-src` | `feat/native-mmproj` | (bind-mount into lucebox) |
+| `ai-platform` | `/media/data/projects/ai-platform` | `main` or team branch | `ai-platform-proxy` |
+
+`model-runner-v4` bind-mounts `lucebox-patch/dflash/scripts/` into the
+lucebox container at `/opt/lucebox-hub/patch/dflash/scripts` (read-only).
+**Patch changes deploy via git pull + container recreate** — not `scp`.
+
+---
+
+## Standard workflow (every code change)
+
+### 1. Dev machine — commit and push
+
+```bash
+cd ~/development/projects/model-runner-v4   # or lucebox-hub, ai-platform
+# edit, test locally if possible
+git add <files>
+git commit -m "describe the change"
+git push origin <branch>
+```
+
+### 2. `ai.local` — pull and recreate
+
+```bash
+ssh david@ai.local
+
+# model-runner-v4 (Python patch, compose, entrypoints, scripts)
+cd /media/data/projects/model-runner-v4
+git fetch origin
+git pull origin feat/vision          # or: git pull --ff-only
+docker compose up -d --force-recreate lucebox
+
+# ai-platform (proxy changes)
+cd /media/data/projects/ai-platform
+git pull
+docker compose up -d --force-recreate ai-platform-proxy   # service name may vary; use docker ps
+
+# lucebox-hub (C++ only — rebuild if src/ changed)
+cd /media/data/projects/lucebox-hub-src
+git pull origin feat/native-mmproj
+# see deployment-flow.md Flow B for CUDA rebuild, then recreate lucebox
+```
+
+### 3. Verify
+
+```bash
+curl -sf http://127.0.0.1:8000/health
+docker logs --tail 30 model-runner-v4-lucebox
+# optional: scripts/run-engine-certification.sh (from pulled repo)
+```
+
+---
 
 ## Do / Don't
 
 | Do | Don't |
 |----|-------|
-| Commit + push from dev machine | Edit source under `lucebox-hub-src` or `model-runner-v4` on ai.local |
-| `git fetch origin <branch>` + `git reset --hard origin/<branch>` on ai.local | `scp` / `tar` source trees to ai.local |
-| Edit `.env` on ai.local for runtime knobs | Patch Python/C++ on the host without committing |
-| Rebuild C++ in CUDA devel container after pull | Build on macOS and copy binaries |
-| Run verification sidecars after deploy | Assume healthy because container started |
+| Commit + push from dev machine | `scp` files to `lucebox-patch/` or `server/scripts/` |
+| `git pull` on `ai.local` | Hand-edit Python/C++ source on the host |
+| `docker compose up -d --force-recreate` after pull | `docker restart` only (misses compose/env changes) |
+| Edit `.env` on host for runtime knobs | Commit secrets or host-specific `.env` to git |
+| Rebuild C++ in CUDA devel container after hub pull | Build on macOS and copy binaries |
+| Use `git status` before pull | Assume pull will overwrite untracked files safely |
 
-On ai.local, **`git reset --hard`** is intentional — it discards any drift from
-hand-edits and matches the pushed branch exactly.
+---
 
-## Standard deploy sequence (native vision + DFlash)
+## Fixing `git pull` blocked by untracked files
 
-From the dev machine:
+If you previously used `scp` (or an agent did), pull may fail with:
 
-```bash
-# 1. Commit and push both repos (dev machine)
-cd ~/development/projects/lucebox-hub
-git push -u origin feat/native-mmproj
-
-cd ~/development/projects/model-runner-v4
-git push -u origin feat/vision
-
-# 2. Pull, build, compose, test (orchestrated)
-./scripts/deploy-native-vision-ai.local.sh
+```
+error: The following untracked working tree files would be overwritten by merge
 ```
 
-What the deploy script does **on ai.local only via git**:
+**If the untracked files are stale copies of what git is about to deliver:**
 
-1. `lucebox-hub-src`: `git fetch` → `checkout feat/native-mmproj` → `pull --ff-only`
-2. CUDA container build → `server/build-mmproj/dflash_server`
-3. `model-runner-v4`: `git fetch` → `checkout feat/vision` → `pull --ff-only`
-4. `docker compose --profile serve up -d --force-recreate lucebox`
-5. `/props` + `vision_smoke_test.py` + `decode_bench.py`
+```bash
+cd /media/data/projects/model-runner-v4
+# remove only the paths git names in the error message
+rm -rf lucebox-patch
+rm -f docs/inference-engine-north-star.md
+rm -f scripts/run-engine-certification.sh scripts/test_cache_pollution.py
+git pull
+```
 
-## Host-only files (not in git)
+**If you might have host-only edits worth keeping:**
 
-These are intentional local state on ai.local:
+```bash
+cp -a lucebox-patch /tmp/lucebox-patch.bak.$(date +%Y%m%d)
+diff -ru /tmp/lucebox-patch.bak.* lucebox-patch   # inspect before deleting
+# then remove and pull
+```
 
-- `/media/data/projects/model-runner-v4/.env` — runtime env vars
-- `/media/data/projects/models-cache/` — GGUF weights
-- `server/build-mmproj/` — compiled artifacts (rebuilt after each C++ pull)
+After a successful pull, recreate the container so bind-mounts pick up
+tracked files.
 
-Back up `.env` before major changes. Never commit secrets.
+---
+
+## Config-only changes (no git)
+
+Runtime tuning stays in host `.env` files:
+
+```bash
+ssh david@ai.local
+cd /media/data/projects/model-runner-v4
+# edit .env (e.g. DFLASH_DRAFT_FEATURE_MIRROR=1)
+docker compose up -d --force-recreate lucebox
+```
+
+Confirm in logs: `docker logs model-runner-v4-lucebox 2>&1 | grep draft_feature_mirror`
+
+---
 
 ## C++ rebuild trigger
 
-Rebuild when **any** of these change on the pulled branch:
+Rebuild `test_dflash` / `dflash_server` on `ai.local` when the pulled
+`lucebox-hub` branch changes:
 
-- `server/src/**` (C++)
+- `server/src/**`
 - `server/CMakeLists.txt`
 - `server/deps/llama.cpp` submodule pointer
 
-Python-only changes in `server/scripts/` on the patched path still follow
-[deployment-flow.md](./deployment-flow.md) Flow A if using `lucebox-patch`;
-native vision uses `dflash_server` HTTP path and does not need the patch
-for image parsing.
+Python-only `model-runner-v4` changes need **pull + recreate only**.
 
-## Verification checklist
-
-After every deploy:
-
-1. **Git SHA** — logs or `docker exec` should match the pushed commit.
-2. **`/props`** — `vision_supported: true`, draft path present, `speculative` as expected.
-3. **`vision_smoke_test.py`** — 1×1 PNG color question returns a word.
-4. **`decode_bench.py`** — text decode TPS regression (draft still active for text-only).
+---
 
 ## Rollback
 
 ```bash
-# On ai.local (david@)
-cd /media/data/projects/lucebox-hub-src
-git checkout <previous-sha>
-
+ssh david@ai.local
 cd /media/data/projects/model-runner-v4
+git log -5 --oneline
 git checkout <previous-sha>
-
-# Rebuild if C++ changed, then recreate
-cd /media/data/projects/model-runner-v4
-docker compose --profile serve up -d --force-recreate lucebox
+docker compose up -d --force-recreate lucebox
 ```
+
+Same pattern for `lucebox-hub-src` and `ai-platform`. Rebuild C++ if the
+hub SHA changed.
+
+---
+
+## For AI coding assistants
+
+1. **Make all code edits in the local git checkout** (dev machine workspace).
+2. **Do not `scp`** to `david@ai.local` — ever.
+3. After changes, tell the user to **commit, push, and pull on ai.local**, or
+   run the pull/recreate steps via SSH only after the push exists on remote.
+4. Host `.env` edits are OK via SSH when tuning runtime knobs the user
+   requested (document what was changed).
+
+---
 
 ## Related docs
 
-- [deployment-flow.md](./deployment-flow.md) — topology, mounts, Flow A–D
-- [vision-integration.md](./vision-integration.md) — mmproj build flags and env knobs
+- [deployment-flow.md](./deployment-flow.md) — topology, mounts, C++ build flow
+- [engine-certification-plan.md](./engine-certification-plan.md) — post-deploy gates
+- [inference-engine-north-star.md](./inference-engine-north-star.md) — perf targets

@@ -46,6 +46,16 @@ docker compose --profile serve up -d
 - Image: `ghcr.io/luce-org/lucebox-hub:cuda12`
 - Watchdog and client API are in **ai-platform**, not this repo.
 
+## Deploying to `ai.local`
+
+**Git only — no `scp`.** Commit and push from your dev machine; on the host:
+
+```bash
+cd /media/data/projects/model-runner-v4 && git pull && docker compose up -d --force-recreate lucebox
+```
+
+Full SOP: [docs/deployment-sop.md](docs/deployment-sop.md)
+
 ## Layout
 
 ```
