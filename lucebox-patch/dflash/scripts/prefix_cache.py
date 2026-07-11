@@ -533,6 +533,7 @@ def deferred_conv_snap_after_cold_tool(
     scope: str,
     snap_prep: tuple[int, int] | None,
     tool_snap_prep: tuple[int, int] | None,
+    max_tail: int | None = None,
 ) -> tuple[int, int] | None:
     """Plan thick conv snap after cold turn 1 when tool inline pin took snap=.
 
@@ -549,6 +550,13 @@ def deferred_conv_snap_after_cold_tool(
     tool_slot, tool_prefix_len = tool_snap_prep
     conv_cut = _conv_snap_cut_after_tool(prefix_cache, prompt_ids, tool_prefix_len)
     if conv_cut is None or conv_cut <= tool_prefix_len:
+        return None
+    tail_len = conv_cut - tool_prefix_len
+    if max_tail is not None and tail_len > max_tail:
+        print(
+            f"  [pc] skip deferred conv snap tail_len={tail_len} > max={max_tail}",
+            flush=True,
+        )
         return None
     prep = prefix_cache.prepare_inline_snap(prompt_ids, scope=cache_scope)
     if prep is None:

@@ -202,6 +202,19 @@ def tool_inline_snap_pin_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def deferred_conv_snap_max_tail() -> int:
+    """Skip post-turn deferred conv snap when tail after tool KV exceeds this (tokens).
+
+    Long multi-turn prompts would otherwise replay the full prompt bin (~25K) while
+    holding the daemon lock. Turn 2+ builds the thick slot on demand instead.
+    """
+    raw = os.environ.get("DFLASH_DEFERRED_CONV_SNAP_MAX_TAIL", "8192")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 8192
+
+
 def request_wall_timeout_seconds() -> float:
     raw = os.environ.get("DFLASH_REQUEST_WALL_TIMEOUT_SEC", "600")
     try:

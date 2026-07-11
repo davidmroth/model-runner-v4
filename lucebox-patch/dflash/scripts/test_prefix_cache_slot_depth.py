@@ -224,6 +224,34 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
             )
         )
 
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_deferred_conv_snap_skipped_when_tail_too_large(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(400))
+        mock_bounds.return_value = [50, 376, 390]
+        scope = "sess-a"
+        tool_snap = (4, 376)
+
+        self.assertIsNone(
+            deferred_conv_snap_after_cold_tool(
+                prefix_cache=pc,
+                prompt_ids=ids,
+                scope=scope,
+                snap_prep=None,
+                tool_snap_prep=tool_snap,
+                max_tail=10,
+            )
+        )
+        prep = deferred_conv_snap_after_cold_tool(
+            prefix_cache=pc,
+            prompt_ids=ids,
+            scope=scope,
+            snap_prep=None,
+            tool_snap_prep=tool_snap,
+            max_tail=128,
+        )
+        self.assertEqual(prep, (0, 390))
+
     def test_abort_full_snap_purges_stale_lookup(self):
         pc = self._make_cache()
         pc.init_full_cache(1)

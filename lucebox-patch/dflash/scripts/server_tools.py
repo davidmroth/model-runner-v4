@@ -68,7 +68,7 @@ from tool_split.daemon_bridge import (
     finish_tool_inline_snap,
     tool_snap_prep_from_pending,
 )
-from tool_split.orchestrator import ToolSplitOrchestrator
+from tool_split.orchestrator import ToolSplitOrchestrator, _ids_to_bin
 from tool_split.registry import resolve_adapter as resolve_tool_split_adapter
 
 
@@ -93,6 +93,7 @@ from handler_reliability import (
     PriorityDaemonLock,
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
+    deferred_conv_snap_max_tail,
     install_quiet_access_log_filter,
     is_ephemeral_cache_scope,
     quiet_access_logs_enabled,
@@ -102,6 +103,32 @@ from handler_reliability import (
 
 # Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "add_generation_prompt", "tools"})
+
+
+class _DeferredConvSnapJob:
+    """Background thick conv snap after cold tool inline pin on turn 1."""
+
+    __slots__ = (
+        "prompt_ids",
+        "tool_slot",
+        "tool_kv_end",
+        "conv_slot",
+        "conv_cut",
+        "cache_scope",
+    )
+
+    def __init__(
+        self,
+        *,
+        prompt_ids: list[int],
+        tool_snap_prep: tuple[int, int],
+        conv_prep: tuple[int, int],
+        cache_scope: str,
+    ) -> None:
+        self.prompt_ids = prompt_ids
+        self.tool_slot, self.tool_kv_end = tool_snap_prep
+        self.conv_slot, self.conv_cut = conv_prep
+        self.cache_scope = cache_scope
 
 
 def _extra_daemon_has_target_sharding(extra: list[str] | None) -> bool:
@@ -666,33 +693,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 scope=cache_scope,
             )
 
-    async def _commit_deferred_conv_snap_after_cold_tool(
-        *,
-        prompt_ids: list[int],
-        prompt_bin: Path,
-        cache_scope: str,
-        tool_snap_prep: tuple[int, int],
-        snap_prep: tuple[int, int] | None,
-    ) -> None:
-        conv_prep = deferred_conv_snap_after_cold_tool(
-            prefix_cache=prefix_cache,
-            prompt_ids=prompt_ids,
-            scope=cache_scope,
-            snap_prep=snap_prep,
-            tool_snap_prep=tool_snap_prep,
-        )
-        if conv_prep is None:
+    async def _execute_deferred_conv_snap_job(job: _DeferredConvSnapJob) -> None:
+        conv_slot, conv_cut = job.conv_slot, job.conv_cut
+        tool_slot, tool_kv_end = job.tool_slot, job.tool_kv_end
+        tail_ids = job.prompt_ids[tool_kv_end:conv_cut]
+        if not tail_ids:
+            prefix_cache.abort_inline_snap(conv_slot, scope=job.cache_scope)
             return
-        conv_slot, conv_cut = conv_prep
-        tool_slot, _tool_kv_end = tool_snap_prep
+        tail_bin = _ids_to_bin(tail_ids)
         print(
             f"  [pc] deferred conv snap after cold tool pin "
-            f"thick_slot={conv_slot} cut={conv_cut} thin={tool_slot}",
+            f"thick_slot={conv_slot} cut={conv_cut} thin={tool_slot} "
+            f"tail_len={len(tail_ids)}",
             flush=True,
         )
         # Daemon rejects gen_len=0 on RESTORE_CHAIN; use 1 token (discarded).
         line = append_inline_snap(
-            f"RESTORE_CHAIN -1 {tool_slot} {prompt_bin} 1",
+            f"RESTORE_CHAIN -1 {tool_slot} {tail_bin} 1",
             (conv_slot, conv_cut),
         ) + "\n"
         drain_pipe_residual(r_pipe)
@@ -719,14 +736,40 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     f"expected={conv_slot}"
                 )
             prefix_cache.finish_inline_snap(
-                conv_prep,
-                prompt_ids,
+                (conv_slot, conv_cut),
+                job.prompt_ids,
                 inline_slot=bus.inline_snap_slot(),
-                scope=cache_scope,
+                scope=job.cache_scope,
             )
         except Exception as exc:
             print(f"  [pc] deferred conv snap failed: {exc}", flush=True)
-            prefix_cache.abort_inline_snap(conv_slot, scope=cache_scope)
+            prefix_cache.abort_inline_snap(conv_slot, scope=job.cache_scope)
+        finally:
+            try:
+                tail_bin.unlink()
+            except Exception:
+                pass
+
+    async def _run_deferred_conv_snap_background(job: _DeferredConvSnapJob) -> None:
+        scoped = not is_ephemeral_cache_scope(job.cache_scope)
+        try:
+            async with _daemon_request_lock(
+                "deferred-conv-snap",
+                max_wait=request_wall_timeout_seconds(),
+                scoped=scoped,
+            ):
+                await _restart_daemon_if_dead()
+                await _execute_deferred_conv_snap_job(job)
+        except DaemonBusyError:
+            prefix_cache.abort_inline_snap(job.conv_slot, scope=job.cache_scope)
+            print(
+                "  [pc] deferred conv snap skipped — daemon busy",
+                flush=True,
+            )
+
+    def _schedule_deferred_conv_snap_jobs(jobs: list[_DeferredConvSnapJob]) -> None:
+        for job in jobs:
+            asyncio.create_task(_run_deferred_conv_snap_background(job))
 
     def _abort_full_snap_if_needed(full_snap_prep) -> None:
         if full_snap_prep is not None:
@@ -744,7 +787,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cache_scope: str,
         tool_snap_prep: tuple[int, int] | None = None,
         tool_ctx: ToolRequestContext | None = None,
-    ) -> None:
+    ) -> _DeferredConvSnapJob | None:
         if full_snap_prep is not None:
             if success and cur_ids is not None:
                 fslot, _ = full_snap_prep
@@ -772,13 +815,31 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             and tool_split
             and tool_ctx
         ):
-            await _commit_deferred_conv_snap_after_cold_tool(
+            conv_prep = deferred_conv_snap_after_cold_tool(
+                prefix_cache=prefix_cache,
                 prompt_ids=prompt_ids,
-                prompt_bin=cur_bin,
-                cache_scope=cache_scope,
-                tool_snap_prep=tool_snap_prep,
+                scope=cache_scope,
                 snap_prep=snap_prep,
+                tool_snap_prep=tool_snap_prep,
+                max_tail=deferred_conv_snap_max_tail(),
             )
+            if conv_prep is not None:
+                tool_slot, tool_kv_end = tool_snap_prep
+                conv_slot, conv_cut = conv_prep
+                tail_len = conv_cut - tool_kv_end
+                print(
+                    f"  [pc] deferred conv snap queued "
+                    f"thick_slot={conv_slot} cut={conv_cut} thin={tool_slot} "
+                    f"tail_len={tail_len}",
+                    flush=True,
+                )
+                return _DeferredConvSnapJob(
+                    prompt_ids=prompt_ids,
+                    tool_snap_prep=tool_snap_prep,
+                    conv_prep=conv_prep,
+                    cache_scope=cache_scope,
+                )
+        return None
 
     def _request_cache_scope(
         headers: dict[str, str] | None,
@@ -1292,6 +1353,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         # Non-streaming: collect, parse, return.
         scoped = not is_ephemeral_cache_scope(cache_scope)
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
+        deferred_job: _DeferredConvSnapJob | None = None
         try:
             async with _daemon_request_lock("chat", max_wait=lock_wait, scoped=scoped):
                 await _restart_daemon_if_dead()
@@ -1367,7 +1429,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         tool_ctx=tool_ctx,
                     )
                     raise
-                await _finalize_request_snaps(
+                deferred_job = await _finalize_request_snaps(
                     full_snap_prep=full_snap_prep,
                     snap_prep=snap_prep,
                     prompt_ids=prompt_ids,
@@ -1392,6 +1454,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 except Exception:
                     pass
             return _busy_response(retry_after_sec=lock_wait)
+        if deferred_job is not None:
+            _schedule_deferred_conv_snap_jobs([deferred_job])
         if full_hit is None:
             try:
                 cur_bin.unlink()
@@ -1502,6 +1566,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             compression_fired_local = compression_fired
             cur_ids_local = cur_ids
             full_snap_prep_local = full_snap_prep
+            pending_deferred_jobs: list[_DeferredConvSnapJob] = []
 
             async def _complete_request(*, success: bool) -> None:
                 nonlocal finalized
@@ -1510,7 +1575,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 finalized = True
                 if success:
                     await bus.drain_timings()
-                await _finalize_request_snaps(
+                deferred_job = await _finalize_request_snaps(
                     full_snap_prep=full_snap_prep_local,
                     snap_prep=snap_prep,
                     prompt_ids=prompt_ids,
@@ -1523,6 +1588,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 )
                 if success:
                     await _commit_tool_snap_if_needed(tool_ctx)
+                    if deferred_job is not None:
+                        pending_deferred_jobs.append(deferred_job)
 
             try:
                 await _restart_daemon_if_dead()
@@ -1798,6 +1865,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 if lock_held:
                     daemon_lock.release()
                     lock_held = False
+                if pending_deferred_jobs:
+                    _schedule_deferred_conv_snap_jobs(pending_deferred_jobs)
+                    pending_deferred_jobs.clear()
 
         return StreamingResponse(sse(), media_type="text/event-stream")
 

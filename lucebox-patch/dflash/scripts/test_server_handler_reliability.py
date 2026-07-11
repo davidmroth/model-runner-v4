@@ -64,6 +64,18 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertTrue(tool_inline_snap_pin_enabled())
 
+    def test_deferred_conv_snap_max_tail_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            from handler_reliability import deferred_conv_snap_max_tail
+
+            self.assertEqual(deferred_conv_snap_max_tail(), 8192)
+
+    def test_deferred_conv_snap_max_tail_env_override(self):
+        with patch.dict(os.environ, {"DFLASH_DEFERRED_CONV_SNAP_MAX_TAIL": "512"}):
+            from handler_reliability import deferred_conv_snap_max_tail
+
+            self.assertEqual(deferred_conv_snap_max_tail(), 512)
+
     def test_tool_inline_snap_pin_off(self):
         with patch.dict(os.environ, {"DFLASH_TOOL_INLINE_SNAP_PIN": "0"}):
             self.assertFalse(tool_inline_snap_pin_enabled())
