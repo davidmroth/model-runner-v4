@@ -89,10 +89,12 @@ from daemon_pipe import (
 )
 from handler_reliability import (
     DaemonBusyError,
+    PriorityDaemonLock,
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
     is_ephemeral_cache_scope,
     request_wall_timeout_seconds,
+    scoped_lock_priority_enabled,
 )
 
 # Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
@@ -485,12 +487,27 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             flush=True,
         )
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
-    daemon_lock = asyncio.Lock()
+    daemon_lock = PriorityDaemonLock()
 
-    async def _acquire_daemon_lock(label: str, *, max_wait: float | None = None) -> None:
+    async def _acquire_daemon_lock(
+        label: str,
+        *,
+        max_wait: float | None = None,
+        scoped: bool = True,
+    ) -> None:
         wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
         loop = asyncio.get_running_loop()
         queued_at = loop.time()
+        use_priority = scoped_lock_priority_enabled()
+
+        if not scoped and use_priority and daemon_lock.scoped_waiting:
+            print(
+                "  [handler] ephemeral yield — scoped waiter ahead "
+                f"({label})",
+                flush=True,
+            )
+            raise DaemonBusyError(label)
+
         if daemon_lock.locked():
             if wait_sec == float("inf"):
                 print(
@@ -504,10 +521,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     flush=True,
                 )
         try:
-            if wait_sec == float("inf"):
-                await daemon_lock.acquire()
+            if use_priority:
+                await daemon_lock.acquire(scoped=scoped, max_wait=wait_sec)
             else:
-                await asyncio.wait_for(daemon_lock.acquire(), timeout=wait_sec)
+                # Legacy FIFO: treat as scoped for asyncio.Lock semantics.
+                await daemon_lock.acquire(scoped=True, max_wait=wait_sec)
             waited = loop.time() - queued_at
             if waited >= 1.0:
                 print(
@@ -522,8 +540,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             raise DaemonBusyError(label)
 
     @asynccontextmanager
-    async def _daemon_request_lock(label: str, *, max_wait: float | None = None):
-        await _acquire_daemon_lock(label, max_wait=max_wait)
+    async def _daemon_request_lock(
+        label: str,
+        *,
+        max_wait: float | None = None,
+        scoped: bool = True,
+    ):
+        await _acquire_daemon_lock(label, max_wait=max_wait, scoped=scoped)
         try:
             yield
         finally:
@@ -1186,10 +1209,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
 
         # Non-streaming: collect, parse, return.
-        lock_wait = chat_stream_lock_wait_seconds(
-            scoped=not is_ephemeral_cache_scope(cache_scope))
+        scoped = not is_ephemeral_cache_scope(cache_scope)
+        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
         try:
-            async with _daemon_request_lock("chat", max_wait=lock_wait):
+            async with _daemon_request_lock("chat", max_wait=lock_wait, scoped=scoped):
                 await _restart_daemon_if_dead()
                 (
                     cur_bin,
@@ -1365,11 +1388,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         )
         include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
         wall_timeout_sec = request_wall_timeout_seconds()
-        lock_wait = chat_stream_lock_wait_seconds(
-            scoped=not is_ephemeral_cache_scope(cache_scope))
+        scoped = not is_ephemeral_cache_scope(cache_scope)
+        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
         lock_held = False
         try:
-            await _acquire_daemon_lock("chat-stream", max_wait=lock_wait)
+            await _acquire_daemon_lock(
+                "chat-stream", max_wait=lock_wait, scoped=scoped)
             lock_held = True
         except DaemonBusyError:
             _abort_full_snap_if_needed(full_snap_prep)

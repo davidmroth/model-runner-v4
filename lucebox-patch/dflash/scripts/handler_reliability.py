@@ -1,7 +1,9 @@
 """Handler reliability helpers for server_tools (no heavy runtime deps)."""
 from __future__ import annotations
 
+import asyncio
 import os
+from collections import deque
 
 
 class DaemonBusyError(Exception):
@@ -10,6 +12,89 @@ class DaemonBusyError(Exception):
     def __init__(self, label: str):
         self.label = label
         super().__init__(label)
+
+
+class PriorityDaemonLock:
+    """Single-flight lock with scoped (conversation) priority over ephemeral traffic.
+
+    Scoped requests jump ahead of ephemeral waiters when the lock is free.
+    Ephemeral acquire fails immediately while any scoped request is queued.
+    """
+
+    def __init__(self) -> None:
+        self._held = False
+        self._high: deque[asyncio.Future[None]] = deque()
+        self._low: deque[asyncio.Future[None]] = deque()
+
+    def locked(self) -> bool:
+        return self._held
+
+    @property
+    def scoped_waiting(self) -> int:
+        return len(self._high)
+
+    async def __aenter__(self) -> PriorityDaemonLock:
+        await self.acquire(scoped=True, max_wait=float("inf"))
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    async def acquire(self, *, scoped: bool, max_wait: float) -> None:
+        if not scoped and self._high:
+            raise DaemonBusyError("ephemeral-yields-to-scoped")
+
+        if not self._held:
+            self._held = True
+            return
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        (self._high if scoped else self._low).append(fut)
+        try:
+            if max_wait == float("inf"):
+                await fut
+            else:
+                await asyncio.wait_for(fut, timeout=max_wait)
+        except asyncio.TimeoutError:
+            self._drop_waiter(fut, scoped=scoped)
+            raise
+        except asyncio.CancelledError:
+            self._drop_waiter(fut, scoped=scoped)
+            raise
+
+    def _drop_waiter(self, fut: asyncio.Future[None], *, scoped: bool) -> None:
+        queue = self._high if scoped else self._low
+        try:
+            queue.remove(fut)
+        except ValueError:
+            pass
+        if not fut.done():
+            fut.cancel()
+
+    def release(self) -> None:
+        if not self._held:
+            raise RuntimeError("release on unlocked PriorityDaemonLock")
+        self._held = False
+        while self._high:
+            fut = self._high.popleft()
+            if fut.cancelled():
+                continue
+            self._held = True
+            fut.set_result(None)
+            return
+        while self._low:
+            fut = self._low.popleft()
+            if fut.cancelled():
+                continue
+            self._held = True
+            fut.set_result(None)
+            return
+
+
+def scoped_lock_priority_enabled() -> bool:
+    raw = os.environ.get("DFLASH_SCOPED_LOCK_PRIORITY", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def daemon_lock_wait_seconds() -> float:

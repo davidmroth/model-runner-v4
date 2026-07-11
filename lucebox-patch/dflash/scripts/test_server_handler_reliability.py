@@ -1,15 +1,18 @@
 """Unit tests for P0b handler reliability helpers in server_tools."""
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
 
 from handler_reliability import (
     DaemonBusyError,
+    PriorityDaemonLock,
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
     ephemeral_lock_wait_seconds,
     is_ephemeral_cache_scope,
     request_wall_timeout_seconds,
+    scoped_lock_priority_enabled,
     scoped_lock_wait_cap_seconds,
     tool_inline_snap_pin_enabled,
     tool_snapshot_max_kv_tokens,
@@ -92,6 +95,50 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
             "DFLASH_SCOPED_LOCK_WAIT_SEC": "45",
         }):
             self.assertEqual(chat_stream_lock_wait_seconds(scoped=True), 45.0)
+
+    def test_scoped_lock_priority_defaults_on(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(scoped_lock_priority_enabled())
+
+
+class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scoped_jumps_ahead_of_ephemeral_waiter(self):
+        lock = PriorityDaemonLock()
+        order: list[str] = []
+
+        async def ephemeral_waiter():
+            await lock.acquire(scoped=False, max_wait=5.0)
+            order.append("bench")
+            lock.release()
+
+        async def scoped_waiter():
+            await lock.acquire(scoped=True, max_wait=5.0)
+            order.append("user")
+            lock.release()
+
+        lock._held = True
+        t_bench = asyncio.create_task(ephemeral_waiter())
+        t_user = asyncio.create_task(scoped_waiter())
+        await asyncio.sleep(0.05)
+        self.assertEqual(lock.scoped_waiting, 1)
+        lock.release()
+        await asyncio.wait_for(asyncio.gather(t_bench, t_user), timeout=2.0)
+        self.assertEqual(order, ["user", "bench"])
+
+    async def test_ephemeral_yields_when_scoped_queued(self):
+        lock = PriorityDaemonLock()
+        lock._held = True
+
+        async def scoped_waiter():
+            await lock.acquire(scoped=True, max_wait=5.0)
+            lock.release()
+
+        t_user = asyncio.create_task(scoped_waiter())
+        await asyncio.sleep(0.01)
+        with self.assertRaises(DaemonBusyError):
+            await lock.acquire(scoped=False, max_wait=1.0)
+        lock.release()
+        await t_user
 
 
 if __name__ == "__main__":
