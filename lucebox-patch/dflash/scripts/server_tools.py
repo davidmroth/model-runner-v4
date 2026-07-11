@@ -486,8 +486,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     daemon_lock = asyncio.Lock()
 
     @asynccontextmanager
-    async def _daemon_request_lock(label: str):
-        wait_sec = daemon_lock_wait_seconds()
+    async def _daemon_request_lock(label: str, *, max_wait: float | None = None):
+        wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
         acquired = False
         loop = asyncio.get_running_loop()
         queued_at = loop.time()
@@ -868,11 +868,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     async def health():
         if daemon_proc.poll() is not None:
             try:
-                async with _daemon_request_lock("health-revive"):
+                # Never queue health/revive behind a long inference turn.
+                async with _daemon_request_lock("health-revive", max_wait=0):
                     await _restart_daemon_if_dead()
             except DaemonBusyError:
                 return JSONResponse(
-                    {"status": "error", "detail": "daemon exited; restart queued"},
+                    {
+                        "status": "degraded",
+                        "detail": "daemon exited; revive deferred (inference active)",
+                    },
                     status_code=503,
                 )
         if daemon_proc.poll() is not None:
@@ -969,6 +973,52 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         try: prompt_bin.unlink()
         except Exception: pass
         return Path(path), len(ids), new_started_in_thinking
+
+    async def _apply_chat_compression_if_needed(
+        req: ChatRequest,
+        cur_bin: Path,
+        prompt_len: int,
+        started_in_thinking: bool,
+        full_hit,
+        prompt_ids: list[int],
+        cache_scope: str,
+    ) -> tuple[Path, int, bool, bool, list[int] | None, tuple[int, int] | None]:
+        """PFlash compress talks to the daemon — run only under inference lock."""
+        if full_hit is not None:
+            return cur_bin, prompt_len, started_in_thinking, False, None, None
+        new_bin, new_len, new_think = await asyncio.to_thread(
+            _maybe_compress_tool_chat,
+            req,
+            cur_bin,
+            prompt_len,
+            started_in_thinking,
+        )
+        compression_fired = new_bin != cur_bin
+        full_snap_prep = None
+        cur_ids: list[int] | None = prompt_ids
+        if compression_fired:
+            cur_bin = new_bin
+            prompt_len = new_len
+            started_in_thinking = new_think
+            raw_compressed = cur_bin.read_bytes()
+            cur_ids = [
+                struct.unpack_from("<i", raw_compressed, i)[0]
+                for i in range(0, len(raw_compressed), 4)
+            ]
+            full_snap_prep = prefix_cache.prepare_full_snap(
+                prompt_ids, scope=cache_scope)
+        return (
+            cur_bin,
+            prompt_len,
+            started_in_thinking,
+            compression_fired,
+            cur_ids,
+            full_snap_prep,
+        )
+
+    def _clamp_gen_len(req: ChatRequest, prompt_len: int) -> int:
+        available_gen = max_ctx - prompt_len - 20
+        return min(_max_gen_tokens(req), available_gen)
 
     def _tokenize_prompt(req: ChatRequest) -> tuple[Path, bool]:
         """Returns (prompt_bin_path, started_in_thinking). started_in_thinking
@@ -1086,48 +1136,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cur_ids = prompt_ids
         compression_fired = False
 
-        try:
-            async with _daemon_request_lock("chat-preflight"):
-                await _restart_daemon_if_dead()
-                allow_full_cache = (
-                    prefill_cfg is not None
-                    and prefill_cfg.enabled
-                    and (not req.tools or tool_split is not None)
-                )
-                if allow_full_cache:
-                    full_hit = prefix_cache.lookup_full(prompt_ids, scope=cache_scope)
+        # Lock-free: Python cache metadata only (no daemon IPC).
+        allow_full_cache = (
+            prefill_cfg is not None
+            and prefill_cfg.enabled
+            and (not req.tools or tool_split is not None)
+        )
+        if allow_full_cache:
+            full_hit = prefix_cache.lookup_full(prompt_ids, scope=cache_scope)
 
-                if full_hit is not None:
-                    slot, cached_cur_bin, cached_cur_ids_len = full_hit
-                    cur_bin = Path(cached_cur_bin)
-                    cur_ids = None
-                    prompt_len = cached_cur_ids_len
-                    started_in_thinking = False  # cached result: no think prefill
-                else:
-                    # pflash compress hook (no-op when off / has tools)
-                    new_bin, prompt_len, started_in_thinking = await asyncio.to_thread(
-                        _maybe_compress_tool_chat, req, prompt_bin, prompt_len, started_in_thinking)
-                    compression_fired = (new_bin != prompt_bin)
-                    cur_bin = new_bin
-                    if compression_fired:
-                        # Read cur_ids from compressed bin for full-cache confirm.
-                        raw_compressed = cur_bin.read_bytes()
-                        cur_ids = [struct.unpack_from("<i", raw_compressed, i)[0]
-                                   for i in range(0, len(raw_compressed), 4)]
-                        full_snap_prep = prefix_cache.prepare_full_snap(
-                            prompt_ids, scope=cache_scope)
-                    else:
-                        cur_ids = prompt_ids
-        except DaemonBusyError:
-            _abort_full_snap_if_needed(full_snap_prep)
-            try:
-                prompt_bin.unlink()
-            except Exception:
-                pass
-            return _busy_response()
+        if full_hit is not None:
+            slot, cached_cur_bin, cached_cur_ids_len = full_hit
+            cur_bin = Path(cached_cur_bin)
+            cur_ids = None
+            prompt_len = cached_cur_ids_len
+            started_in_thinking = False  # cached result: no think prefill
 
-        available_gen = max_ctx - prompt_len - 20
-        gen_len = min(_max_gen_tokens(req), available_gen)
+        gen_len = _clamp_gen_len(req, prompt_len)
         if gen_len <= 0:
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
@@ -1162,6 +1187,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         try:
             async with _daemon_request_lock("chat"):
                 await _restart_daemon_if_dead()
+                (
+                    cur_bin,
+                    prompt_len,
+                    started_in_thinking,
+                    compression_fired,
+                    cur_ids,
+                    full_snap_prep,
+                ) = await _apply_chat_compression_if_needed(
+                    req,
+                    cur_bin,
+                    prompt_len,
+                    started_in_thinking,
+                    full_hit,
+                    prompt_ids,
+                    cache_scope,
+                )
+                gen_len = _clamp_gen_len(req, prompt_len)
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     cur_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
@@ -1327,12 +1369,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                   "finish_reason": finish}]}
 
         async def sse() -> AsyncIterator[str]:
+            nonlocal prompt_bin, prompt_len, started_in_thinking, gen_len
             snap_prep = None
             tool_snap_prep = None
             conv_prefix_len = None
             completion_tokens = 0
             finish_reason = "stop"
             finalized = False
+            compression_fired_local = compression_fired
+            cur_ids_local = cur_ids
+            full_snap_prep_local = full_snap_prep
 
             async def _complete_request(*, success: bool) -> None:
                 nonlocal finalized
@@ -1342,11 +1388,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 if success:
                     await bus.drain_timings()
                 await _finalize_request_snaps(
-                    full_snap_prep=full_snap_prep,
+                    full_snap_prep=full_snap_prep_local,
                     snap_prep=snap_prep,
                     prompt_ids=prompt_ids,
                     cur_bin=prompt_bin,
-                    cur_ids=cur_ids,
+                    cur_ids=cur_ids_local,
                     success=success,
                     cache_scope=cache_scope,
                     tool_snap_prep=tool_snap_prep,
@@ -1358,12 +1404,29 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             try:
                 async with _daemon_request_lock("chat-stream"):
                     await _restart_daemon_if_dead()
+                    (
+                        prompt_bin,
+                        prompt_len,
+                        started_in_thinking,
+                        compression_fired_local,
+                        cur_ids_local,
+                        full_snap_prep_local,
+                    ) = await _apply_chat_compression_if_needed(
+                        req,
+                        prompt_bin,
+                        prompt_len,
+                        started_in_thinking,
+                        full_hit,
+                        prompt_ids,
+                        cache_scope,
+                    )
+                    gen_len = _clamp_gen_len(req, prompt_len)
                     cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                         prompt_bin, gen_len, prompt_ids,
                         full_hit=full_hit,
-                        compression_fired=compression_fired,
-                        full_snap_prep=full_snap_prep,
-                        cur_ids=cur_ids,
+                        compression_fired=compression_fired_local,
+                        full_snap_prep=full_snap_prep_local,
+                        cur_ids=cur_ids_local,
                         tool_ctx=tool_ctx,
                         cache_scope=cache_scope,
                     )
@@ -1688,6 +1751,32 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         except Exception: pass
         return Path(path), len(ids)
 
+    async def _apply_anthropic_compression_if_needed(
+        prompt_bin: Path,
+        prompt_len: int,
+        raw_msgs: list[dict],
+        full_hit,
+        prompt_ids: list[int],
+        cache_scope: str,
+    ) -> tuple[Path, int, bool, list[int] | None, tuple[int, int] | None]:
+        if full_hit is not None:
+            return prompt_bin, prompt_len, False, None, None
+        new_bin, new_len = await asyncio.to_thread(
+            _maybe_compress_anthropic, prompt_bin, prompt_len, raw_msgs)
+        compression_fired = new_bin != prompt_bin
+        full_snap_prep = None
+        cur_ids: list[int] | None = prompt_ids
+        if compression_fired:
+            raw_compressed = new_bin.read_bytes()
+            cur_ids = [
+                struct.unpack_from("<i", raw_compressed, i)[0]
+                for i in range(0, len(raw_compressed), 4)
+            ]
+            full_snap_prep = prefix_cache.prepare_full_snap(
+                prompt_ids, scope=cache_scope)
+            return new_bin, new_len, True, cur_ids, full_snap_prep
+        return new_bin, new_len, False, cur_ids, None
+
     @app.post("/v1/messages")
     async def anthropic_messages(req: AnthropicMessagesRequest, request: Request):
         prompt_bin, prompt_len, raw_msgs = _tokenize_anthropic(req)
@@ -1709,27 +1798,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cur_ids = prompt_ids
         compression_fired = False
 
-        async with _daemon_request_lock("anthropic-preflight"):
-            full_hit = prefix_cache.lookup_full(prompt_ids, scope=cache_scope)
-            if full_hit is not None:
-                slot, cached_cur_bin, cached_cur_ids_len = full_hit
-                cur_bin = Path(cached_cur_bin)
-                cur_ids = None
-                prompt_len = cached_cur_ids_len
-            else:
-                new_bin, new_len = await asyncio.to_thread(
-                    _maybe_compress_anthropic, prompt_bin, prompt_len, raw_msgs)
-                compression_fired = (new_bin != prompt_bin)
-                cur_bin = new_bin
-                prompt_len = new_len
-                if compression_fired:
-                    raw_compressed = cur_bin.read_bytes()
-                    cur_ids = [struct.unpack_from("<i", raw_compressed, i)[0]
-                               for i in range(0, len(raw_compressed), 4)]
-                    full_snap_prep = prefix_cache.prepare_full_snap(
-                        prompt_ids, scope=cache_scope)
-                else:
-                    cur_ids = prompt_ids
+        full_hit = prefix_cache.lookup_full(prompt_ids, scope=cache_scope)
+        if full_hit is not None:
+            slot, cached_cur_bin, cached_cur_ids_len = full_hit
+            cur_bin = Path(cached_cur_bin)
+            cur_ids = None
+            prompt_len = cached_cur_ids_len
 
         available_gen = max_ctx - prompt_len - 20
         gen_len = min(req.max_tokens, available_gen)
@@ -1757,16 +1831,41 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         if req.stream:
             async def sse() -> AsyncIterator[str]:
                 async with _daemon_request_lock("anthropic-stream"):
+                    cur_bin_local = cur_bin
+                    prompt_len_local = prompt_len
+                    compression_fired_local = compression_fired
+                    cur_ids_local = cur_ids
+                    full_snap_prep_local = full_snap_prep
+                    gen_len_local = gen_len
+                    (
+                        cur_bin_local,
+                        prompt_len_local,
+                        compression_fired_local,
+                        cur_ids_local,
+                        full_snap_prep_local,
+                    ) = await _apply_anthropic_compression_if_needed(
+                        cur_bin_local,
+                        prompt_len_local,
+                        raw_msgs,
+                        full_hit,
+                        prompt_ids,
+                        cache_scope,
+                    )
+                    available_gen_local = max_ctx - prompt_len_local - 20
+                    gen_len_local = min(req.max_tokens, available_gen_local)
                     if full_hit is not None:
                         slot, cached_cur_bin, _cached_len = full_hit
-                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
+                        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len_local}\n"
                         snap_prep = None
-                    elif compression_fired:
-                        if full_snap_prep is not None:
-                            fslot, _ = full_snap_prep
-                            cmd_line = f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n"
+                    elif compression_fired_local:
+                        if full_snap_prep_local is not None:
+                            fslot, _ = full_snap_prep_local
+                            cmd_line = (
+                                f"{cur_bin_local} {gen_len_local} "
+                                f"snap={len(cur_ids_local)}:{fslot}\n"
+                            )
                         else:
-                            cmd_line = f"{cur_bin} {gen_len}\n"
+                            cmd_line = f"{cur_bin_local} {gen_len_local}\n"
                         snap_prep = None
                     else:
                         hit = prefix_cache.lookup(prompt_ids, scope=cache_scope)
@@ -1774,9 +1873,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             prompt_ids, scope=cache_scope)
                         if hit:
                             slot, _prefix_len = hit
-                            cmd_line = f"RESTORE {slot} {cur_bin} {gen_len}"
+                            cmd_line = f"RESTORE {slot} {cur_bin_local} {gen_len_local}"
                         else:
-                            cmd_line = f"{cur_bin} {gen_len}"
+                            cmd_line = f"{cur_bin_local} {gen_len_local}"
                         if snap_prep:
                             cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
                         cmd_line += "\n"
@@ -1787,7 +1886,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             "id": msg_id, "type": "message", "role": "assistant",
                             "model": req.model or MODEL_NAME,
                             "content": [], "stop_reason": None, "stop_sequence": None,
-                            "usage": {"input_tokens": prompt_len, "output_tokens": 0},
+                            "usage": {"input_tokens": prompt_len_local, "output_tokens": 0},
                         },
                     }
                     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
@@ -1811,7 +1910,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     snap_ok = False
                     try:
                         async for tok_id in async_iter_pipe_tokens(
-                                r_pipe, gen_len, stop_ids, bus=bus,
+                                r_pipe, gen_len_local, stop_ids, bus=bus,
                                 wall_timeout=request_wall_timeout_seconds()):
                             out_tokens += 1
                             piece = tokenizer.decode([tok_id])
@@ -1862,33 +1961,29 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         snap_ok = True
                     except Exception:
                         await _finalize_request_snaps(
-                            full_snap_prep=full_snap_prep,
+                            full_snap_prep=full_snap_prep_local,
                             snap_prep=snap_prep,
                             prompt_ids=prompt_ids,
-                            cur_bin=cur_bin,
-                            cur_ids=cur_ids,
+                            cur_bin=cur_bin_local,
+                            cur_ids=cur_ids_local,
                             success=False,
                             cache_scope=cache_scope,
                         )
                         raise
                     finally:
                         if full_hit is None:
-                            try: cur_bin.unlink()
+                            try: cur_bin_local.unlink()
                             except Exception: pass
                         else:
-                            # On full-cache hit, cur_bin points at the persistent cached file
-                            # (which we MUST keep). The tokenize-stage prompt_bin tempfile, on
-                            # the other hand, was never used (we hit before _maybe_compress) and
-                            # would otherwise leak.
                             try: prompt_bin.unlink()
                             except Exception: pass
 
                     await _finalize_request_snaps(
-                        full_snap_prep=full_snap_prep,
+                        full_snap_prep=full_snap_prep_local,
                         snap_prep=snap_prep,
                         prompt_ids=prompt_ids,
-                        cur_bin=cur_bin,
-                        cur_ids=cur_ids,
+                        cur_bin=cur_bin_local,
+                        cur_ids=cur_ids_local,
                         success=snap_ok,
                         cache_scope=cache_scope,
                     )
@@ -1910,6 +2005,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         # Non-streaming
         async with _daemon_request_lock("anthropic"):
+            (
+                cur_bin,
+                prompt_len,
+                compression_fired,
+                cur_ids,
+                full_snap_prep,
+            ) = await _apply_anthropic_compression_if_needed(
+                cur_bin,
+                prompt_len,
+                raw_msgs,
+                full_hit,
+                prompt_ids,
+                cache_scope,
+            )
+            available_gen = max_ctx - prompt_len - 20
+            gen_len = min(req.max_tokens, available_gen)
             if full_hit is not None:
                 slot, cached_cur_bin, _cached_len = full_hit
                 cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"
