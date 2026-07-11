@@ -143,6 +143,12 @@ class ToolSlotCache:
             del self._pending[fingerprint]
         self._pending_evict = None
 
+    def reset(self) -> None:
+        """Clear in-memory slot map after daemon restart."""
+        self._confirmed.clear()
+        self._pending.clear()
+        self._pending_evict = None
+
 
 class ToolSplitOrchestrator:
     """High-level API used by ``server_tools.py``."""

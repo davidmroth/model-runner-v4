@@ -1061,6 +1061,20 @@ class PrefixCache:
                     pass
                 self.abort_inline_snap(slot, scope=scope)
 
+    def invalidate_daemon_state(self) -> None:
+        """Drop Python-side cache index after daemon process restart."""
+        if self.disabled:
+            return
+        self.entries.clear()
+        self._slot_prefix_len.clear()
+        self._slot_scope.clear()
+        self._populated_slots.clear()
+        self._pending_evict_key = None
+        if hasattr(self, "full_entries"):
+            self.full_entries.clear()
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+
     async def startup_sync(self, timeout: float = 120.0) -> None:
         """Query the daemon for existing slots and free them all.
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
+from handler_reliability import tool_snapshot_max_kv_tokens
+
 
 async def snapshot_thin(
     *,
@@ -38,6 +40,15 @@ async def commit_pending_tool_snap(
 ) -> None:
     if kv_end <= 0:
         orchestrator.tool_slots.release_reservation(fingerprint, slot)
+        return
+    max_kv = tool_snapshot_max_kv_tokens()
+    if max_kv > 0 and kv_end > max_kv:
+        orchestrator.tool_slots.release_reservation(fingerprint, slot)
+        print(
+            f"[tool-split] SNAPSHOT_THIN skipped kv_end={kv_end} > max={max_kv} "
+            f"(set DFLASH_TOOL_SNAPSHOT_MAX_KV=0 to force; may crash daemon)",
+            flush=True,
+        )
         return
     ok = await snapshot_thin(
         daemon_stdin=daemon_stdin,

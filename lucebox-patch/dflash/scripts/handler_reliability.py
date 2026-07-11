@@ -30,6 +30,15 @@ def daemon_lock_wait_seconds() -> float:
     return max(1.0, val)
 
 
+def tool_snapshot_max_kv_tokens() -> int:
+    """Skip SNAPSHOT_THIN above this KV depth (daemon may crash on huge thin snaps)."""
+    raw = os.environ.get("DFLASH_TOOL_SNAPSHOT_MAX_KV", "16384")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 16384
+
+
 def request_wall_timeout_seconds() -> float:
     raw = os.environ.get("DFLASH_REQUEST_WALL_TIMEOUT_SEC", "600")
     try:

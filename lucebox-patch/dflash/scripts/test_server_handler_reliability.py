@@ -7,6 +7,7 @@ from handler_reliability import (
     DaemonBusyError,
     daemon_lock_wait_seconds,
     request_wall_timeout_seconds,
+    tool_snapshot_max_kv_tokens,
 )
 
 
@@ -40,6 +41,14 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
     def test_request_wall_timeout_env_override(self):
         with patch.dict(os.environ, {"DFLASH_REQUEST_WALL_TIMEOUT_SEC": "180"}):
             self.assertEqual(request_wall_timeout_seconds(), 180.0)
+
+    def test_tool_snapshot_max_kv_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(tool_snapshot_max_kv_tokens(), 16384)
+
+    def test_tool_snapshot_max_kv_zero_means_unlimited(self):
+        with patch.dict(os.environ, {"DFLASH_TOOL_SNAPSHOT_MAX_KV": "0"}):
+            self.assertEqual(tool_snapshot_max_kv_tokens(), 0)
 
     def test_daemon_busy_error_carries_label(self):
         err = DaemonBusyError("chat-stream")

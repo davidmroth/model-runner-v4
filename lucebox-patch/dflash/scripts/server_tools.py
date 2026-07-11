@@ -540,16 +540,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             headers=headers,
         )
 
-    r_pipe, w_pipe = os.pipe()
-    if sys.platform == "win32":
-        import msvcrt
-        os.set_inheritable(w_pipe, True)
-        stream_fd_val = int(msvcrt.get_osfhandle(w_pipe))
-    else:
-        # PEP 446: pipe fds are close-on-exec by default; the child must inherit
-        # w_pipe or --stream-fd points at a stale fd and HTTP handlers hang on read.
-        os.set_inheritable(w_pipe, True)
-        stream_fd_val = w_pipe
+    def _open_token_pipe() -> tuple[int, int]:
+        r_pipe, w_pipe = os.pipe()
+        if sys.platform == "win32":
+            import msvcrt
+            os.set_inheritable(w_pipe, True)
+            stream_fd_val = int(msvcrt.get_osfhandle(w_pipe))
+        else:
+            os.set_inheritable(w_pipe, True)
+            stream_fd_val = w_pipe
+        return r_pipe, w_pipe, stream_fd_val
 
     bin_abs = str(Path(bin_path).resolve())
     dll_dir = str(Path(bin_abs).parent / "bin")
@@ -557,11 +557,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     if sys.platform == "win32":
         env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
 
-    if arch in _LAGUNA_ARCHES:
-        cmd = [bin_abs, str(target), "--daemon",
-               f"--max-ctx={max_ctx}",
-               f"--stream-fd={stream_fd_val}"]
-    else:
+    def _daemon_cmd(stream_fd_val: int) -> list[str]:
+        if arch in _LAGUNA_ARCHES:
+            return [bin_abs, str(target), "--daemon",
+                    f"--max-ctx={max_ctx}",
+                    f"--stream-fd={stream_fd_val}"]
         if draft is None:
             raise SystemExit("qwen35 arch requires --draft model.safetensors")
         cmd = [bin_abs, str(target), str(draft), "--daemon",
@@ -570,17 +570,26 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                f"--stream-fd={stream_fd_val}"]
         if extra_daemon_args:
             cmd.extend(extra_daemon_args)
-    if sys.platform == "win32":
-        daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
-                                       stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, bufsize=0)
-    else:
-        daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), env=env,
-                                       stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, bufsize=0)
+        return cmd
+
+    def _spawn_daemon(stream_fd_val: int) -> subprocess.Popen:
+        cmd = _daemon_cmd(stream_fd_val)
+        if sys.platform == "win32":
+            return subprocess.Popen(cmd, close_fds=False, env=env,
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, bufsize=0)
+        return subprocess.Popen(cmd, pass_fds=(stream_fd_val,), env=env,
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, bufsize=0)
+
+    r_pipe, w_pipe, stream_fd_val = _open_token_pipe()
+    daemon_proc = _spawn_daemon(stream_fd_val)
     os.close(w_pipe)
 
+    runtime = {"proc": daemon_proc, "r_pipe": r_pipe, "bus": None}
+
     bus = DaemonStdoutBus(daemon_proc.stdout)
+    runtime["bus"] = bus
     # Mirror server.py: resolve effective KV-K type + FA window from env so
     # they participate in the prefix-cache hash key.
     def _resolve_kv_k_type():
@@ -773,6 +782,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             return
         if not tool_ctx.fingerprint:
             return
+        if daemon_proc.poll() is not None:
+            print("  [tool-split] skip SNAPSHOT_THIN — daemon not running", flush=True)
+            slot, _ = tool_ctx.pending_tool_snap
+            tool_split.tool_slots.release_reservation(tool_ctx.fingerprint, slot)
+            return
         slot, kv_end = tool_ctx.pending_tool_snap
         await commit_pending_tool_snap(
             orchestrator=tool_split,
@@ -783,6 +797,43 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             kv_end=kv_end,
         )
 
+    async def _restart_daemon_if_dead() -> bool:
+        """Respawn test_dflash after crash. Caller must hold ``daemon_lock``."""
+        nonlocal daemon_proc, bus, r_pipe
+        if daemon_proc.poll() is None:
+            return True
+        print("  [daemon] process exited — restarting", flush=True)
+        if bus._task is not None:
+            bus._task.cancel()
+            try:
+                await bus._task
+            except asyncio.CancelledError:
+                pass
+        try:
+            daemon_proc.kill()
+            daemon_proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            os.close(r_pipe)
+        except OSError:
+            pass
+        r_pipe, w_pipe, stream_fd_val = _open_token_pipe()
+        daemon_proc = _spawn_daemon(stream_fd_val)
+        os.close(w_pipe)
+        runtime["proc"] = daemon_proc
+        runtime["r_pipe"] = r_pipe
+        bus = DaemonStdoutBus(daemon_proc.stdout)
+        runtime["bus"] = bus
+        prefix_cache.stdin = daemon_proc.stdin
+        prefix_cache.invalidate_daemon_state()
+        if tool_split is not None:
+            tool_split.tool_slots.reset()
+        bus.start(asyncio.get_running_loop())
+        await prefix_cache.startup_sync()
+        print("  [daemon] restart complete", flush=True)
+        return True
+
     @app.on_event("startup")
     async def _startup():
         import asyncio
@@ -790,9 +841,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         await prefix_cache.startup_sync()
 
     @app.get("/health")
-    def health():
-        alive = daemon_proc.poll() is None
-        if not alive:
+    async def health():
+        if daemon_proc.poll() is not None:
+            try:
+                async with _daemon_request_lock("health-revive"):
+                    await _restart_daemon_if_dead()
+            except DaemonBusyError:
+                return JSONResponse(
+                    {"status": "error", "detail": "daemon exited; restart queued"},
+                    status_code=503,
+                )
+        if daemon_proc.poll() is not None:
             return JSONResponse(
                 {"status": "error", "detail": "daemon exited"},
                 status_code=503,
@@ -1005,6 +1064,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         try:
             async with _daemon_request_lock("chat-preflight"):
+                await _restart_daemon_if_dead()
                 allow_full_cache = (
                     prefill_cfg is not None
                     and prefill_cfg.enabled
@@ -1077,6 +1137,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         # Non-streaming: collect, parse, return.
         try:
             async with _daemon_request_lock("chat"):
+                await _restart_daemon_if_dead()
                 cmd_line, snap_prep, conv_prefix_len = _compose_daemon_cmd(
                     cur_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
@@ -1263,6 +1324,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
             try:
                 async with _daemon_request_lock("chat-stream"):
+                    await _restart_daemon_if_dead()
                     cmd_line, snap_prep, conv_prefix_len = _compose_daemon_cmd(
                         prompt_bin, gen_len, prompt_ids,
                         full_hit=full_hit,
