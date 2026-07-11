@@ -34,22 +34,20 @@ async def finish_tool_inline_snap(
     fingerprint: str,
     tool_snap_prep: tuple[int, int] | None,
 ) -> bool:
-    """Confirm tool KV pin after inline ``snap=`` ack, or release the reservation."""
+    """Log inline ``snap=`` ack; daemon thin registration is ``SNAPSHOT_THIN``."""
     if tool_snap_prep is None or not fingerprint:
         return False
     slot, kv_end = tool_snap_prep
     await bus.drain_inline_snap()
     if bus.inline_snap_slot() == slot:
-        orchestrator.tool_slots.confirm(fingerprint, slot)
         print(
-            f"[tool-split] tool KV pinned (inline) slot={slot} len={kv_end} "
-            f"fp={fingerprint[:12]}…",
+            f"[tool-split] inline tool snap ack slot={slot} len={kv_end} "
+            f"fp={fingerprint[:12]}… (thin pin via SNAPSHOT_THIN next)",
             flush=True,
         )
         return True
-    orchestrator.tool_slots.release_reservation(fingerprint, slot)
     print(
-        f"[tool-split] inline tool pin failed slot={slot} "
+        f"[tool-split] inline tool snap missed slot={slot} "
         f"(ack={bus.inline_snap_slot()!r}) fp={fingerprint[:12]}…",
         flush=True,
     )

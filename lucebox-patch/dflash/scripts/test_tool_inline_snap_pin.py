@@ -80,7 +80,7 @@ class FinishToolInlineSnapTests(unittest.IsolatedAsyncioTestCase):
             tool_snap_prep=(4, 20590),
         )
         self.assertTrue(ok)
-        self.assertEqual(orch.tool_slots.pinned_slot(fp), 4)
+        self.assertIsNone(orch.tool_slots.pinned_slot(fp))
 
     async def test_release_on_ack_mismatch(self):
         from tool_split.daemon_bridge import finish_tool_inline_snap
