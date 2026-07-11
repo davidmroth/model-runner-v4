@@ -484,9 +484,32 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     async def _daemon_request_lock(label: str):
         wait_sec = daemon_lock_wait_seconds()
         acquired = False
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
+        if daemon_lock.locked():
+            if wait_sec == float("inf"):
+                print(
+                    f"  [handler] daemon_lock busy — queueing ({label})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  [handler] daemon_lock busy — queueing up to "
+                    f"{wait_sec:.0f}s ({label})",
+                    flush=True,
+                )
         try:
-            await asyncio.wait_for(daemon_lock.acquire(), timeout=wait_sec)
+            if wait_sec == float("inf"):
+                await daemon_lock.acquire()
+            else:
+                await asyncio.wait_for(daemon_lock.acquire(), timeout=wait_sec)
             acquired = True
+            waited = loop.time() - queued_at
+            if waited >= 1.0:
+                print(
+                    f"  [handler] daemon_lock acquired after {waited:.1f}s ({label})",
+                    flush=True,
+                )
             yield
         except asyncio.TimeoutError:
             print(
@@ -499,9 +522,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 daemon_lock.release()
 
     def _busy_response() -> JSONResponse:
+        # 503 only when an explicit lock-wait cap is exceeded — not for normal
+        # single-flight queueing (default waits up to request wall timeout).
+        wait_sec = daemon_lock_wait_seconds()
+        headers: dict[str, str] = {}
+        if wait_sec != float("inf"):
+            headers["Retry-After"] = str(max(1, int(wait_sec)))
         return JSONResponse(
-            {"detail": "Inference engine busy — retry shortly"},
+            {
+                "error": {
+                    "message": "Inference engine busy — retry shortly",
+                    "type": "server_busy",
+                    "code": "engine_busy",
+                }
+            },
             status_code=503,
+            headers=headers,
         )
 
     r_pipe, w_pipe = os.pipe()

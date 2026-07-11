@@ -11,17 +11,27 @@ from handler_reliability import (
 
 
 class HandlerReliabilityConfigTests(unittest.TestCase):
-    def test_daemon_lock_wait_defaults(self):
+    def test_daemon_lock_wait_defaults_to_wall_timeout(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(daemon_lock_wait_seconds(), 120.0)
+            self.assertEqual(
+                daemon_lock_wait_seconds(),
+                request_wall_timeout_seconds(),
+            )
 
     def test_daemon_lock_wait_env_override(self):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "45"}):
             self.assertEqual(daemon_lock_wait_seconds(), 45.0)
 
+    def test_daemon_lock_wait_zero_means_unbounded(self):
+        with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "0"}):
+            self.assertEqual(daemon_lock_wait_seconds(), float("inf"))
+
     def test_daemon_lock_wait_invalid_env_falls_back(self):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "nope"}):
-            self.assertEqual(daemon_lock_wait_seconds(), 120.0)
+            self.assertEqual(
+                daemon_lock_wait_seconds(),
+                request_wall_timeout_seconds(),
+            )
 
     def test_request_wall_timeout_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
