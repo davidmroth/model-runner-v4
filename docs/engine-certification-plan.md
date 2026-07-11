@@ -5,6 +5,10 @@ we're trying to achieve, architecture, and sign-off criteria.
 
 **North star (metrics + no-hack policy):** [inference-engine-north-star.md](./inference-engine-north-star.md)
 
+**Operations SOP:** [anonymous-feedback-loop-sop.md](./anonymous-feedback-loop-sop.md)
+
+**Iteration template:** [anonymous-feedback-loop-scorecard.md](./anonymous-feedback-loop-scorecard.md)
+
 **Goal:** Restore Hermes agent tool-calling stability and hit the speed targets
 documented in [whitepaper-agent-inference-cache.md](./whitepaper-agent-inference-cache.md)
 on 2×RTX 3090 (`ai.local` and production Lightsail).
