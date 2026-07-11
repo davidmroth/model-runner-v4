@@ -66,8 +66,9 @@ Slot layout (8 daemon slots max): ``[prefix LRU][full compress][tool pins]``.
 
 ## Requirements
 
-- `DFLASH_LAYER_SPLIT=0` (or non-sharded daemon): SNAPSHOT / RESTORE_CHAIN are
-  unsupported in layer-split mode.
+- Layer-split + legacy daemon (`DFLASH_LEGACY_DAEMON=1`, default in
+  ``entrypoint-tool-split-serve.sh``): SNAPSHOT_THIN / RESTORE_CHAIN supported.
+- Layer-split **without** tool-split: prefix/full cache slots are disabled.
 - PFlash enabled (`--prefill-compression auto`) for conversation compression.
 
 ## Architecture

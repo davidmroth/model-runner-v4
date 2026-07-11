@@ -90,6 +90,10 @@ class DaemonStdoutBus:
         r"avg commit/step=([\d.]+)"
     )
 
+    _TARGET_SPLIT_DECODE_RE = re.compile(
+        r"\[target-split-dflash\] decode tokens=(\d+)"
+    )
+
     _STEP_TIMING_LINE_RE = re.compile(r"^  ([a-z_]+|----- sum)\s+([\d.]+)$")
 
     def __init__(self, stdout):
@@ -143,6 +147,10 @@ class DaemonStdoutBus:
             self._timings["draft_steps"] = int(m.group(1))
             self._timings["draft_accept_pct"] = float(m.group(4))
             self._timings["avg_commit_per_step"] = float(m.group(5))
+            return
+        m = self._TARGET_SPLIT_DECODE_RE.search(decoded)
+        if m:
+            self._timings["completion_tokens"] = int(m.group(1))
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._task = loop.create_task(self._run())

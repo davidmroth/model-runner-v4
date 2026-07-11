@@ -2,6 +2,7 @@
 import os
 import struct
 import threading
+import time
 import unittest
 
 from daemon_pipe import (
@@ -43,7 +44,34 @@ class DaemonPipeTests(unittest.TestCase):
             os.close(r)
         self.assertEqual(tokens, [10, 11])
 
-    def test_drain_clears_residual(self):
+    def test_iter_stops_when_bus_reports_completion(self):
+        from unittest.mock import MagicMock
+
+        r, w = os.pipe()
+
+        def writer():
+            for tok in (201, 202):
+                os.write(w, struct.pack("<i", tok))
+            # Daemon stops without closing pipe or sentinel (layer-split path).
+            time.sleep(0.5)
+
+        bus = MagicMock()
+        bus.request_timings.side_effect = [
+            {},
+            {},
+            {"completion_tokens": 2},
+            {"completion_tokens": 2},
+        ]
+
+        threading.Thread(target=writer, daemon=True).start()
+        try:
+            tokens = collect_pipe_tokens(
+                r, 4096, bus=bus, wall_timeout=5.0, post_token_idle=0.2,
+            )
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(tokens, [201, 202])
         r, w = os.pipe()
         os.write(w, struct.pack("<iii", 1, 2, 3))
         drain_pipe_residual(r)

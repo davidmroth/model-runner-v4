@@ -744,6 +744,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
             return cmd, snap_prep, conv_prefix_len
 
+        if tool_split and tool_ctx:
+            if tool_ctx.pending_tool_snap is not None:
+                slot, kv_end = tool_ctx.pending_tool_snap
+                print(
+                    f"  [tool-split] cold tool prefill slot={slot} "
+                    f"tool_prefix_len={kv_end} prompt_tokens={len(prompt_ids)}",
+                    flush=True,
+                )
+            elif tool_ctx.tool_slot_hit is None and tool_ctx.fingerprint:
+                print(
+                    f"  [tool-split] tool cache miss fp={tool_ctx.fingerprint[:12]}… "
+                    f"prompt_tokens={len(prompt_ids)}",
+                    flush=True,
+                )
+
         if hit:
             slot, _prefix_len = hit
             cmd = f"RESTORE {slot} {cur_bin} {gen_len}"
@@ -1077,8 +1092,18 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 daemon_proc.stdin.flush()
                 snap_ok = False
                 try:
+                    wall_timeout_sec = request_wall_timeout_seconds()
                     tokens = await asyncio.to_thread(
-                        list, iter_pipe_tokens(r_pipe, gen_len, stop_ids))
+                        lambda: list(
+                            iter_pipe_tokens(
+                                r_pipe,
+                                gen_len,
+                                stop_ids,
+                                bus=bus,
+                                wall_timeout=wall_timeout_sec,
+                            )
+                        ),
+                    )
                     await bus.drain_timings()
                     snap_ok = True
                 except asyncio.CancelledError:
@@ -1275,7 +1300,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     try:
                         token_ids = await asyncio.wait_for(
                             asyncio.to_thread(
-                                list, iter_pipe_tokens(r_pipe, gen_len, stop_ids)),
+                                lambda: list(
+                                    iter_pipe_tokens(
+                                        r_pipe,
+                                        gen_len,
+                                        stop_ids,
+                                        bus=bus,
+                                        wall_timeout=wall_timeout_sec,
+                                    )
+                                ),
+                            ),
                             timeout=wall_timeout_sec,
                         )
                     except asyncio.TimeoutError:
@@ -1682,7 +1716,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     snap_ok = False
                     try:
                         async for tok_id in async_iter_pipe_tokens(
-                                r_pipe, gen_len, stop_ids):
+                                r_pipe, gen_len, stop_ids, bus=bus,
+                                wall_timeout=request_wall_timeout_seconds()):
                             out_tokens += 1
                             piece = tokenizer.decode([tok_id])
                             if user_stops:
@@ -1811,7 +1846,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             try:
                 tokens = [
                     t async for t in async_iter_pipe_tokens(
-                        r_pipe, gen_len, stop_ids)
+                        r_pipe, gen_len, stop_ids, bus=bus,
+                        wall_timeout=request_wall_timeout_seconds())
                 ]
                 snap_ok = True
             except Exception:
@@ -2071,10 +2107,24 @@ def main():
             extra_daemon.append(f"--target-layer-split={args.target_layer_split}")
         extra_daemon.append("--target-split-load-draft")
         extra_daemon.append("--target-split-dflash")
-        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
-            print("  [cfg] target-gpus daemon mode disables prefix/full cache slots (snapshot protocol unsupported)")
+        if tool_split_orchestrator is None and (
+            args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0
+        ):
+            print(
+                "  [cfg] target-gpus without tool-split: disabling prefix/full "
+                "cache slots (use DFLASH_TOOL_SPLIT_ENABLED=1 for agent cache)",
+                flush=True,
+            )
             args.prefix_cache_slots = 0
             args.prefill_cache_slots = 0
+        elif tool_split_orchestrator is not None:
+            print(
+                f"  [cfg] layer-split tool-split slot budget: "
+                f"prefix={args.prefix_cache_slots} "
+                f"prefill={args.prefill_cache_slots} "
+                f"tool_pins={tool_split_cfg.pinned_tool_slots}",
+                flush=True,
+            )
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
