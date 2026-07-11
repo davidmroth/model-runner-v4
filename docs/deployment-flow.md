@@ -47,7 +47,7 @@ From `docker inspect model-runner-v4-lucebox`:
 
 | Host path | Container path | Role |
 |---|---|---|
-| `model-runner-v4/lucebox-patch/dflash/scripts` | `/opt/lucebox-hub/patch/dflash/scripts` (ro) | **Live Python server** — `server_tools.py`, `prefix_cache.py`, `tool_split/` |
+| `model-runner-v4/lucebox-patch/dflash/scripts` | `/opt/lucebox-hub/patch/dflash/scripts` (ro) | **Live Python server** — `server_tools.py`, `prefix_cache.py`, `_prefill_hook.py`, `tool_split/`, unit tests |
 | `lucebox-hub-src/server/build` | `/opt/lucebox-hub/dflash-build` (ro) | **Compiled daemon** — `test_dflash` + patched ggml `.so`s |
 | `models-cache` | `/opt/lucebox-hub/server/models` (rw) | GGUF weights (target, draft, PFlash drafter) |
 | `model-runner-v4/scripts/entrypoint-*.sh` | `/scripts/…` (ro) | Entrypoints |

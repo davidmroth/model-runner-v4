@@ -4,7 +4,7 @@
 **Reporter:** David Roth (Hermes Agent deployment on `ai.local`, 2×RTX 3090)  
 **Stack:** `model-runner-v4` lucebox / dflash tool-split server  
 **Severity:** Critical — agent and cron replies become empty or HumanEval Python code  
-**Status:** Confirmed on production; workaround is `DFLASH_TOOL_SPLIT_ENABLED=0`
+**Status:** Fixed in lucebox-hub — session-scoped prefix cache keys (`resolve_cache_scope`).
 
 ---
 
@@ -60,12 +60,16 @@ Verify startup banner shows `tool-split = off` and logs no longer print
 
 | Setting | Safe default | Notes |
 |---------|--------------|-------|
-| `DFLASH_TOOL_SPLIT_ENABLED` | `0` | Do not enable until cache restore is session-safe |
+| `DFLASH_TOOL_SPLIT_ENABLED` | `1` | Safe with session-scoped prefix cache (lucebox-hub). Send `X-Conversation-Id` on agent traffic for multi-turn reuse. |
 | `DFLASH_PREFILL_MODE` | `off` | See `feedback-pflash-agent-regression.md` |
 | `DFLASH_TOOL_SPLIT_COMPRESS_CONV` | `0` | Conversation compression breaks agents |
 
 ## Root-cause area (lucebox-hub patch)
 
 Fix belongs in `prefix_cache.py` / `server_tools.py` — cache lookup must not
-reuse slots across unrelated prompts (benchmark vs agent). Until then, keep
-tool-split disabled on production agent hosts.
+reuse slots across unrelated prompts (benchmark vs agent).
+
+**Implemented (July 2026):** `resolve_cache_scope()` keys prefix-cache LRU entries
+by `X-Conversation-Id` when present; otherwise each distinct prompt+tools hash
+gets an ephemeral scope so benchmarks cannot pollute agent sessions. Slots track
+`_slot_scope` and reject cross-scope restores.

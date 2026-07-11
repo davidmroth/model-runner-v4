@@ -63,7 +63,10 @@ if [ "${DFLASH_PREFILL_MODE:-off}" != "off" ]; then
 fi
 
 if [ "${DFLASH_LAYER_SPLIT:-0}" = "1" ]; then
-  ARGS+=(--target-gpus "${DFLASH_TARGET_DEVICES:-cuda:0,cuda:1}")
+  # test_dflash expects integer GPU ids (0,1), not cuda:0,cuda:1.
+  _target_gpus="${DFLASH_TARGET_GPUS:-${DFLASH_TARGET_DEVICES:-0,1}}"
+  _target_gpus="${_target_gpus//cuda:/}"
+  ARGS+=(--target-gpus "${_target_gpus}")
   if [ -n "${DFLASH_TARGET_LAYER_SPLIT:-}" ]; then
     ARGS+=(--target-layer-split "${DFLASH_TARGET_LAYER_SPLIT}")
   else
@@ -91,13 +94,27 @@ export PYTHONPATH="${PATCH_SCRIPTS}${PYTHONPATH:+:${PYTHONPATH}}"
 # legacy loop instead of run_qwen35_daemon.
 export DFLASH_LEGACY_DAEMON="${DFLASH_LEGACY_DAEMON:-1}"
 
-# The daemon binary links shared ggml libs from its build tree; its RUNPATH
+# The daemon binary links shared ggml + mtmd libs from its build tree; RUNPATH
 # points at the build container's /src path, which doesn't exist here. Put the
-# mounted build's ggml dirs first so the patched libs win over any stock copy.
+# mounted build's lib dirs first so patched libs win over any stock copy.
 BUILD_DIR="$(cd "$(dirname "${BIN}")" && pwd)"
 GGML_DIR="${BUILD_DIR}/deps/llama.cpp/ggml/src"
-if [ -d "${GGML_DIR}" ]; then
-  export LD_LIBRARY_PATH="${GGML_DIR}:${GGML_DIR}/ggml-cuda${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+MTMD_DIR="${BUILD_DIR}/deps/llama.cpp/tools/mtmd"
+LLAMA_BIN="${BUILD_DIR}/bin"
+_libpath=""
+if [ -d "${MTMD_DIR}" ]; then
+  _libpath="${MTMD_DIR}"
+fi
+if [ -d "${LLAMA_BIN}" ]; then
+  _libpath="${_libpath:+${_libpath}:}${LLAMA_BIN}"
+fi
+if [ -d "${GGML_DIR}/ggml-cuda" ]; then
+  _libpath="${_libpath:+${_libpath}:}${GGML_DIR}:${GGML_DIR}/ggml-cuda"
+elif [ -d "${GGML_DIR}" ]; then
+  _libpath="${_libpath:+${_libpath}:}${GGML_DIR}"
+fi
+if [ -n "${_libpath}" ]; then
+  export LD_LIBRARY_PATH="${_libpath}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
 cd "${PATCH_SCRIPTS}"
