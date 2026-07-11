@@ -2190,6 +2190,9 @@ def main():
                 pinned_slots=tool_split_cfg.pinned_tool_slots,
                 slot_base=args.prefix_cache_slots + args.prefill_cache_slots,
             )
+            os.environ["DFLASH_TOOL_SNAP_SLOT_BASE"] = str(
+                tool_split_orchestrator.tool_slots.slot_base
+            )
             from handler_reliability import tool_inline_snap_pin_enabled
             print(
                 f"  [cfg] tool-inline-snap-pin="
