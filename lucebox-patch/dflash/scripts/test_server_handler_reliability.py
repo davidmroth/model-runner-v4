@@ -11,6 +11,8 @@ from handler_reliability import (
     daemon_lock_wait_seconds,
     ephemeral_lock_wait_seconds,
     is_ephemeral_cache_scope,
+    install_quiet_access_log_filter,
+    quiet_access_logs_enabled,
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
     scoped_lock_wait_cap_seconds,
@@ -65,6 +67,54 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
     def test_tool_inline_snap_pin_off(self):
         with patch.dict(os.environ, {"DFLASH_TOOL_INLINE_SNAP_PIN": "0"}):
             self.assertFalse(tool_inline_snap_pin_enabled())
+
+    def test_quiet_access_logs_defaults_on(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(quiet_access_logs_enabled())
+
+    def test_quiet_access_logs_off(self):
+        with patch.dict(os.environ, {"DFLASH_QUIET_ACCESS_LOGS": "0"}):
+            self.assertFalse(quiet_access_logs_enabled())
+
+    def test_quiet_access_log_filter_hides_health_and_models(self):
+        import logging
+
+        with patch.dict(os.environ, {"DFLASH_QUIET_ACCESS_LOGS": "1"}):
+            install_quiet_access_log_filter()
+            logger = logging.getLogger("uvicorn.access")
+            filt = next(f for f in logger.filters if f.__class__.__name__ == "_QuietAccessLogFilter")
+            health = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 0,
+                '127.0.0.1:1 - "GET /health HTTP/1.1" 200 OK',
+                (), None,
+            )
+            models = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 0,
+                '172.22.0.2:1 - "GET /v1/models HTTP/1.1" 200 OK',
+                (), None,
+            )
+            chat = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 0,
+                '172.22.0.3:1 - "POST /v1/chat/completions HTTP/1.1" 200 OK',
+                (), None,
+            )
+            self.assertFalse(filt.filter(health))
+            self.assertFalse(filt.filter(models))
+            self.assertTrue(filt.filter(chat))
+
+    def test_quiet_access_log_filter_off_shows_all(self):
+        import logging
+
+        with patch.dict(os.environ, {"DFLASH_QUIET_ACCESS_LOGS": "0"}):
+            install_quiet_access_log_filter()
+            logger = logging.getLogger("uvicorn.access")
+            filt = next(f for f in logger.filters if f.__class__.__name__ == "_QuietAccessLogFilter")
+            health = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 0,
+                '127.0.0.1:1 - "GET /health HTTP/1.1" 200 OK',
+                (), None,
+            )
+            self.assertTrue(filt.filter(health))
 
     def test_daemon_busy_error_carries_label(self):
         err = DaemonBusyError("chat-stream")

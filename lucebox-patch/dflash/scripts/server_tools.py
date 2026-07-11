@@ -93,7 +93,9 @@ from handler_reliability import (
     PriorityDaemonLock,
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
+    install_quiet_access_log_filter,
     is_ephemeral_cache_scope,
+    quiet_access_logs_enabled,
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
 )
@@ -2491,6 +2493,12 @@ def main():
         print("  tool-split = requested but no adapter matched (disabled)")
     else:
         print("  tool-split = off")
+    install_quiet_access_log_filter()
+    print(
+        f"  [cfg] quiet-access-logs="
+        f"{1 if quiet_access_logs_enabled() else 0}",
+        flush=True,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

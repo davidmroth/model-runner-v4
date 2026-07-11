@@ -2,8 +2,41 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections import deque
+
+
+# Uvicorn access-log paths suppressed when ``DFLASH_QUIET_ACCESS_LOGS=1`` (default).
+_QUIET_ACCESS_LOG_PATHS = ("/health", "/v1/models")
+
+
+class _QuietAccessLogFilter(logging.Filter):
+    """Drop uvicorn access lines for high-frequency probe endpoints."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not quiet_access_logs_enabled():
+            return True
+        msg = record.getMessage()
+        for path in _QUIET_ACCESS_LOG_PATHS:
+            if f"{path} HTTP" in msg:
+                return False
+        return True
+
+
+def quiet_access_logs_enabled() -> bool:
+    """Hide ``GET /health`` and ``GET /v1/models`` uvicorn access lines (default on)."""
+    raw = os.environ.get("DFLASH_QUIET_ACCESS_LOGS", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def install_quiet_access_log_filter() -> None:
+    """Attach filter to uvicorn access logger (idempotent)."""
+    logger = logging.getLogger("uvicorn.access")
+    for existing in logger.filters:
+        if isinstance(existing, _QuietAccessLogFilter):
+            return
+    logger.addFilter(_QuietAccessLogFilter())
 
 
 class DaemonBusyError(Exception):
