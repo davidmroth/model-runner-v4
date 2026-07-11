@@ -10,11 +10,20 @@ from handler_reliability import tool_inline_snap_pin_enabled, tool_snapshot_max_
 def tool_snap_prep_from_pending(
     pending_tool_snap: tuple[int, int] | None,
 ) -> tuple[int, int] | None:
-    """Return ``(pin_slot, kv_end)`` for inline tool pin on cold prefill, or ``None``."""
+    """Return ``(pin_slot, kv_end)`` for inline tool snap on cold prefill, or ``None``.
+
+    Inline ``snap=`` into the tool pin slot is only used when ``SNAPSHOT_THIN`` is
+    skipped (depth above ``DFLASH_TOOL_SNAPSHOT_MAX_KV``). Below that threshold,
+    ``SNAPSHOT_THIN`` alone registers the thin slot for ``RESTORE_CHAIN``; combining
+    both on the same slot crashes the layer-split daemon.
+    """
     if not tool_inline_snap_pin_enabled() or pending_tool_snap is None:
         return None
     slot, kv_end = pending_tool_snap
     if kv_end <= 0:
+        return None
+    max_kv = tool_snapshot_max_kv_tokens()
+    if max_kv > 0 and kv_end <= max_kv:
         return None
     return (slot, kv_end)
 

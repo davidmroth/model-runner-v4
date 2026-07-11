@@ -23,6 +23,13 @@ class ToolInlineSnapPinTests(unittest.TestCase):
         with patch.dict(os.environ, {"DFLASH_TOOL_INLINE_SNAP_PIN": "1"}):
             self.assertEqual(tool_snap_prep_from_pending((4, 20590)), (4, 20590))
 
+    def test_tool_snap_prep_defers_to_snapshot_thin_below_max(self):
+        with patch.dict(
+            os.environ,
+            {"DFLASH_TOOL_INLINE_SNAP_PIN": "1", "DFLASH_TOOL_SNAPSHOT_MAX_KV": "16384"},
+        ):
+            self.assertIsNone(tool_snap_prep_from_pending((4, 310)))
+
     def test_tool_snap_prep_disabled(self):
         with patch.dict(os.environ, {"DFLASH_TOOL_INLINE_SNAP_PIN": "0"}):
             self.assertIsNone(tool_snap_prep_from_pending((4, 20590)))
