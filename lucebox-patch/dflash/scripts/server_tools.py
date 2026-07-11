@@ -2252,9 +2252,10 @@ def main():
     tokenizer_id = args.tokenizer or _tokenizer_id_from_gguf(args.target)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
     stop_ids = set()
-    for s in ("<|im_end|>", "<|endoftext|>"):
+    for s in ("<|im_end|>", "<|im_start|>", "<|endoftext|>"):
         ids = tokenizer.encode(s, add_special_tokens=False)
-        if ids: stop_ids.add(ids[0])
+        if ids:
+            stop_ids.add(ids[0])
 
     drafter_tokenizer = None
     if prefill_cfg.enabled:
