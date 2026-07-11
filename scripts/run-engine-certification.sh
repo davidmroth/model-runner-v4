@@ -5,13 +5,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROXY="${PROXY_URL:-http://127.0.0.1:8000}"
+PROXY_DOCKER="$PROXY"
+if [ "$PROXY" = "http://127.0.0.1:8000" ]; then
+  # Dockerized probe steps cannot reach host-loopback directly.
+  PROXY_DOCKER="http://ai-platform-proxy:8000"
+fi
 MODEL="${CERT_MODEL:-qwen3.6-27b-autoround}"
 LUCEBOX="${LUCEBOX_CONTAINER:-model-runner-v4-lucebox}"
 OUT_DIR="${CERT_OUT_DIR:-/tmp/engine-cert-$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
 echo "=== Engine certification ==="
-echo "proxy=$PROXY model=$MODEL out=$OUT_DIR"
+echo "proxy=$PROXY docker_proxy=$PROXY_DOCKER model=$MODEL out=$OUT_DIR"
 
 # --- Unit tests (patch scripts in lucebox container or local mount) ---
 echo ""
@@ -35,7 +40,7 @@ echo "--- E2E: cache pollution regression ---"
 docker run --rm --network ai-inference \
   -v "$ROOT/scripts/test_cache_pollution.py:/w/test_cache_pollution.py:ro" \
   python:3.12-slim \
-  python3 /w/test_cache_pollution.py "$PROXY" "$MODEL" \
+  python3 /w/test_cache_pollution.py "$PROXY_DOCKER" "$MODEL" \
   | tee "$OUT_DIR/cache-pollution.log"
 
 # --- Thorough tool-split bench (speed + RESTORE_CHAIN markers) ---
@@ -44,7 +49,7 @@ echo "--- E2E: tool-split thorough benchmark ---"
 docker run --rm --network ai-inference \
   -v "$ROOT/scripts/benchmark-tool-split-thorough.py:/w/bench.py:ro" \
   python:3.12-slim \
-  python3 /w/bench.py "$PROXY" "$MODEL" "$LUCEBOX" "$OUT_DIR/tool-split-bench.json" \
+  python3 /w/bench.py "$PROXY_DOCKER" "$MODEL" "$LUCEBOX" "$OUT_DIR/tool-split-bench.json" \
   | tee "$OUT_DIR/tool-split-bench.log"
 
 # --- Log markers from lucebox ---
