@@ -30,6 +30,45 @@ def daemon_lock_wait_seconds() -> float:
     return max(1.0, val)
 
 
+def is_ephemeral_cache_scope(cache_scope: str) -> bool:
+    """True when the request has no conversation id (benchmark / one-off probes)."""
+    return cache_scope.startswith("ephemeral:")
+
+
+def scoped_lock_wait_cap_seconds() -> float:
+    """Cap lock wait for scoped (conversation-id) chat when global wait is unbounded."""
+    raw = os.environ.get("DFLASH_SCOPED_LOCK_WAIT_SEC", "60")
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 60.0
+
+
+def ephemeral_lock_wait_seconds() -> float:
+    """Max lock wait for ephemeral traffic before returning 503 when the lock is busy."""
+    raw = os.environ.get("DFLASH_EPHEMERAL_LOCK_WAIT_SEC", "5")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
+def chat_stream_lock_wait_seconds(*, scoped: bool) -> float:
+    """Lock wait for chat/chat-stream before 503.
+
+    Ephemeral/benchmark traffic gets a short cap so user conversations are not
+    stuck behind multi-minute cold prefills. Scoped traffic uses
+    ``DFLASH_SCOPED_LOCK_WAIT_SEC`` when ``DFLASH_DAEMON_LOCK_WAIT_SEC=0``.
+    """
+    if not scoped:
+        return ephemeral_lock_wait_seconds()
+    base = daemon_lock_wait_seconds()
+    cap = scoped_lock_wait_cap_seconds()
+    if base == float("inf"):
+        return cap
+    return min(base, cap)
+
+
 def tool_snapshot_max_kv_tokens() -> int:
     """Skip SNAPSHOT_THIN above this KV depth (daemon may crash on huge thin snaps)."""
     raw = os.environ.get("DFLASH_TOOL_SNAPSHOT_MAX_KV", "16384")

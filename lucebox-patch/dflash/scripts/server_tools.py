@@ -89,7 +89,9 @@ from daemon_pipe import (
 )
 from handler_reliability import (
     DaemonBusyError,
+    chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
+    is_ephemeral_cache_scope,
     request_wall_timeout_seconds,
 )
 
@@ -485,10 +487,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = asyncio.Lock()
 
-    @asynccontextmanager
-    async def _daemon_request_lock(label: str, *, max_wait: float | None = None):
+    async def _acquire_daemon_lock(label: str, *, max_wait: float | None = None) -> None:
         wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
-        acquired = False
         loop = asyncio.get_running_loop()
         queued_at = loop.time()
         if daemon_lock.locked():
@@ -508,28 +508,30 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 await daemon_lock.acquire()
             else:
                 await asyncio.wait_for(daemon_lock.acquire(), timeout=wait_sec)
-            acquired = True
             waited = loop.time() - queued_at
             if waited >= 1.0:
                 print(
                     f"  [handler] daemon_lock acquired after {waited:.1f}s ({label})",
                     flush=True,
                 )
-            yield
         except asyncio.TimeoutError:
             print(
                 f"  [handler] daemon_lock wait timed out after {wait_sec:.0f}s ({label})",
                 flush=True,
             )
             raise DaemonBusyError(label)
-        finally:
-            if acquired:
-                daemon_lock.release()
 
-    def _busy_response() -> JSONResponse:
-        # 503 only when an explicit lock-wait cap is exceeded — not for normal
-        # single-flight queueing (default waits up to request wall timeout).
-        wait_sec = daemon_lock_wait_seconds()
+    @asynccontextmanager
+    async def _daemon_request_lock(label: str, *, max_wait: float | None = None):
+        await _acquire_daemon_lock(label, max_wait=max_wait)
+        try:
+            yield
+        finally:
+            daemon_lock.release()
+
+    def _busy_response(*, retry_after_sec: float | None = None) -> JSONResponse:
+        # 503 when lock-wait cap is exceeded (streaming acquires lock before 200).
+        wait_sec = retry_after_sec if retry_after_sec is not None else daemon_lock_wait_seconds()
         headers: dict[str, str] = {}
         if wait_sec != float("inf"):
             headers["Retry-After"] = str(max(1, int(wait_sec)))
@@ -1184,8 +1186,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
 
         # Non-streaming: collect, parse, return.
+        lock_wait = chat_stream_lock_wait_seconds(
+            scoped=not is_ephemeral_cache_scope(cache_scope))
         try:
-            async with _daemon_request_lock("chat"):
+            async with _daemon_request_lock("chat", max_wait=lock_wait):
                 await _restart_daemon_if_dead()
                 (
                     cur_bin,
@@ -1283,7 +1287,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     prompt_bin.unlink()
                 except Exception:
                     pass
-            return _busy_response()
+            return _busy_response(retry_after_sec=lock_wait)
         if full_hit is None:
             try:
                 cur_bin.unlink()
@@ -1361,6 +1365,20 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         )
         include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
         wall_timeout_sec = request_wall_timeout_seconds()
+        lock_wait = chat_stream_lock_wait_seconds(
+            scoped=not is_ephemeral_cache_scope(cache_scope))
+        lock_held = False
+        try:
+            await _acquire_daemon_lock("chat-stream", max_wait=lock_wait)
+            lock_held = True
+        except DaemonBusyError:
+            _abort_full_snap_if_needed(full_snap_prep)
+            if full_hit is None:
+                try:
+                    prompt_bin.unlink()
+                except Exception:
+                    pass
+            return _busy_response(retry_after_sec=lock_wait)
 
         def chunk(delta_obj, finish=None):
             return {"id": completion_id, "object": "chat.completion.chunk",
@@ -1369,7 +1387,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                   "finish_reason": finish}]}
 
         async def sse() -> AsyncIterator[str]:
-            nonlocal prompt_bin, prompt_len, started_in_thinking, gen_len
+            nonlocal prompt_bin, prompt_len, started_in_thinking, gen_len, lock_held
             snap_prep = None
             tool_snap_prep = None
             conv_prefix_len = None
@@ -1402,244 +1420,181 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     await _commit_tool_snap_if_needed(tool_ctx)
 
             try:
-                async with _daemon_request_lock("chat-stream"):
-                    await _restart_daemon_if_dead()
-                    (
-                        prompt_bin,
-                        prompt_len,
-                        started_in_thinking,
-                        compression_fired_local,
-                        cur_ids_local,
-                        full_snap_prep_local,
-                    ) = await _apply_chat_compression_if_needed(
-                        req,
-                        prompt_bin,
-                        prompt_len,
-                        started_in_thinking,
-                        full_hit,
-                        prompt_ids,
-                        cache_scope,
-                    )
-                    gen_len = _clamp_gen_len(req, prompt_len)
-                    cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
-                        prompt_bin, gen_len, prompt_ids,
-                        full_hit=full_hit,
-                        compression_fired=compression_fired_local,
-                        full_snap_prep=full_snap_prep_local,
-                        cur_ids=cur_ids_local,
-                        tool_ctx=tool_ctx,
-                        cache_scope=cache_scope,
-                    )
-                    drain_pipe_residual(r_pipe)
-                    bus.begin_request()
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                await _restart_daemon_if_dead()
+                (
+                    prompt_bin,
+                    prompt_len,
+                    started_in_thinking,
+                    compression_fired_local,
+                    cur_ids_local,
+                    full_snap_prep_local,
+                ) = await _apply_chat_compression_if_needed(
+                    req,
+                    prompt_bin,
+                    prompt_len,
+                    started_in_thinking,
+                    full_hit,
+                    prompt_ids,
+                    cache_scope,
+                )
+                gen_len = _clamp_gen_len(req, prompt_len)
+                cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
+                    prompt_bin, gen_len, prompt_ids,
+                    full_hit=full_hit,
+                    compression_fired=compression_fired_local,
+                    full_snap_prep=full_snap_prep_local,
+                    cur_ids=cur_ids_local,
+                    tool_ctx=tool_ctx,
+                    cache_scope=cache_scope,
+                )
+                drain_pipe_residual(r_pipe)
+                bus.begin_request()
+                daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                daemon_proc.stdin.flush()
 
-                    mode = "reasoning" if started_in_thinking else "content"
-                    window = ""
-                    tool_buffer = ""
-                    stops = normalize_stop(req.stop)
-                    tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
-                    stop_holdback = max((len(s) for s in stops), default=0)
-                    HOLDBACK = max(tag_holdback, stop_holdback)
-                    stop_hit = False
-                    aborted = False
-                    loop = asyncio.get_running_loop()
-                    deadline = loop.time() + wall_timeout_sec
+                mode = "reasoning" if started_in_thinking else "content"
+                window = ""
+                tool_buffer = ""
+                stops = normalize_stop(req.stop)
+                tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                stop_holdback = max((len(s) for s in stops), default=0)
+                HOLDBACK = max(tag_holdback, stop_holdback)
+                stop_hit = False
+                aborted = False
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + wall_timeout_sec
 
-                    def emit_delta(text, kind):
-                        if not text:
-                            return None
-                        return f"data: {json.dumps(chunk({kind: text}))}\n\n"
+                def emit_delta(text, kind):
+                    if not text:
+                        return None
+                    return f"data: {json.dumps(chunk({kind: text}))}\n\n"
 
-                    # Collect daemon tokens before yielding SSE (same pattern as
-                    # non-stream). StreamingResponse + yield-before-read deadlocks
-                    # under uvicorn even with a background pump task.
-                    try:
-                        token_ids = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                lambda: list(
-                                    iter_pipe_tokens(
-                                        r_pipe,
-                                        gen_len,
-                                        stop_ids,
-                                        bus=bus,
-                                        wall_timeout=wall_timeout_sec,
-                                    )
-                                ),
+                # Collect daemon tokens before yielding SSE (same pattern as
+                # non-stream). StreamingResponse + yield-before-read deadlocks
+                # under uvicorn even with a background pump task.
+                try:
+                    token_ids = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: list(
+                                iter_pipe_tokens(
+                                    r_pipe,
+                                    gen_len,
+                                    stop_ids,
+                                    bus=bus,
+                                    wall_timeout=wall_timeout_sec,
+                                )
                             ),
-                            timeout=wall_timeout_sec,
-                        )
-                    except asyncio.TimeoutError:
-                        print(
-                            f"  [handler] pipe read timed out after "
-                            f"{wall_timeout_sec:.0f}s (chat-stream)",
-                            flush=True,
-                        )
-                        await _complete_request(success=False)
-                        err = {
-                            "error": {
-                                "message": "Inference engine timed out",
-                                "type": "server_error",
-                                "code": "engine_timeout",
-                            }
+                        ),
+                        timeout=wall_timeout_sec,
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"  [handler] pipe read timed out after "
+                        f"{wall_timeout_sec:.0f}s (chat-stream)",
+                        flush=True,
+                    )
+                    await _complete_request(success=False)
+                    err = {
+                        "error": {
+                            "message": "Inference engine timed out",
+                            "type": "server_error",
+                            "code": "engine_timeout",
                         }
-                        yield f"data: {json.dumps(err)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+                    }
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
-                    yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
-                    role_sent = True
+                yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
+                role_sent = True
 
-                    try:
-                        for tok_id in token_ids:
-                            if loop.time() >= deadline:
-                                print(
-                                    f"  [handler] request wall timeout after "
-                                    f"{wall_timeout_sec:.0f}s (chat-stream)",
-                                    flush=True,
-                                )
-                                aborted = True
+                try:
+                    for tok_id in token_ids:
+                        if loop.time() >= deadline:
+                            print(
+                                f"  [handler] request wall timeout after "
+                                f"{wall_timeout_sec:.0f}s (chat-stream)",
+                                flush=True,
+                            )
+                            aborted = True
+                            break
+                        if await request.is_disconnected():
+                            print(
+                                "  [handler] client disconnected — aborting stream",
+                                flush=True,
+                            )
+                            aborted = True
+                            break
+
+                        completion_tokens += 1
+                        piece = tokenizer.decode([tok_id])
+                        window += piece
+
+                        if stops and mode != "tool_buffer":
+                            si = first_stop_match(window, stops)
+                            if si != -1:
+                                window = window[:si]
+                                stop_hit = True
+                                kind = "reasoning_content" if mode == "reasoning" else "content"
+                                out = emit_delta(window, kind)
+                                if out:
+                                    yield out
+                                window = ""
                                 break
-                            if await request.is_disconnected():
-                                print(
-                                    "  [handler] client disconnected — aborting stream",
-                                    flush=True,
-                                )
-                                aborted = True
+
+                        while True:
+                            if mode == "tool_buffer":
+                                tool_buffer += window
+                                window = ""
                                 break
 
-                            completion_tokens += 1
-                            piece = tokenizer.decode([tok_id])
-                            window += piece
-
-                            if stops and mode != "tool_buffer":
-                                si = first_stop_match(window, stops)
-                                if si != -1:
-                                    window = window[:si]
-                                    stop_hit = True
-                                    kind = "reasoning_content" if mode == "reasoning" else "content"
-                                    out = emit_delta(window, kind)
-                                    if out:
-                                        yield out
-                                    window = ""
-                                    break
-
-                            while True:
-                                if mode == "tool_buffer":
-                                    tool_buffer += window
-                                    window = ""
-                                    break
-
-                                if mode == "reasoning":
-                                    idx = window.find(THINK_CLOSE_TAG)
-                                    if idx != -1:
-                                        pre = window[:idx]
-                                        out = emit_delta(pre, "reasoning_content")
-                                        if out:
-                                            yield out
-                                        window = window[idx + len(THINK_CLOSE_TAG):]
-                                        mode = "content"
-                                        continue
-                                    if len(window) > HOLDBACK:
-                                        safe = window[:-HOLDBACK]
-                                        out = emit_delta(safe, "reasoning_content")
-                                        if out:
-                                            yield out
-                                        window = window[-HOLDBACK:]
-                                    break
-
-                                think_idx = window.find(THINK_OPEN_TAG)
-                                tool_idx = window.find(TOOL_OPEN_TAG)
-                                hits = [(i, t) for i, t in
-                                        ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
-                                if hits:
-                                    hits.sort()
-                                    idx, which = hits[0]
+                            if mode == "reasoning":
+                                idx = window.find(THINK_CLOSE_TAG)
+                                if idx != -1:
                                     pre = window[:idx]
-                                    out = emit_delta(pre, "content")
+                                    out = emit_delta(pre, "reasoning_content")
                                     if out:
                                         yield out
-                                    if which == "think":
-                                        window = window[idx + len(THINK_OPEN_TAG):]
-                                        mode = "reasoning"
-                                    else:
-                                        tool_buffer = window[idx:]
-                                        window = ""
-                                        mode = "tool_buffer"
+                                    window = window[idx + len(THINK_CLOSE_TAG):]
+                                    mode = "content"
                                     continue
                                 if len(window) > HOLDBACK:
                                     safe = window[:-HOLDBACK]
-                                    out = emit_delta(safe, "content")
+                                    out = emit_delta(safe, "reasoning_content")
                                     if out:
                                         yield out
                                     window = window[-HOLDBACK:]
                                 break
 
-                        if stop_hit:
-                            finish_reason = "stop"
-                            yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
-                            if include_usage:
-                                usage_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": MODEL_NAME,
-                                    "choices": [],
-                                    "usage": _build_usage(
-                                        prompt_len,
-                                        completion_tokens,
-                                        conv_prefix_len=conv_prefix_len,
-                                    ),
-                                }
-                                yield f"data: {json.dumps(usage_chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            await _complete_request(success=not aborted)
-                            return
-
-                        if mode == "reasoning" and window:
-                            out = emit_delta(window, "reasoning_content")
-                            if out:
-                                yield out
-                        elif mode == "content" and window:
-                            out = emit_delta(window, "content")
-                            if out:
-                                yield out
-                        elif mode == "tool_buffer":
-                            tool_buffer += window
-                        window = ""
-
-                        finish_reason = "stop"
-                        if mode == "tool_buffer":
-                            cleaned_after, tool_calls = parse_tool_calls(
-                                tool_buffer, tools=req.tools)
-                            if tool_calls:
-                                if cleaned_after:
-                                    out = emit_delta(cleaned_after, "content")
-                                    if out:
-                                        yield out
-                                tc_delta_list = [{
-                                    "index": i,
-                                    "id": tc["id"],
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc["function"]["name"],
-                                        "arguments": tc["function"]["arguments"],
-                                    },
-                                } for i, tc in enumerate(tool_calls)]
-                                yield f"data: {json.dumps(chunk({'tool_calls': tc_delta_list}))}\n\n"
-                                finish_reason = "tool_calls"
-                            else:
-                                out = emit_delta(tool_buffer, "content")
+                            think_idx = window.find(THINK_OPEN_TAG)
+                            tool_idx = window.find(TOOL_OPEN_TAG)
+                            hits = [(i, t) for i, t in
+                                    ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                            if hits:
+                                hits.sort()
+                                idx, which = hits[0]
+                                pre = window[:idx]
+                                out = emit_delta(pre, "content")
                                 if out:
                                     yield out
+                                if which == "think":
+                                    window = window[idx + len(THINK_OPEN_TAG):]
+                                    mode = "reasoning"
+                                else:
+                                    tool_buffer = window[idx:]
+                                    window = ""
+                                    mode = "tool_buffer"
+                                continue
+                            if len(window) > HOLDBACK:
+                                safe = window[:-HOLDBACK]
+                                out = emit_delta(safe, "content")
+                                if out:
+                                    yield out
+                                window = window[-HOLDBACK:]
+                            break
 
-                        await _complete_request(success=not aborted)
-                        if aborted:
-                            return
-
-                        if not role_sent:
-                            yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
+                    if stop_hit:
+                        finish_reason = "stop"
                         yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                         if include_usage:
                             usage_chunk = {
@@ -1656,32 +1611,88 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             }
                             yield f"data: {json.dumps(usage_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
-                    except asyncio.CancelledError:
-                        print(
-                            "  [handler] stream task cancelled — cleaning up",
-                            flush=True,
-                        )
-                        await _complete_request(success=False)
-                        raise
-                    except Exception:
-                        await _complete_request(success=False)
-                        raise
-                    finally:
-                        if full_hit is None:
-                            try:
-                                prompt_bin.unlink()
-                            except Exception:
-                                pass
-            except DaemonBusyError:
-                err = {
-                    "error": {
-                        "message": "Inference engine busy",
-                        "type": "server_error",
-                        "code": "engine_busy",
-                    }
-                }
-                yield f"data: {json.dumps(err)}\n\n"
-                yield "data: [DONE]\n\n"
+                        await _complete_request(success=not aborted)
+                        return
+
+                    if mode == "reasoning" and window:
+                        out = emit_delta(window, "reasoning_content")
+                        if out:
+                            yield out
+                    elif mode == "content" and window:
+                        out = emit_delta(window, "content")
+                        if out:
+                            yield out
+                    elif mode == "tool_buffer":
+                        tool_buffer += window
+                    window = ""
+
+                    finish_reason = "stop"
+                    if mode == "tool_buffer":
+                        cleaned_after, tool_calls = parse_tool_calls(
+                            tool_buffer, tools=req.tools)
+                        if tool_calls:
+                            if cleaned_after:
+                                out = emit_delta(cleaned_after, "content")
+                                if out:
+                                    yield out
+                            tc_delta_list = [{
+                                "index": i,
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["function"]["name"],
+                                    "arguments": tc["function"]["arguments"],
+                                },
+                            } for i, tc in enumerate(tool_calls)]
+                            yield f"data: {json.dumps(chunk({'tool_calls': tc_delta_list}))}\n\n"
+                            finish_reason = "tool_calls"
+                        else:
+                            out = emit_delta(tool_buffer, "content")
+                            if out:
+                                yield out
+
+                    await _complete_request(success=not aborted)
+                    if aborted:
+                        return
+
+                    if not role_sent:
+                        yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
+                    yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
+                    if include_usage:
+                        usage_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_NAME,
+                            "choices": [],
+                            "usage": _build_usage(
+                                prompt_len,
+                                completion_tokens,
+                                conv_prefix_len=conv_prefix_len,
+                            ),
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except asyncio.CancelledError:
+                    print(
+                        "  [handler] stream task cancelled — cleaning up",
+                        flush=True,
+                    )
+                    await _complete_request(success=False)
+                    raise
+                except Exception:
+                    await _complete_request(success=False)
+                    raise
+                finally:
+                    if full_hit is None:
+                        try:
+                            prompt_bin.unlink()
+                        except Exception:
+                            pass
+            finally:
+                if lock_held:
+                    daemon_lock.release()
+                    lock_held = False
 
         return StreamingResponse(sse(), media_type="text/event-stream")
 
