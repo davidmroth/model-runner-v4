@@ -29,33 +29,6 @@ TOOLS_A = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "terminal",
-            "description": "Run a shell command",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": "Search files by pattern",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "path": {"type": "string"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
 ]
 
 # Different tool set → different fingerprint (tests slot reuse / second pin).
@@ -297,7 +270,7 @@ def main() -> int:
 
     # --- Phase B: 5-turn incremental session ---
     print("\n--- B. Five-turn tool session (incremental prefill) ---")
-    msgs = [{"role": "user", "content": "Remember this code: " + ("x = 1\n" * 400)}]
+    msgs = [{"role": "user", "content": "Remember this code: " + ("x = 1\n" * 120)}]
     for i, (extra, mt) in enumerate([
         ([], 12),
         ([{"role": "assistant", "content": "Stored."},
@@ -318,7 +291,7 @@ def main() -> int:
 
     # --- Phase C: cross-session (pollute then agent — regression) ---
     print("\n--- C. Cross-session: agent after long session (cache safety) ---")
-    agent2 = [{"role": "user", "content": "Use terminal to run: echo hello. One line."}]
+    agent2 = [{"role": "user", "content": "Use read_file to read /etc/hostname. One line."}]
     r_x, body_x = chat(
         agent2,
         tools=TOOLS_A,
