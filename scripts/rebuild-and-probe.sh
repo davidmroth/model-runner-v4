@@ -34,19 +34,21 @@ echo "Binary before: $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
 echo ""
 echo "=== Step 3: Build inside Docker builder container ==="
 echo "Image: $BUILDER_IMAGE"
-echo "(Installing ninja-build, deleting stale object to force recompile, then building...)"
+echo "(Installing cmake+ninja-build, deleting stale object to force recompile, then building...)"
+# Mount source at /src (writable so cmake can regenerate build.ninja at /src/server/build-mmproj).
+# The build dir is inside /src/server/build-mmproj — same path as baked into the existing build.ninja.
 docker run --rm --gpus all \
-    -v "$SRC":/src:ro \
-    -v "$BUILD":/build \
+    -v "$SRC":/src \
     "$BUILDER_IMAGE" \
     bash -c "
         set -e
-        apt-get update -qq && apt-get install -y -q ninja-build 2>&1 | grep -E 'ninja|Setting up|error' || true
-        echo 'ninja version:' && ninja --version
-        OBJ=/build/CMakeFiles/dflash_common.dir/src/common/dflash_spec_decode.cpp.o
-        echo \"Removing stale object to force recompile: \$OBJ\"
+        apt-get update -qq && apt-get install -y -q cmake ninja-build 2>&1 | grep -E 'cmake|ninja|Setting up|error' || true
+        echo 'cmake:' && cmake --version | head -1
+        echo 'ninja:' && ninja --version
+        OBJ=/src/server/build-mmproj/CMakeFiles/dflash_common.dir/src/common/dflash_spec_decode.cpp.o
+        echo \"Removing stale object: \$OBJ\"
         rm -f \"\$OBJ\"
-        ninja -C /build test_dflash
+        ninja -C /src/server/build-mmproj test_dflash
     "
 echo "Binary after:  $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
 
