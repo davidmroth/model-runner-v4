@@ -74,9 +74,11 @@ class DaemonStdoutBus:
     """
 
     # Prefixes that are too spammy to print in normal operation.
+    # NOTE: "[timing]" and "  " (two-space timing lines) are temporarily un-suppressed
+    # to verify timing output is emitted. Re-suppress after validation.
     _SUPPRESS_PREFIXES = (
-        "[step ", "[timing]", "[dflash]", "[prompt]",
-        "[prefill]", "[migrate]", "[dbg ", "  ",
+        "[step ", "[dflash]", "[prompt]",
+        "[prefill]", "[migrate]", "[dbg ",
     )
 
     _PREFILL_TIMING_RE = re.compile(
