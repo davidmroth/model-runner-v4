@@ -728,7 +728,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     )
                 ),
             )
-            await bus.drain_timings(timeout=120.0)
+            # The deferred conv snap only needs the inline snap ack; skip
+            # drain_timings entirely.  The target-split RESTORE_CHAIN timing
+            # format does not populate prefill_ms / decode_ms so drain_timings
+            # would spin for its full 120 s timeout on every deferred run.
             await bus.drain_inline_snap(timeout=30.0)
             if bus.inline_snap_slot() != conv_slot:
                 raise RuntimeError(
