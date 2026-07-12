@@ -84,6 +84,8 @@ class PriorityDaemonLock:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[None] = loop.create_future()
         (self._high if scoped else self._low).append(fut)
+        if scoped:
+            self._drain_low_waiters()
         try:
             if max_wait == float("inf"):
                 await fut
@@ -104,6 +106,26 @@ class PriorityDaemonLock:
             pass
         if not fut.done():
             fut.cancel()
+
+    def _drain_low_waiters(self) -> None:
+        """Cancel all queued ephemeral waiters when a scoped request enqueues.
+
+        Prevents a pipeline of ephemeral requests already waiting in ``_low``
+        from running ahead of the newly-arrived scoped request.  The current
+        lock *holder* (if any) is not affected — only queued-but-not-running
+        ephemerals are cancelled.
+        """
+        drained = 0
+        while self._low:
+            fut = self._low.popleft()
+            if not fut.done():
+                fut.cancel()
+                drained += 1
+        if drained:
+            print(
+                f"  [lock] drained {drained} ephemeral waiter(s) — scoped enqueued",
+                flush=True,
+            )
 
     def release(self) -> None:
         if not self._held:
@@ -154,12 +176,17 @@ def is_ephemeral_cache_scope(cache_scope: str) -> bool:
 
 
 def scoped_lock_wait_cap_seconds() -> float:
-    """Cap lock wait for scoped (conversation-id) chat when global wait is unbounded."""
-    raw = os.environ.get("DFLASH_SCOPED_LOCK_WAIT_SEC", "60")
+    """Cap lock wait for scoped (conversation-id) chat when global wait is unbounded.
+
+    Default 180s: cold prefill of 20K+ tokens takes ~90s without PFlash, so
+    the cap must exceed the longest expected inference to avoid a scoped request
+    timing out before it can acquire the lock.
+    """
+    raw = os.environ.get("DFLASH_SCOPED_LOCK_WAIT_SEC", "180")
     try:
         return max(5.0, float(raw))
     except ValueError:
-        return 60.0
+        return 180.0
 
 
 def ephemeral_lock_wait_seconds() -> float:
