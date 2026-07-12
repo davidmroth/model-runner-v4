@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # rebuild-and-probe.sh — Rebuild test_dflash with timing instrumentation and run the timing probe.
-# Run ON ai.local as david:
+#
+# The binary is compiled inside a Docker build container (nvidia/cuda devel image)
+# because ninja/cmake are not installed on the host — they live in the builder
+# stage of the Dockerfile.
+#
+# Run ON ai.local (any user with docker access):
 #   bash /media/data/projects/model-runner-v4/scripts/rebuild-and-probe.sh
 set -e
 
@@ -8,23 +13,11 @@ SRC=/media/data/projects/lucebox-hub-src
 BUILD=$SRC/server/build-mmproj
 MODEL_RUNNER=/media/data/projects/model-runner-v4
 
-echo "=== Step 1: Find build tool ==="
-NINJA_BIN=""
-for candidate in ninja ninja-build /usr/bin/ninja /usr/local/bin/ninja ~/.local/bin/ninja; do
-    if command -v "$candidate" &>/dev/null; then
-        NINJA_BIN=$(command -v "$candidate")
-        break
-    fi
-done
-if [ -z "$NINJA_BIN" ]; then
-    echo "ERROR: ninja not found. Install with: sudo apt-get install ninja-build"
-    echo "Or activate your build venv if you have one."
-    exit 1
-fi
-echo "ninja: $NINJA_BIN"
+# Builder image: matches the FROM in lucebox-hub-src/Dockerfile builder stage.
+# Must have cmake + ninja-build available via apt (it's the -devel image).
+BUILDER_IMAGE="nvidia/cuda:12.8.1-devel-ubuntu22.04"
 
-echo ""
-echo "=== Step 2: Verify source has timing instrumentation ==="
+echo "=== Step 1: Verify source has timing instrumentation ==="
 if ! grep -q "\[timing\] per-step averages" "$SRC/server/src/common/dflash_spec_decode.cpp"; then
     echo "ERROR: timing printf not found in dflash_spec_decode.cpp"
     echo "Source may not have been patched. Check the file manually."
@@ -33,19 +26,30 @@ fi
 echo "OK: timing printf found in source"
 
 echo ""
-echo "=== Step 3: Force-touch source to ensure cmake detects change ==="
+echo "=== Step 2: Force-touch source to ensure ninja detects change ==="
 touch "$SRC/server/src/common/dflash_spec_decode.cpp"
 echo "Source mtime: $(stat -c '%y' "$SRC/server/src/common/dflash_spec_decode.cpp")"
 echo "Object mtime: $(stat -c '%y' "$BUILD/CMakeFiles/dflash_common.dir/src/common/dflash_spec_decode.cpp.o" 2>/dev/null || echo 'not found')"
-echo "Binary before: $(stat -c '%y' "$BUILD/test_dflash")"
+echo "Binary before: $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
 
 echo ""
-echo "=== Step 4: Build ==="
-"$NINJA_BIN" -C "$BUILD" test_dflash
-echo "Binary after:  $(stat -c '%y' "$BUILD/test_dflash")"
+echo "=== Step 3: Build inside Docker builder container ==="
+echo "Image: $BUILDER_IMAGE"
+echo "(Installing ninja-build via apt, then running ninja on the existing build dir...)"
+docker run --rm --gpus all \
+    -v "$SRC":/src:ro \
+    -v "$BUILD":/build \
+    "$BUILDER_IMAGE" \
+    bash -c "
+        set -e
+        apt-get update -qq && apt-get install -y -q ninja-build 2>&1 | grep -E 'ninja|Setting up|error' || true
+        ninja --version
+        ninja -C /build test_dflash
+    "
+echo "Binary after:  $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
 
 echo ""
-echo "=== Step 5: Verify binary has timing strings ==="
+echo "=== Step 4: Verify binary has timing strings ==="
 if strings "$BUILD/test_dflash" | grep -q "per-step averages"; then
     echo "OK: [timing] per-step averages found in binary"
 else
@@ -54,7 +58,7 @@ else
 fi
 
 echo ""
-echo "=== Step 6: Redeploy lucebox ==="
+echo "=== Step 5: Redeploy lucebox ==="
 cd "$MODEL_RUNNER"
 docker compose --profile serve up -d --force-recreate lucebox
 echo "Waiting for lucebox to be healthy..."
@@ -62,7 +66,7 @@ timeout 120 bash -c "until docker exec model-runner-v4-lucebox curl -sf http://1
 echo "Lucebox is healthy"
 
 echo ""
-echo "=== Step 7: Run timing probe ==="
+echo "=== Step 6: Run timing probe ==="
 SYS_PROMPT=$(python3 -c "print('You are a helpful AI assistant with extensive knowledge. ' * 150)")
 PAYLOAD=$(python3 -c "
 import json, sys
