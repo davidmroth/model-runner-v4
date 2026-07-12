@@ -37,6 +37,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import base64
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1265,8 +1267,255 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             return req.max_completion_tokens
         return req.max_tokens
 
+    # ── Native vision helpers ────────────────────────────────────────────────
+
+    def _extract_vision_from_request(
+        req: ChatRequest,
+    ) -> tuple[Path, Path] | None:
+        """Return (img_tmp, text_tmp) if any message has image_url content.
+
+        The text file contains the full conversation rendered via chat template
+        with ``<image>`` markers where images appear (consumed by prefill_multimodal
+        via mtmd).  The image file holds raw JPEG/PNG bytes from the first image.
+        Returns None if the request is text-only.
+        """
+        image_bytes: bytes | None = None
+        msgs_for_template: list[dict] = []
+
+        for m in req.messages:
+            content = m.content
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image_url":
+                        if image_bytes is None:  # first image only for v1
+                            url = (block.get("image_url") or {}).get("url", "")
+                            if url.startswith("data:"):
+                                _header, b64 = url.split(",", 1)
+                                try:
+                                    image_bytes = base64.b64decode(b64)
+                                except Exception:
+                                    image_bytes = b""
+                            else:
+                                try:
+                                    req2 = urllib.request.Request(
+                                        url, headers={"User-Agent": "dflash-vision/1"})
+                                    with urllib.request.urlopen(req2, timeout=15) as r:
+                                        image_bytes = r.read()
+                                except Exception as exc:
+                                    print(f"  [vision] image download failed: {exc!r}",
+                                          flush=True)
+                                    image_bytes = b""
+                        text_parts.append("<image>")  # mtmd default marker
+                    elif isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                msgs_for_template.append({"role": m.role,
+                                           "content": "".join(text_parts)})
+            else:
+                d: dict = {"role": m.role}
+                if content is not None:
+                    d["content"] = content
+                msgs_for_template.append(d)
+
+        if image_bytes is None:
+            return None  # text-only request
+
+        # Write image to tmp
+        fd_img, img_str = tempfile.mkstemp(suffix=".jpg")
+        with os.fdopen(fd_img, "wb") as fh:
+            fh.write(image_bytes)
+        img_path = Path(img_str)
+
+        # Build marked text via chat template (tokenize=False → raw string)
+        kwargs: dict = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        try:
+            marked_text: str = tokenizer.apply_chat_template(
+                msgs_for_template, **kwargs)
+        except Exception as exc:
+            print(f"  [vision] apply_chat_template failed: {exc!r}", flush=True)
+            # Fallback: plain concatenation if template doesn't support it
+            marked_text = "\n".join(
+                f"{m['role']}: {m.get('content', '')}"
+                for m in msgs_for_template
+            )
+
+        fd_txt, txt_str = tempfile.mkstemp(suffix=".txt")
+        with os.fdopen(fd_txt, "w", encoding="utf-8") as fh:
+            fh.write(marked_text)
+
+        return img_path, Path(txt_str)
+
+    async def _handle_vision_request(
+        req: ChatRequest,
+        request: Request,
+        vision: tuple[Path, Path],
+    ) -> JSONResponse | StreamingResponse:
+        """Handle a multimodal request via GENERATE_MULTIMODAL daemon command.
+
+        Vision turns bypass the prefix cache and tool-split logic entirely (v1).
+        KV caching of previous text context is not preserved across image turns.
+        """
+        img_path, text_path = vision
+        gen_len = _max_gen_tokens(req)
+        completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        cmd_line = f"GENERATE_MULTIMODAL {img_path} {text_path} {gen_len}\n"
+
+        print(f"  [vision] multimodal request img={img_path.name}", flush=True)
+
+        def _cleanup():
+            for p in (img_path, text_path):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        # Ephemeral scope — no conversation caching for vision turns.
+        scoped = False
+        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
+
+        if req.stream:
+            # Streaming vision response (SSE)
+            try:
+                await _acquire_daemon_lock("chat-vision-stream",
+                                           max_wait=lock_wait, scoped=scoped)
+            except DaemonBusyError:
+                _cleanup()
+                return _busy_response(retry_after_sec=lock_wait)
+
+            completion_tokens = 0
+            finish_reason = "stop"
+
+            async def sse_vision() -> AsyncIterator[str]:
+                nonlocal completion_tokens, finish_reason
+                try:
+                    await _restart_daemon_if_dead()
+                    drain_pipe_residual(r_pipe)
+                    bus.begin_request()
+                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                    daemon_proc.stdin.flush()
+
+                    stops = normalize_stop(req.stop)
+                    wall_timeout_sec = request_wall_timeout_seconds()
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + wall_timeout_sec
+
+                    # Yield role delta first
+                    yield "data: " + json.dumps({
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": MODEL_NAME,
+                        "choices": [{"index": 0,
+                                     "delta": {"role": "assistant", "content": ""},
+                                     "finish_reason": None}]
+                    }) + "\n\n"
+
+                    text_buf = ""
+                    while loop.time() < deadline:
+                        tok_id = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: struct.unpack("<i", r_pipe.read(4))[0]
+                            if True else -1
+                        )
+                        if tok_id < 0:
+                            break
+                        piece = tokenizer.decode([tok_id], skip_special_tokens=True)
+                        if piece:
+                            text_buf += piece
+                            # Simple stop check
+                            if any(s in text_buf for s in stops):
+                                finish_reason = "stop"
+                                break
+                            completion_tokens += 1
+                            yield "data: " + json.dumps({
+                                "id": completion_id, "object": "chat.completion.chunk",
+                                "created": created, "model": MODEL_NAME,
+                                "choices": [{"index": 0,
+                                             "delta": {"content": piece},
+                                             "finish_reason": None}]
+                            }) + "\n\n"
+
+                    await bus.drain_timings()
+                    yield "data: " + json.dumps({
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": MODEL_NAME,
+                        "choices": [{"index": 0, "delta": {},
+                                     "finish_reason": finish_reason}],
+                        "usage": {"prompt_tokens": 0,
+                                  "completion_tokens": completion_tokens,
+                                  "total_tokens": completion_tokens}
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    daemon_lock.release()
+                    _cleanup()
+
+            return StreamingResponse(sse_vision(), media_type="text/event-stream")
+
+        # Non-streaming vision response
+        try:
+            await _acquire_daemon_lock("chat-vision", max_wait=lock_wait,
+                                       scoped=scoped)
+        except DaemonBusyError:
+            _cleanup()
+            return _busy_response(retry_after_sec=lock_wait)
+
+        try:
+            await _restart_daemon_if_dead()
+            drain_pipe_residual(r_pipe)
+            bus.begin_request()
+            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+            daemon_proc.stdin.flush()
+
+            ok_line = await bus.await_reply(
+                "ok ", timeout=request_wall_timeout_seconds())
+            await bus.drain_timings()
+            timings = bus.request_timings()
+            gen_tokens = int(timings.get("completion_tokens", 0))
+
+            # Read gen_tokens from stream FD
+            tokens: list[int] = []
+            for _ in range(gen_tokens):
+                chunk = r_pipe.read(4)
+                if len(chunk) < 4:
+                    break
+                tok = struct.unpack("<i", chunk)[0]
+                if tok < 0:
+                    break
+                tokens.append(tok)
+
+            text = tokenizer.decode(tokens, skip_special_tokens=True)
+        finally:
+            daemon_lock.release()
+            _cleanup()
+
+        return JSONResponse({
+            "id": completion_id, "object": "chat.completion",
+            "created": created, "model": MODEL_NAME,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": len(tokens),
+                "total_tokens": len(tokens),
+            },
+        })
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
+        # ── Vision fast-path ────────────────────────────────────────────────
+        # If any message contains image_url content, route to the multimodal
+        # daemon command.  Vision turns are ephemeral (no KV caching v1) so
+        # the rest of the prefix-cache / tool-split logic is skipped entirely.
+        vision = _extract_vision_from_request(req)
+        if vision is not None:
+            return await _handle_vision_request(req, request, vision)
+
         prompt_bin, started_in_thinking = _tokenize_prompt(req)
         prompt_len = prompt_bin.stat().st_size // 4
 

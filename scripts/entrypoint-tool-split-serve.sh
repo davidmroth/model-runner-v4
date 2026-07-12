@@ -87,6 +87,14 @@ if [ -n "${DFLASH_TOOL_SPLIT_PLUGIN_DIR:-}" ]; then
   ARGS+=(--tool-split-plugin-dir "${DFLASH_TOOL_SPLIT_PLUGIN_DIR}")
 fi
 
+# Native mmproj vision — pass the model file and GPU offload preference to
+# test_dflash so Qwen35LayerSplitAdapter loads the vision encoder.
+# DFLASH_MMPROJ is read directly by test_dflash.cpp via std::getenv; no CLI
+# flag is needed here. The env var is already set via docker-compose.yml.
+if [ -n "${DFLASH_MMPROJ:-}" ]; then
+  echo "[tool-split-serve] mmproj: ${DFLASH_MMPROJ} (gpu_offload=$([ "${DFLASH_MMPROJ_NO_OFFLOAD:-1}" = "0" ] && echo yes || echo no))"
+fi
+
 export PYTHONPATH="${PATCH_SCRIPTS}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # server_tools.py speaks the legacy inline daemon protocol (SNAPSHOT_THIN with
