@@ -77,7 +77,7 @@ python3 -m py_compile lucebox-patch/dflash/scripts/server_tools.py
 git add lucebox-patch/ && git commit -m "…" && git push origin feat/vision
 
 # ai.local
-ssh david@ai.local
+ssh bot@ai.local
 cd /media/data/projects/model-runner-v4
 git pull origin feat/vision
 docker compose up -d --force-recreate lucebox
@@ -116,7 +116,7 @@ ssh david@192.168.87.153 \
   "cd /media/data/projects/model-runner-v4 && sed -i 's/^DFLASH_DDTREE_BUDGET=.*/DFLASH_DDTREE_BUDGET=22/' .env"
 
 # compose/entrypoint edits: commit + push locally, then on ai.local:
-ssh david@ai.local
+ssh bot@ai.local
 cd /media/data/projects/model-runner-v4
 git pull
 # edit .env on host if needed (not in git)
@@ -145,7 +145,7 @@ Benchmark scripts live in the pulled repo under `scripts/` — mount from the
 host checkout (no `scp`):
 
 ```bash
-ssh david@ai.local
+ssh bot@ai.local
 cd /media/data/projects/model-runner-v4
 git pull   # ensures scripts/decode_bench.py is current
 docker run --rm --network ai-inference \

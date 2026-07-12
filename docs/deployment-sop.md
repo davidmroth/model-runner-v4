@@ -56,7 +56,7 @@ git push origin <branch>
 ### 2. `ai.local` — pull and recreate
 
 ```bash
-ssh david@ai.local
+ssh bot@ai.local
 
 # model-runner-v4 (Python patch, compose, entrypoints, scripts)
 cd /media/data/projects/model-runner-v4
@@ -135,7 +135,7 @@ tracked files.
 Runtime tuning stays in host `.env` files:
 
 ```bash
-ssh david@ai.local
+ssh bot@ai.local
 cd /media/data/projects/model-runner-v4
 # edit .env (e.g. DFLASH_DRAFT_FEATURE_MIRROR=1)
 docker compose up -d --force-recreate lucebox
@@ -161,7 +161,7 @@ Python-only `model-runner-v4` changes need **pull + recreate only**.
 ## Rollback
 
 ```bash
-ssh david@ai.local
+ssh bot@ai.local
 cd /media/data/projects/model-runner-v4
 git log -5 --oneline
 git checkout <previous-sha>
@@ -176,7 +176,7 @@ hub SHA changed.
 ## For AI coding assistants
 
 1. **Make all code edits in the local git checkout** (dev machine workspace).
-2. **Do not `scp`** to `david@ai.local` — ever.
+2. **Do not `scp`** to `bot@ai.local` — ever.
 3. After changes, tell the user to **commit, push, and pull on ai.local**, or
    run the pull/recreate steps via SSH only after the push exists on remote.
 4. Host `.env` edits are OK via SSH when tuning runtime knobs the user
