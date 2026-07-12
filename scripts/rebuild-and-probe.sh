@@ -26,8 +26,7 @@ fi
 echo "OK: timing printf found in source"
 
 echo ""
-echo "=== Step 2: Force-touch source to ensure ninja detects change ==="
-touch "$SRC/server/src/common/dflash_spec_decode.cpp"
+echo "=== Step 2: Stale object will be removed inside the build container ==="
 echo "Source mtime: $(stat -c '%y' "$SRC/server/src/common/dflash_spec_decode.cpp")"
 echo "Object mtime: $(stat -c '%y' "$BUILD/CMakeFiles/dflash_common.dir/src/common/dflash_spec_decode.cpp.o" 2>/dev/null || echo 'not found')"
 echo "Binary before: $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
@@ -35,7 +34,7 @@ echo "Binary before: $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
 echo ""
 echo "=== Step 3: Build inside Docker builder container ==="
 echo "Image: $BUILDER_IMAGE"
-echo "(Installing ninja-build via apt, then running ninja on the existing build dir...)"
+echo "(Installing ninja-build, deleting stale object to force recompile, then building...)"
 docker run --rm --gpus all \
     -v "$SRC":/src:ro \
     -v "$BUILD":/build \
@@ -43,7 +42,10 @@ docker run --rm --gpus all \
     bash -c "
         set -e
         apt-get update -qq && apt-get install -y -q ninja-build 2>&1 | grep -E 'ninja|Setting up|error' || true
-        ninja --version
+        echo 'ninja version:' && ninja --version
+        OBJ=/build/CMakeFiles/dflash_common.dir/src/common/dflash_spec_decode.cpp.o
+        echo \"Removing stale object to force recompile: \$OBJ\"
+        rm -f \"\$OBJ\"
         ninja -C /build test_dflash
     "
 echo "Binary after:  $(stat -c '%y %s bytes' "$BUILD/test_dflash")"
