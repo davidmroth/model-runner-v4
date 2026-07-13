@@ -225,23 +225,24 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
         )
 
     @patch("prefix_cache.find_all_boundaries_markers")
-    def test_deferred_conv_snap_skipped_when_tail_too_large(self, mock_bounds):
+    def test_deferred_conv_snap_clamps_when_tail_too_large(self, mock_bounds):
         pc = self._make_cache()
         ids = list(range(400))
         mock_bounds.return_value = [50, 376, 390]
         scope = "sess-a"
         tool_snap = (4, 376)
 
-        self.assertIsNone(
-            deferred_conv_snap_after_cold_tool(
-                prefix_cache=pc,
-                prompt_ids=ids,
-                scope=scope,
-                snap_prep=None,
-                tool_snap_prep=tool_snap,
-                max_tail=10,
-            )
+        # Deepest post-tool cut (390) exceeds max_tail=10 → clamp to tool+max.
+        prep = deferred_conv_snap_after_cold_tool(
+            prefix_cache=pc,
+            prompt_ids=ids,
+            scope=scope,
+            snap_prep=None,
+            tool_snap_prep=tool_snap,
+            max_tail=10,
         )
+        self.assertEqual(prep, (0, 386))
+
         prep = deferred_conv_snap_after_cold_tool(
             prefix_cache=pc,
             prompt_ids=ids,

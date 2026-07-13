@@ -72,6 +72,13 @@ from tool_split.daemon_bridge import (
 )
 from tool_split.orchestrator import ToolSplitOrchestrator, _ids_to_bin
 from tool_split.registry import resolve_adapter as resolve_tool_split_adapter
+from tool_split.tools_snapshot import (
+    default_tools_snapshot_path,
+    load_tools_snapshot,
+    save_tools_snapshot,
+    tool_pin_protect_enabled,
+    tool_warmup_enabled,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -696,58 +703,67 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         if not tail_ids:
             prefix_cache.abort_inline_snap(conv_slot, scope=job.cache_scope)
             return
-        tail_bin = _ids_to_bin(tail_ids)
         print(
             f"  [pc] deferred conv snap after cold tool pin "
             f"thick_slot={conv_slot} cut={conv_cut} thin={tool_slot} "
             f"tail_len={len(tail_ids)}",
             flush=True,
         )
-        # Daemon rejects gen_len=0 on RESTORE_CHAIN; use 1 token (discarded).
-        line = append_inline_snap(
-            f"RESTORE_CHAIN -1 {tool_slot} {tail_bin} 1",
-            (conv_slot, conv_cut),
-        ) + "\n"
-        drain_pipe_residual(r_pipe)
-        bus.begin_request()
-        daemon_proc.stdin.write(line.encode("utf-8"))
-        daemon_proc.stdin.flush()
-        try:
-            await asyncio.to_thread(
-                lambda: list(
-                    iter_pipe_tokens(
-                        r_pipe,
-                        1,
-                        stop_ids,
-                        bus=bus,
-                        wall_timeout=120.0,
-                    )
-                ),
-            )
-            # The deferred conv snap only needs the inline snap ack; skip
-            # drain_timings entirely.  The target-split RESTORE_CHAIN timing
-            # format does not populate prefill_ms / decode_ms so drain_timings
-            # would spin for its full 120 s timeout on every deferred run.
-            await bus.drain_inline_snap(timeout=30.0)
-            if bus.inline_snap_slot() != conv_slot:
-                raise RuntimeError(
-                    f"inline snap ack slot={bus.inline_snap_slot()!r} "
-                    f"expected={conv_slot}"
-                )
-            prefix_cache.finish_inline_snap(
+
+        async def _once() -> None:
+            tail_bin = _ids_to_bin(tail_ids)
+            # Daemon rejects gen_len=0 on RESTORE_CHAIN; use 1 token (discarded).
+            line = append_inline_snap(
+                f"RESTORE_CHAIN -1 {tool_slot} {tail_bin} 1",
                 (conv_slot, conv_cut),
-                job.prompt_ids,
-                inline_slot=bus.inline_snap_slot(),
-                scope=job.cache_scope,
-            )
-        except Exception as exc:
-            print(f"  [pc] deferred conv snap failed: {exc}", flush=True)
-            prefix_cache.abort_inline_snap(conv_slot, scope=job.cache_scope)
-        finally:
+            ) + "\n"
+            drain_pipe_residual(r_pipe)
+            bus.begin_request()
+            daemon_proc.stdin.write(line.encode("utf-8"))
+            daemon_proc.stdin.flush()
             try:
-                tail_bin.unlink()
-            except Exception:
-                pass
+                await asyncio.to_thread(
+                    lambda: list(
+                        iter_pipe_tokens(
+                            r_pipe,
+                            1,
+                            stop_ids,
+                            bus=bus,
+                            wall_timeout=120.0,
+                        )
+                    ),
+                )
+                # The deferred conv snap only needs the inline snap ack; skip
+                # drain_timings entirely.  The target-split RESTORE_CHAIN timing
+                # format does not populate prefill_ms / decode_ms so drain_timings
+                # would spin for its full 120 s timeout on every deferred run.
+                await bus.drain_inline_snap(timeout=30.0)
+                if bus.inline_snap_slot() != conv_slot:
+                    raise RuntimeError(
+                        f"inline snap ack slot={bus.inline_snap_slot()!r} "
+                        f"expected={conv_slot}"
+                    )
+                prefix_cache.finish_inline_snap(
+                    (conv_slot, conv_cut),
+                    job.prompt_ids,
+                    inline_slot=bus.inline_snap_slot(),
+                    scope=job.cache_scope,
+                )
+            finally:
+                try:
+                    tail_bin.unlink()
+                except Exception:
+                    pass
+
+        try:
+            await _once()
+        except Exception as exc:
+            print(f"  [pc] deferred conv snap failed (retrying once): {exc}", flush=True)
+            try:
+                await _once()
+            except Exception as exc2:
+                print(f"  [pc] deferred conv snap failed: {exc2}", flush=True)
+                prefix_cache.abort_inline_snap(conv_slot, scope=job.cache_scope)
 
     async def _run_deferred_conv_snap_background(job: _DeferredConvSnapJob) -> None:
         scoped = not is_ephemeral_cache_scope(job.cache_scope)
@@ -775,6 +791,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             fslot, _ = full_snap_prep
             prefix_cache.abort_full_snap(fslot)
 
+    def _maybe_persist_tools_snapshot(
+        tool_ctx: ToolRequestContext | None,
+        tools: list | None,
+    ) -> None:
+        if not tool_warmup_enabled() or not tool_split or not tool_ctx:
+            return
+        if not tool_ctx.protect_pin or not tool_ctx.fingerprint or not tools:
+            return
+        if tool_split.tool_slots.pinned_slot(tool_ctx.fingerprint) is None:
+            return
+        tools_payload = [
+            t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in tools
+        ]
+        prefix_len = (
+            tool_ctx.split.tool_prefix_len if tool_ctx.split is not None else None
+        )
+        save_tools_snapshot(
+            tool_ctx.fingerprint,
+            tools_payload,
+            tool_prefix_len=prefix_len,
+        )
+
     async def _finalize_request_snaps(
         *,
         full_snap_prep,
@@ -786,6 +824,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cache_scope: str,
         tool_snap_prep: tuple[int, int] | None = None,
         tool_ctx: ToolRequestContext | None = None,
+        tools: list | None = None,
     ) -> _DeferredConvSnapJob | None:
         if full_snap_prep is not None:
             if success and cur_ids is not None:
@@ -799,13 +838,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         elif snap_prep:
             prefix_cache.abort_inline_snap(snap_prep[0], scope=cache_scope)
         tool_pinned = False
+        protect = bool(tool_ctx and tool_ctx.protect_pin)
         if success and tool_snap_prep and tool_split and tool_ctx and tool_ctx.fingerprint:
             tool_pinned = await finish_tool_inline_snap(
                 orchestrator=tool_split,
                 bus=bus,
                 fingerprint=tool_ctx.fingerprint,
                 tool_snap_prep=tool_snap_prep,
+                protect=protect,
             )
+            if tool_pinned:
+                _maybe_persist_tools_snapshot(tool_ctx, tools)
         if (
             success
             and tool_pinned
@@ -967,7 +1010,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             cmd = append_inline_snap(cmd, snap_prep)
         return cmd + "\n", snap_prep, conv_prefix_len, tool_snap_prep
 
-    async def _commit_tool_snap_if_needed(tool_ctx: ToolRequestContext | None) -> None:
+    async def _commit_tool_snap_if_needed(
+        tool_ctx: ToolRequestContext | None,
+        tools: list | None = None,
+    ) -> None:
         if not tool_split or not tool_ctx or not tool_ctx.pending_tool_snap:
             return
         if not tool_ctx.fingerprint:
@@ -985,7 +1031,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             fingerprint=tool_ctx.fingerprint,
             slot=slot,
             kv_end=kv_end,
+            protect=bool(tool_ctx.protect_pin),
         )
+        _maybe_persist_tools_snapshot(tool_ctx, tools)
 
     async def _restart_daemon_if_dead() -> bool:
         """Respawn test_dflash after crash. Caller must hold ``daemon_lock``."""
@@ -1022,13 +1070,154 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         bus.start(asyncio.get_running_loop())
         await prefix_cache.startup_sync()
         print("  [daemon] restart complete", flush=True)
+        await _run_tool_warmup()
         return True
+
+    async def _run_tool_warmup() -> None:
+        """Prefill + pin the last-seen tools fingerprint before user traffic."""
+        if not tool_warmup_enabled() or tool_split is None:
+            return
+        snap = load_tools_snapshot()
+        if snap is None:
+            print(
+                f"  [tool-split] warmup skip — no snapshot at "
+                f"{default_tools_snapshot_path()}",
+                flush=True,
+            )
+            return
+        if tool_split.tool_slots.pinned_slot(snap.fingerprint) is not None:
+            print(
+                f"  [tool-split] warmup skip — already pinned "
+                f"fp={snap.fingerprint[:12]}…",
+                flush=True,
+            )
+            return
+        messages = [
+            {"role": "system", "content": "Tool KV warmup."},
+            {"role": "user", "content": "ok"},
+        ]
+        try:
+            async with _daemon_request_lock(
+                "tool-warmup",
+                max_wait=request_wall_timeout_seconds(),
+                scoped=True,
+            ):
+                if daemon_proc.poll() is not None:
+                    print("  [tool-split] warmup abort — daemon not running", flush=True)
+                    return
+                ctx = tool_split.prepare_request_context(
+                    tokenizer,
+                    messages,
+                    snap.tools,
+                    protect_pin=True,
+                    allow_evict_protected=True,
+                )
+                if ctx is None or not ctx.fingerprint:
+                    print("  [tool-split] warmup abort — empty context", flush=True)
+                    return
+                if ctx.fingerprint != snap.fingerprint:
+                    print(
+                        f"  [tool-split] warmup fp mismatch saved="
+                        f"{snap.fingerprint[:12]}… now={ctx.fingerprint[:12]}… "
+                        f"— pinning current",
+                        flush=True,
+                    )
+                if ctx.tool_slot_hit is not None:
+                    print(
+                        f"  [tool-split] warmup hit thin slot={ctx.tool_slot_hit} "
+                        f"fp={ctx.fingerprint[:12]}…",
+                        flush=True,
+                    )
+                    return
+                if ctx.pending_tool_snap is None or ctx.split is None:
+                    print("  [tool-split] warmup abort — no pending pin", flush=True)
+                    return
+                slot, kv_end = ctx.pending_tool_snap
+                prefix_ids = list(ctx.split.tool_prefix_ids)
+                if not prefix_ids or kv_end <= 0:
+                    tool_split.tool_slots.release_reservation(ctx.fingerprint, slot)
+                    print("  [tool-split] warmup abort — empty tool prefix", flush=True)
+                    return
+                # Prefill tool prefix only; inline snap when above SNAPSHOT_THIN max.
+                prompt_bin = _ids_to_bin(prefix_ids)
+                tool_snap = tool_snap_prep_from_pending(ctx.pending_tool_snap)
+                try:
+                    print(
+                        f"  [tool-split] warmup cold pin slot={slot} "
+                        f"tool_prefix_len={kv_end} fp={ctx.fingerprint[:12]}…",
+                        flush=True,
+                    )
+                    cmd = f"{prompt_bin} 1"
+                    if tool_snap is not None:
+                        cmd = append_inline_snap(cmd, tool_snap)
+                    cmd += "\n"
+                    drain_pipe_residual(r_pipe)
+                    bus.begin_request()
+                    daemon_proc.stdin.write(cmd.encode("utf-8"))
+                    daemon_proc.stdin.flush()
+                    await asyncio.to_thread(
+                        lambda: list(
+                            iter_pipe_tokens(
+                                r_pipe,
+                                1,
+                                stop_ids,
+                                bus=bus,
+                                wall_timeout=request_wall_timeout_seconds(),
+                            )
+                        ),
+                    )
+                    pinned = False
+                    if tool_snap is not None:
+                        pinned = await finish_tool_inline_snap(
+                            orchestrator=tool_split,
+                            bus=bus,
+                            fingerprint=ctx.fingerprint,
+                            tool_snap_prep=tool_snap,
+                            protect=True,
+                        )
+                    else:
+                        await commit_pending_tool_snap(
+                            orchestrator=tool_split,
+                            daemon_stdin=daemon_proc.stdin,
+                            await_reply=bus.await_reply,
+                            fingerprint=ctx.fingerprint,
+                            slot=slot,
+                            kv_end=kv_end,
+                            protect=True,
+                        )
+                        pinned = (
+                            tool_split.tool_slots.pinned_slot(ctx.fingerprint) is not None
+                        )
+                    if pinned:
+                        save_tools_snapshot(
+                            ctx.fingerprint,
+                            snap.tools,
+                            tool_prefix_len=kv_end,
+                        )
+                        print(
+                            f"  [tool-split] warmup complete slot="
+                            f"{tool_split.tool_slots.pinned_slot(ctx.fingerprint)} "
+                            f"fp={ctx.fingerprint[:12]}…",
+                            flush=True,
+                        )
+                    else:
+                        print("  [tool-split] warmup pin failed", flush=True)
+                finally:
+                    try:
+                        prompt_bin.unlink()
+                    except Exception:
+                        pass
+        except DaemonBusyError:
+            print("  [tool-split] warmup skipped — daemon busy", flush=True)
+        except Exception as exc:
+            print(f"  [tool-split] warmup failed: {exc!r}", flush=True)
 
     @app.on_event("startup")
     async def _startup():
         import asyncio
         bus.start(asyncio.get_running_loop())
         await prefix_cache.startup_sync()
+        await _run_tool_warmup()
 
     @app.get("/health")
     async def health():
@@ -1550,11 +1739,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         request_headers = {k: v for k, v in request.headers.items()}
 
         tool_ctx: ToolRequestContext | None = None
+        conv_id = extract_conversation_id(request_headers)
+        protect_pin = bool(conv_id)
+        allow_evict_protected = (not tool_pin_protect_enabled()) or protect_pin
         if tool_split and req.tools:
             try:
                 tool_ctx = tool_split.prepare_request_context(
                     tokenizer, req.messages, req.tools,
                     chat_template_kwargs=req.chat_template_kwargs,
+                    protect_pin=protect_pin,
+                    allow_evict_protected=allow_evict_protected,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1687,6 +1881,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         cache_scope=cache_scope,
                         tool_snap_prep=tool_snap_prep,
                         tool_ctx=tool_ctx,
+                        tools=req.tools,
                     )
                     raise
                 except Exception:
@@ -1700,6 +1895,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         cache_scope=cache_scope,
                         tool_snap_prep=tool_snap_prep,
                         tool_ctx=tool_ctx,
+                        tools=req.tools,
                     )
                     raise
                 deferred_job = await _finalize_request_snaps(
@@ -1712,8 +1908,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cache_scope=cache_scope,
                     tool_snap_prep=tool_snap_prep,
                     tool_ctx=tool_ctx,
+                    tools=req.tools,
                 )
-                await _commit_tool_snap_if_needed(tool_ctx)
+                await _commit_tool_snap_if_needed(tool_ctx, tools=req.tools)
         except DaemonBusyError:
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
@@ -1858,9 +2055,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cache_scope=cache_scope,
                     tool_snap_prep=tool_snap_prep,
                     tool_ctx=tool_ctx,
+                    tools=req.tools,
                 )
                 if success:
-                    await _commit_tool_snap_if_needed(tool_ctx)
+                    await _commit_tool_snap_if_needed(tool_ctx, tools=req.tools)
                     if deferred_job is not None:
                         pending_deferred_jobs.append(deferred_job)
 

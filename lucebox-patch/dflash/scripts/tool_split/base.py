@@ -62,6 +62,8 @@ class ToolRequestContext:
     fingerprint: str | None = None
     tool_slot_hit: int | None = None
     pending_tool_snap: tuple[int, int] | None = None
+    #: When True, successful pin is marked protected (scoped / warmup).
+    protect_pin: bool = False
 
 
 class ToolSplitAdapter(ABC):

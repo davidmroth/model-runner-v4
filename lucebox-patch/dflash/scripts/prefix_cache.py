@@ -548,6 +548,10 @@ def deferred_conv_snap_after_cold_tool(
     tool pin wins.  A follow-up ``RESTORE_CHAIN -1 <thin> … snap=`` registers
     the conversation thick slot so turn 2+ can use ``thick=0`` instead of
     ``thick=-1`` (full chain prefill).
+
+    When the deepest post-tool boundary exceeds ``max_tail``, clamp to the
+    deepest boundary still within budget (or ``tool_prefix + max_tail``) so a
+    thick snap still lands quickly instead of being skipped entirely.
     """
     if snap_prep is not None or tool_snap_prep is None:
         return None
@@ -559,12 +563,33 @@ def deferred_conv_snap_after_cold_tool(
     if conv_cut is None or conv_cut <= tool_prefix_len:
         return None
     tail_len = conv_cut - tool_prefix_len
-    if max_tail is not None and tail_len > max_tail:
-        print(
-            f"  [pc] skip deferred conv snap tail_len={tail_len} > max={max_tail}",
-            flush=True,
-        )
-        return None
+    if max_tail is not None and max_tail > 0 and tail_len > max_tail:
+        candidates = prefix_cache._all_boundaries(prompt_ids)
+        within = [
+            c for c in candidates
+            if tool_prefix_len < c <= tool_prefix_len + max_tail
+        ]
+        if within:
+            conv_cut = within[-1]
+            print(
+                f"  [pc] deferred conv snap clamp cut={conv_cut} "
+                f"tail_len={conv_cut - tool_prefix_len} max={max_tail}",
+                flush=True,
+            )
+        else:
+            forced = min(len(prompt_ids), tool_prefix_len + max_tail)
+            if forced <= tool_prefix_len:
+                print(
+                    f"  [pc] skip deferred conv snap tail_len={tail_len} > max={max_tail}",
+                    flush=True,
+                )
+                return None
+            conv_cut = forced
+            print(
+                f"  [pc] deferred conv snap clamp cut={conv_cut} "
+                f"tail_len={conv_cut - tool_prefix_len} max={max_tail} (forced)",
+                flush=True,
+            )
     prep = prefix_cache.prepare_inline_snap(prompt_ids, scope=cache_scope)
     if prep is None:
         return None

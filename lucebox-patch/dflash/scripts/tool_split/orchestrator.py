@@ -89,6 +89,9 @@ class ToolSlotCache:
     Eviction is deferred from ``reserve()`` to ``confirm()`` so a failed
     ``SNAPSHOT_THIN`` can call ``release_reservation()`` without losing the
     previous anchor (same pattern as ``PrefixCache.prepare_inline_snap``).
+
+    Fingerprints confirmed with ``protect=True`` (scoped / warmup pins) are not
+    evicted by ``allow_evict_protected=False`` reserves (ephemeral probes).
     """
 
     def __init__(self, *, pinned_slots: int, slot_base: int = 0):
@@ -97,6 +100,7 @@ class ToolSlotCache:
         self._confirmed: OrderedDict[str, int] = OrderedDict()
         self._pending: dict[str, int] = {}
         self._pending_evict: tuple[str, int] | None = None
+        self._protected: set[str] = set()
 
     def lookup(self, fingerprint: str) -> int | None:
         if fingerprint in self._pending:
@@ -110,7 +114,22 @@ class ToolSlotCache:
             return self._confirmed[fingerprint]
         return None
 
-    def reserve(self, fingerprint: str) -> int:
+    def is_protected(self, fingerprint: str) -> bool:
+        return fingerprint in self._protected
+
+    def _lru_evict_candidate(self, *, allow_evict_protected: bool) -> tuple[str, int] | None:
+        for old_fp, slot in self._confirmed.items():
+            if allow_evict_protected or old_fp not in self._protected:
+                return old_fp, slot
+        return None
+
+    def reserve(
+        self,
+        fingerprint: str,
+        *,
+        allow_evict_protected: bool = True,
+    ) -> int | None:
+        """Reserve a thin slot. Returns ``None`` when eviction would hit only protected pins."""
         if self.pinned_slots <= 0:
             raise ValueError("ToolSlotCache.reserve requires pinned_slots > 0")
         if fingerprint in self._confirmed:
@@ -119,8 +138,12 @@ class ToolSlotCache:
         if fingerprint in self._pending:
             return self._pending[fingerprint]
         if len(self._confirmed) >= self.pinned_slots:
-            # Peek LRU without evicting — eviction happens in confirm().
-            old_fp, slot = next(iter(self._confirmed.items()))
+            cand = self._lru_evict_candidate(
+                allow_evict_protected=allow_evict_protected,
+            )
+            if cand is None:
+                return None
+            old_fp, slot = cand
             self._pending_evict = (old_fp, slot)
         else:
             used = set(self._confirmed.values()) | set(self._pending.values())
@@ -132,14 +155,17 @@ class ToolSlotCache:
         self._pending[fingerprint] = slot
         return slot
 
-    def confirm(self, fingerprint: str, slot: int) -> None:
+    def confirm(self, fingerprint: str, slot: int, *, protect: bool = False) -> None:
         if self._pending_evict is not None:
             evict_fp, _ = self._pending_evict
             self._confirmed.pop(evict_fp, None)
+            self._protected.discard(evict_fp)
             self._pending_evict = None
         self._pending.pop(fingerprint, None)
         self._confirmed[fingerprint] = slot
         self._confirmed.move_to_end(fingerprint)
+        if protect:
+            self._protected.add(fingerprint)
 
     def release_reservation(self, fingerprint: str, slot: int) -> None:
         """Drop a fingerprint reserved before SNAPSHOT_THIN succeeded."""
@@ -152,6 +178,7 @@ class ToolSlotCache:
         self._confirmed.clear()
         self._pending.clear()
         self._pending_evict = None
+        self._protected.clear()
 
 
 class ToolSplitOrchestrator:
@@ -216,6 +243,8 @@ class ToolSplitOrchestrator:
         tools: Sequence[Any] | None,
         *,
         chat_template_kwargs: Mapping[str, Any] | None = None,
+        protect_pin: bool = False,
+        allow_evict_protected: bool = True,
     ) -> ToolRequestContext | None:
         if not self.active_for_request(tools):
             return None
@@ -230,14 +259,25 @@ class ToolSplitOrchestrator:
         tool_slot_hit = self.tool_slots.lookup(fp)
         pending: tuple[int, int] | None = None
         if tool_slot_hit is None and self.config.pinned_tool_slots > 0:
-            slot = self.tool_slots.reserve(fp)
-            pending = (slot, split.tool_prefix_len)
+            slot = self.tool_slots.reserve(
+                fp, allow_evict_protected=allow_evict_protected,
+            )
+            if slot is None:
+                print(
+                    f"  [tool-split] skip tool pin reserve fp={fp[:12]}… "
+                    f"(protected slots full; allow_evict_protected="
+                    f"{allow_evict_protected})",
+                    flush=True,
+                )
+            else:
+                pending = (slot, split.tool_prefix_len)
 
         return ToolRequestContext(
             split=split,
             fingerprint=fp,
             tool_slot_hit=tool_slot_hit,
             pending_tool_snap=pending,
+            protect_pin=protect_pin,
         )
 
     def build_plan(

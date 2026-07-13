@@ -42,6 +42,7 @@ async def finish_tool_inline_snap(
     bus: Any,
     fingerprint: str,
     tool_snap_prep: tuple[int, int] | None,
+    protect: bool = False,
 ) -> bool:
     """Confirm tool pin when inline ``snap=`` registered a thin slot in the daemon."""
     if tool_snap_prep is None or not fingerprint:
@@ -49,10 +50,11 @@ async def finish_tool_inline_snap(
     slot, kv_end = tool_snap_prep
     await bus.drain_inline_snap()
     if bus.inline_snap_slot() == slot:
-        orchestrator.tool_slots.confirm(fingerprint, slot)
+        orchestrator.tool_slots.confirm(fingerprint, slot, protect=protect)
         print(
             f"[tool-split] tool KV pinned slot={slot} len={kv_end} "
-            f"fp={fingerprint[:12]}… (inline thin)",
+            f"fp={fingerprint[:12]}… (inline thin"
+            f"{', protected' if protect else ''})",
             flush=True,
         )
         return True
@@ -61,6 +63,7 @@ async def finish_tool_inline_snap(
         f"(ack={bus.inline_snap_slot()!r}) fp={fingerprint[:12]}…",
         flush=True,
     )
+    orchestrator.tool_slots.release_reservation(fingerprint, slot)
     return False
 
 
@@ -95,6 +98,7 @@ async def commit_pending_tool_snap(
     fingerprint: str,
     slot: int,
     kv_end: int,
+    protect: bool = False,
 ) -> None:
     if kv_end <= 0:
         orchestrator.tool_slots.release_reservation(fingerprint, slot)
@@ -118,10 +122,11 @@ async def commit_pending_tool_snap(
         kv_end=kv_end,
     )
     if ok:
-        orchestrator.tool_slots.confirm(fingerprint, slot)
+        orchestrator.tool_slots.confirm(fingerprint, slot, protect=protect)
         print(
             f"[tool-split] tool KV pinned slot={slot} len={kv_end} "
-            f"fp={fingerprint[:12]}…",
+            f"fp={fingerprint[:12]}…"
+            f"{' (protected)' if protect else ''}",
             flush=True,
         )
     else:
