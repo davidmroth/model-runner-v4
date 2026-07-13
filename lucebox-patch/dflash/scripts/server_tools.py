@@ -1377,9 +1377,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 raw.extend(chunk)
             return struct.unpack("<i", raw)[0]
 
-        # Vision turns do not use the text KV cache yet, but retain scoped
-        # admission priority when the caller supplied a conversation id.
-        scoped = bool(request.headers.get("x-conversation-id", "").strip())
+        # Vision turns do not use the text KV cache yet. They are nevertheless
+        # interactive work, so give them scoped admission priority even for
+        # OpenAI-compatible clients that do not send a conversation header.
+        scoped = True
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
 
         if req.stream:
