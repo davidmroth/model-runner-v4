@@ -1377,8 +1377,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 raw.extend(chunk)
             return struct.unpack("<i", raw)[0]
 
-        # Ephemeral scope — no conversation caching for vision turns.
-        scoped = False
+        # Vision turns do not use the text KV cache yet, but retain scoped
+        # admission priority when the caller supplied a conversation id.
+        scoped = bool(request.headers.get("x-conversation-id", "").strip())
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
 
         if req.stream:

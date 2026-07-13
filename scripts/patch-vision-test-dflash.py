@@ -14,6 +14,8 @@ def patch(path: pathlib.Path, replacements: list[tuple[str, str]], label: str):
     if not bak.exists():
         shutil.copy(path, bak)
     for old, new in replacements:
+        if new in code:
+            continue
         assert old in code, f"{label}: anchor not found:\n{old!r}"
         code = code.replace(old, new, 1)
     path.write_text(code)
@@ -47,6 +49,23 @@ patch(
         "    args.mmproj_use_gpu = cfg.mmproj_use_gpu;"
     )],
     "layer_split_daemon_loop.cpp"
+)
+
+# ── 2b. layer_split_backend.h ───────────────────────────────────────────────
+# The daemon talks to ModelBackend, not directly to LayerSplitAdapter.  Forward
+# the capability check or GENERATE_MULTIMODAL will always see the base false.
+patch(
+    SRC / "src/common/layer_split_backend.h",
+    [(
+        "    bool init() override;\n"
+        "    void print_ready_banner() const override;",
+        "    bool init() override;\n"
+        "    bool supports_multimodal() const override {\n"
+        "        return adapter_ && adapter_->supports_multimodal();\n"
+        "    }\n"
+        "    void print_ready_banner() const override;"
+    )],
+    "layer_split_backend.h"
 )
 
 # ── 3. test_dflash.cpp ────────────────────────────────────────────────────────
