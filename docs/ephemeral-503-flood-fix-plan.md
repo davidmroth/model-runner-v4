@@ -1,6 +1,7 @@
 # Ephemeral 503 Flood — Fix Plan
 
-**Status:** Planned  
+**Status:** Implemented  
+
 **Scope:** `lucebox-patch/dflash/scripts/handler_reliability.py`, `lucebox-patch/dflash/scripts/server_tools.py`, `services/proxy/alias_proxy.py`
 
 ---

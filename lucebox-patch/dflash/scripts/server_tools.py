@@ -101,6 +101,7 @@ from handler_reliability import (
     quiet_access_logs_enabled,
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
+    should_log_ephemeral_busy,
 )
 
 # Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
@@ -532,15 +533,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         queued_at = loop.time()
         use_priority = scoped_lock_priority_enabled()
 
-        if not scoped and use_priority and daemon_lock.scoped_waiting:
-            print(
-                "  [handler] ephemeral yield — scoped waiter ahead "
-                f"({label})",
-                flush=True,
-            )
-            raise DaemonBusyError(label)
-
-        if daemon_lock.locked():
+        if daemon_lock.locked() and (scoped or should_log_ephemeral_busy()):
             if wait_sec == float("inf"):
                 print(
                     f"  [handler] daemon_lock busy — queueing ({label})",
@@ -1374,6 +1367,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 except Exception:
                     pass
 
+        def _read_stream_token() -> int:
+            """Read one signed token id from the daemon's integer stream FD."""
+            raw = bytearray()
+            while len(raw) < 4:
+                chunk = os.read(r_pipe, 4 - len(raw))
+                if not chunk:
+                    return -1
+                raw.extend(chunk)
+            return struct.unpack("<i", raw)[0]
+
         # Ephemeral scope — no conversation caching for vision turns.
         scoped = False
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
@@ -1415,10 +1418,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
                     text_buf = ""
                     while loop.time() < deadline:
-                        tok_id = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: struct.unpack("<i", r_pipe.read(4))[0]
-                            if True else -1
-                        )
+                        tok_id = await loop.run_in_executor(
+                            None, _read_stream_token)
                         if tok_id < 0:
                             break
                         piece = tokenizer.decode([tok_id], skip_special_tokens=True)
@@ -1478,10 +1479,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             # Read gen_tokens from stream FD
             tokens: list[int] = []
             for _ in range(gen_tokens):
-                chunk = r_pipe.read(4)
-                if len(chunk) < 4:
-                    break
-                tok = struct.unpack("<i", chunk)[0]
+                tok = _read_stream_token()
                 if tok < 0:
                     break
                 tokens.append(tok)

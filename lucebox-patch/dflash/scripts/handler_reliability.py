@@ -4,11 +4,34 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections import deque
 
 
 # Uvicorn access-log paths suppressed when ``DFLASH_QUIET_ACCESS_LOGS=1`` (default).
 _QUIET_ACCESS_LOG_PATHS = ("/health", "/v1/models")
+
+_EPHEMERAL_LOG_DEBOUNCE_DEFAULT = 5.0
+_last_ephemeral_log: float = 0.0
+
+
+def should_log_ephemeral_busy() -> bool:
+    """Rate-limit ephemeral ``daemon_lock busy`` log lines.
+
+    Returns True at most once per ``DFLASH_EPHEMERAL_LOG_DEBOUNCE_SEC``
+    (default 5s) so a no-backoff client cannot flood the handler log.
+    """
+    global _last_ephemeral_log
+    raw = os.environ.get("DFLASH_EPHEMERAL_LOG_DEBOUNCE_SEC", "5")
+    try:
+        debounce = max(0.0, float(raw))
+    except ValueError:
+        debounce = _EPHEMERAL_LOG_DEBOUNCE_DEFAULT
+    now = time.monotonic()
+    if now - _last_ephemeral_log >= debounce:
+        _last_ephemeral_log = now
+        return True
+    return False
 
 
 class _QuietAccessLogFilter(logging.Filter):
@@ -51,7 +74,9 @@ class PriorityDaemonLock:
     """Single-flight lock with scoped (conversation) priority over ephemeral traffic.
 
     Scoped requests jump ahead of ephemeral waiters when the lock is free.
-    Ephemeral acquire fails immediately while any scoped request is queued.
+    Ephemeral waiters join ``_low`` and wait up to ``max_wait``; they are
+    cancelled when a scoped request enqueues, and ``release()`` always drains
+    ``_high`` before ``_low``.
     """
 
     def __init__(self) -> None:
@@ -74,9 +99,6 @@ class PriorityDaemonLock:
         self.release()
 
     async def acquire(self, *, scoped: bool, max_wait: float) -> None:
-        if not scoped and self._high:
-            raise DaemonBusyError("ephemeral-yields-to-scoped")
-
         if not self._held:
             self._held = True
             return
@@ -108,10 +130,11 @@ class PriorityDaemonLock:
             fut.cancel()
 
     def _drain_low_waiters(self) -> None:
-        """Cancel all queued ephemeral waiters when a scoped request enqueues.
+        """Cancel queued ephemeral waiters when a scoped request enqueues.
 
-        Prevents a pipeline of ephemeral requests already waiting in ``_low``
-        from running ahead of the newly-arrived scoped request.  The current
+        Fires when a new scoped request joins ``_high``. Combined with
+        ``release()`` draining ``_high`` before ``_low``, this keeps
+        ephemerals from running while any scoped waiter exists. The current
         lock *holder* (if any) is not affected — only queued-but-not-running
         ephemerals are cancelled.
         """
