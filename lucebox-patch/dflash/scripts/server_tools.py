@@ -1268,9 +1268,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         """Return (img_tmp, text_tmp) if any message has image_url content.
 
         The text file contains the full conversation rendered via chat template
-        with ``<image>`` markers where images appear (consumed by prefill_multimodal
-        via mtmd).  The image file holds raw JPEG/PNG bytes from the first image.
-        Returns None if the request is text-only.
+        with ``<__media__>`` markers where images appear (mtmd_default_marker;
+        consumed by prefill_multimodal via mtmd).  The image file holds raw
+        JPEG/PNG bytes from the first image. Returns None if the request is
+        text-only.
         """
         image_bytes: bytes | None = None
         msgs_for_template: list[dict] = []
@@ -1299,7 +1300,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                     print(f"  [vision] image download failed: {exc!r}",
                                           flush=True)
                                     image_bytes = b""
-                        text_parts.append("<image>")  # mtmd default marker
+                        text_parts.append("<__media__>")  # mtmd_default_marker()
                     elif isinstance(block, dict) and block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                 msgs_for_template.append({"role": m.role,
@@ -1335,6 +1336,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 f"{m['role']}: {m.get('content', '')}"
                 for m in msgs_for_template
             )
+
+        # Chat templates sometimes strip unknown placeholders. mtmd requires
+        # exactly one <__media__> per image bitmap or tokenize returns rc=1.
+        _marker = "<__media__>"
+        if _marker not in marked_text:
+            print("  [vision] chat template dropped media marker — reinjecting",
+                  flush=True)
+            marked_text = _marker + "\n" + marked_text
 
         fd_txt, txt_str = tempfile.mkstemp(suffix=".txt")
         with os.fdopen(fd_txt, "w", encoding="utf-8") as fh:
