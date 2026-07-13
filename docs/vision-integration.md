@@ -94,7 +94,7 @@ INFERENCE_BASE=http://model-runner-v4-lucebox:8080 python scripts/vision_smoke_t
 | Behavior | Detail |
 |----------|--------|
 | **Spec decode + mmproj** | Both load together; text-only requests use DFlash, image requests use AR decode |
-| **Layer-split + vision** | Not supported yet — use single-GPU or non-split placement for vision testing |
+| **Layer-split + vision** | Supported when mmproj is loaded; `LayerSplitBackend` must delegate `supports_multimodal()` to the adapter |
 | **Prefix cache + vision** | Multimodal restore not implemented (`kv_offset != 0` rejected) |
 | **PFlash + vision** | Compression path is text-only |
 
