@@ -93,6 +93,8 @@ class DaemonStdoutBus:
     _TARGET_SPLIT_DECODE_RE = re.compile(
         r"\[target-split-dflash\] decode tokens=(\d+)"
     )
+    # Layer-split daemon_loop success line (AR + multimodal GENERATE_*).
+    _OK_GEN_RE = re.compile(r"^ok N=(\d+) gen=(\d+)\b")
 
     _STEP_TIMING_LINE_RE = re.compile(r"^  ([a-z_]+|----- sum)\s+([\d.]+)$")
 
@@ -151,7 +153,12 @@ class DaemonStdoutBus:
         m = self._TARGET_SPLIT_DECODE_RE.search(decoded)
         if m:
             self._timings["completion_tokens"] = int(m.group(1))
-
+            return
+        m = self._OK_GEN_RE.match(decoded)
+        if m:
+            # Prefer gen= (decode count); N= is the same for GENERATE_MULTIMODAL.
+            self._timings["completion_tokens"] = int(m.group(2))
+            return
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._task = loop.create_task(self._run())
 

@@ -1376,16 +1376,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 except Exception:
                     pass
 
-        def _read_stream_token() -> int:
-            """Read one signed token id from the daemon's integer stream FD."""
-            raw = bytearray()
-            while len(raw) < 4:
-                chunk = os.read(r_pipe, 4 - len(raw))
-                if not chunk:
-                    return -1
-                raw.extend(chunk)
-            return struct.unpack("<i", raw)[0]
-
         # Vision turns do not use the text KV cache yet. They are nevertheless
         # interactive work, so give them scoped admission priority even for
         # OpenAI-compatible clients that do not send a conversation header.
@@ -1415,8 +1405,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
                     stops = normalize_stop(req.stop)
                     wall_timeout_sec = request_wall_timeout_seconds()
-                    loop = asyncio.get_running_loop()
-                    deadline = loop.time() + wall_timeout_sec
 
                     # Yield role delta first
                     yield "data: " + json.dumps({
@@ -1428,26 +1416,27 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     }) + "\n\n"
 
                     text_buf = ""
-                    while loop.time() < deadline:
-                        tok_id = await loop.run_in_executor(
-                            None, _read_stream_token)
-                        if tok_id < 0:
-                            break
+                    async for tok_id in async_iter_pipe_tokens(
+                        r_pipe,
+                        gen_len,
+                        bus=bus,
+                        wall_timeout=wall_timeout_sec,
+                    ):
                         piece = tokenizer.decode([tok_id], skip_special_tokens=True)
-                        if piece:
-                            text_buf += piece
-                            # Simple stop check
-                            if any(s in text_buf for s in stops):
-                                finish_reason = "stop"
-                                break
-                            completion_tokens += 1
-                            yield "data: " + json.dumps({
-                                "id": completion_id, "object": "chat.completion.chunk",
-                                "created": created, "model": MODEL_NAME,
-                                "choices": [{"index": 0,
-                                             "delta": {"content": piece},
-                                             "finish_reason": None}]
-                            }) + "\n\n"
+                        if not piece:
+                            continue
+                        text_buf += piece
+                        if any(s in text_buf for s in stops):
+                            finish_reason = "stop"
+                            break
+                        completion_tokens += 1
+                        yield "data: " + json.dumps({
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": MODEL_NAME,
+                            "choices": [{"index": 0,
+                                         "delta": {"content": piece},
+                                         "finish_reason": None}]
+                        }) + "\n\n"
 
                     await bus.drain_timings()
                     yield "data: " + json.dumps({
@@ -1481,21 +1470,29 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
 
-            ok_line = await bus.await_reply(
-                "ok ", timeout=request_wall_timeout_seconds())
+            # Multimodal uses AR decode: tokens hit the pipe before the
+            # ``ok N=… gen=…`` line. Read concurrently (same as text chat);
+            # do not await ``ok`` first or completion_tokens stays 0.
+            wall_timeout_sec = request_wall_timeout_seconds()
+            tokens = await asyncio.to_thread(
+                lambda: list(
+                    iter_pipe_tokens(
+                        r_pipe,
+                        gen_len,
+                        bus=bus,
+                        wall_timeout=wall_timeout_sec,
+                    )
+                ),
+            )
             await bus.drain_timings()
-            timings = bus.request_timings()
-            gen_tokens = int(timings.get("completion_tokens", 0))
-
-            # Read gen_tokens from stream FD
-            tokens: list[int] = []
-            for _ in range(gen_tokens):
-                tok = _read_stream_token()
-                if tok < 0:
-                    break
-                tokens.append(tok)
 
             text = tokenizer.decode(tokens, skip_special_tokens=True)
+            stops = normalize_stop(req.stop)
+            if stops:
+                i = first_stop_match(text, stops)
+                if i != -1:
+                    text = text[:i]
+            text, _reasoning = parse_reasoning(text, thinking_enabled=False)
         finally:
             daemon_lock.release()
             _cleanup()
