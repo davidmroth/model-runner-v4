@@ -90,6 +90,7 @@ from daemon_pipe import (
     drain_pipe_residual,
     iter_pipe_tokens,
 )
+from stream_detokenize import IncrementalDetokenizer
 from handler_reliability import (
     DaemonBusyError,
     PriorityDaemonLock,
@@ -1416,20 +1417,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     }) + "\n\n"
 
                     text_buf = ""
+                    detok = IncrementalDetokenizer(
+                        tokenizer, skip_special_tokens=True)
                     async for tok_id in async_iter_pipe_tokens(
                         r_pipe,
                         gen_len,
                         bus=bus,
                         wall_timeout=wall_timeout_sec,
                     ):
-                        piece = tokenizer.decode([tok_id], skip_special_tokens=True)
+                        completion_tokens += 1
+                        piece = detok.push(tok_id)
                         if not piece:
                             continue
                         text_buf += piece
                         if any(s in text_buf for s in stops):
                             finish_reason = "stop"
                             break
-                        completion_tokens += 1
                         yield "data: " + json.dumps({
                             "id": completion_id, "object": "chat.completion.chunk",
                             "created": created, "model": MODEL_NAME,
@@ -1437,6 +1440,18 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                          "delta": {"content": piece},
                                          "finish_reason": None}]
                         }) + "\n\n"
+                    else:
+                        tail = detok.finish()
+                        if tail:
+                            text_buf += tail
+                            yield "data: " + json.dumps({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created, "model": MODEL_NAME,
+                                "choices": [{"index": 0,
+                                             "delta": {"content": tail},
+                                             "finish_reason": None}]
+                            }) + "\n\n"
 
                     await bus.drain_timings()
                     yield "data: " + json.dumps({
@@ -1937,6 +1952,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
                 yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
                 role_sent = True
+                detok = IncrementalDetokenizer(
+                    tokenizer, skip_special_tokens=False)
 
                 try:
                     for tok_id in token_ids:
@@ -1957,7 +1974,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             break
 
                         completion_tokens += 1
-                        piece = tokenizer.decode([tok_id])
+                        piece = detok.push(tok_id)
+                        if not piece:
+                            continue
                         window += piece
 
                         if stops and mode != "tool_buffer":
@@ -2022,6 +2041,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                     yield out
                                 window = window[-HOLDBACK:]
                             break
+
+                    if not stop_hit:
+                        # Flush held U+FFFD / incomplete emoji (skip on stop trim).
+                        tail = detok.finish()
+                        if tail:
+                            window += tail
 
                     if stop_hit:
                         finish_reason = "stop"
@@ -2352,12 +2377,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     holdback = max((len(s) for s in user_stops), default=0)
                     window = ""
                     snap_ok = False
+                    detok = IncrementalDetokenizer(
+                        tokenizer, skip_special_tokens=False)
                     try:
                         async for tok_id in async_iter_pipe_tokens(
                                 r_pipe, gen_len_local, stop_ids, bus=bus,
                                 wall_timeout=request_wall_timeout_seconds()):
                             out_tokens += 1
-                            piece = tokenizer.decode([tok_id])
+                            piece = detok.push(tok_id)
+                            if not piece:
+                                continue
                             if user_stops:
                                 window += piece
                                 si = first_stop_match(window, user_stops)
@@ -2391,17 +2420,27 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                 }
                                 yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
                         else:
-                            if user_stops and window:
-                                trimmed, matched_stop = trim_at_stop(window, user_stops)
-                                if matched_stop is not None:
-                                    stop_reason = "stop_sequence"
-                                    window = trimmed
+                            tail = detok.finish()
+                            if user_stops:
+                                if tail:
+                                    window += tail
                                 if window:
-                                    delta = {
-                                        "type": "content_block_delta", "index": 0,
-                                        "delta": {"type": "text_delta", "text": window},
-                                    }
-                                    yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                                    trimmed, matched_stop = trim_at_stop(window, user_stops)
+                                    if matched_stop is not None:
+                                        stop_reason = "stop_sequence"
+                                        window = trimmed
+                                    if window:
+                                        delta = {
+                                            "type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "text_delta", "text": window},
+                                        }
+                                        yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                            elif tail:
+                                delta = {
+                                    "type": "content_block_delta", "index": 0,
+                                    "delta": {"type": "text_delta", "text": tail},
+                                }
+                                yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
                         snap_ok = True
                     except Exception:
                         await _finalize_request_snaps(
