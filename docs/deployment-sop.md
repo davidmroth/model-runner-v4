@@ -64,6 +64,20 @@ done
 After that, either `bot@` or `david@` can fetch/pull. Prefer **`bot@`** for
 agents and documented deploy steps so ownership does not drift again.
 
+Host remotes must use a **wildcard fetch refspec**. A narrow refspec (e.g.
+only `feature/dual-gpu-…`) leaves `refs/remotes/origin/<deploy-branch>`
+stale: `git fetch origin <branch>` updates `FETCH_HEAD` but not
+`origin/<branch>`, so tip checks lie. Fix once per repo:
+
+```bash
+git -C /media/data/projects/lucebox-hub-src \
+  config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git -C /media/data/projects/model-runner-v4 \
+  config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git -C /media/data/projects/ai-platform \
+  config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+```
+
 `lucebox-hub-src` must track a **single pushed branch tip**. Host-only commits
 are forbidden. If a fix exists only on the host, cherry-pick it onto the deploy
 branch on the **dev machine**, push, then `git pull --ff-only` on ai.local.
