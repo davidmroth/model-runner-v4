@@ -35,18 +35,34 @@ entrypoints on the host. Change them in git, push, pull.
 | `lucebox-hub` | `/media/data/projects/lucebox-hub-src` | `feat/native-mmproj` | (bind-mount into lucebox) |
 | `ai-platform` | `/media/data/projects/ai-platform` | `main` or team branch | `ai-platform-proxy` |
 
-SSH as **`bot@ai.local`** for all host ops (not personal accounts). Mixed
-`.git/objects` ownership between users breaks `git pull` / `git fetch`
+SSH as **`bot@ai.local`** for day-to-day host ops. `bot` is in the `users`
+group, so repo `.git` trees may be owned by **`david:users`** as long as they
+stay **group-writable**. Mixed per-user object dirs (some `bot:bot`, some
+`david:david`) break `git pull` / `git fetch`
 (“insufficient permission for adding an object to repository database”).
 
-If that happens, fix once (requires sudo on the host):
+One-time repair (run on the host with sudo — expand paths, do not use `...`):
 
 ```bash
-sudo chown -R bot:users /media/data/projects/{model-runner-v4,lucebox-hub-src,ai-platform}/.git
-sudo chmod -R g+w /media/data/projects/{model-runner-v4,lucebox-hub-src,ai-platform}/.git
+#!/bin/bash
+set -euo pipefail
+
+repos=(
+  /media/data/projects/model-runner-v4
+  /media/data/projects/lucebox-hub-src
+  /media/data/projects/ai-platform
+)
+
+for repo in "${repos[@]}"; do
+  sudo chown -R david:users "$repo/.git"
+  sudo chmod -R g+w "$repo/.git"
+  sudo find "$repo/.git" -type d -exec chmod g+s {} \;
+  git -C "$repo" config core.sharedRepository group
+done
 ```
 
-Then keep using `bot@` only.
+After that, either `bot@` or `david@` can fetch/pull. Prefer **`bot@`** for
+agents and documented deploy steps so ownership does not drift again.
 
 `lucebox-hub-src` must track a **single pushed branch tip**. Host-only commits
 are forbidden. If a fix exists only on the host, cherry-pick it onto the deploy
