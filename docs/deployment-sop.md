@@ -36,7 +36,17 @@ entrypoints on the host. Change them in git, push, pull.
 | `ai-platform` | `/media/data/projects/ai-platform` | `main` or team branch | `ai-platform-proxy` |
 
 SSH as **`bot@ai.local`** for all host ops (not personal accounts). Mixed
-`.git/objects` ownership between users breaks `git pull`.
+`.git/objects` ownership between users breaks `git pull` / `git fetch`
+(“insufficient permission for adding an object to repository database”).
+
+If that happens, fix once (requires sudo on the host):
+
+```bash
+sudo chown -R bot:users /media/data/projects/{model-runner-v4,lucebox-hub-src,ai-platform}/.git
+sudo chmod -R g+w /media/data/projects/{model-runner-v4,lucebox-hub-src,ai-platform}/.git
+```
+
+Then keep using `bot@` only.
 
 `lucebox-hub-src` must track a **single pushed branch tip**. Host-only commits
 are forbidden. If a fix exists only on the host, cherry-pick it onto the deploy
