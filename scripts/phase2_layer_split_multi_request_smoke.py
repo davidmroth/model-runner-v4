@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Phase 2 M2a gate: layer-split multi-slot smoke on ai.local.
+"""Phase 2 layer-split multi-slot smoke on ai.local (M2a + M2b).
 
 Runs outside the live lucebox container against a side-built test_dflash.
 Expects VRAM free (stop model-runner-v4-lucebox first). Prefer AR-only
 (no draft) and no DFLASH_KVFLASH (multi-slot refuses kvflash reattach).
 
 Gates:
-  N=1  LIST_TARGET_CACHE_SLOTS + generate + SNAPSHOT + RESTORE_CHAIN
-  N=2  two START + SCHED_DRAIN; demux tagged frames; slot_busy on restore
+  N=1  LIST + generate + SNAPSHOT_THIN + RESTORE_CHAIN (tool-pin certify)
+  N=2  tagged START+SCHED_DRAIN; slot_required; busy refuse;
+       tool-pin RESTORE on slot 0 while slot 1 idle (and inverse)
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import select
 import struct
 import subprocess
@@ -23,12 +25,30 @@ import time
 from pathlib import Path
 
 
+# Minimal chat-ish token prefix used as the "tool" pin region.
+TOOL_IDS = [151644, 872, 198, 8948, 151645, 198, 151644, 77091, 198]
+TOOL_LEN = len(TOOL_IDS)
+# Unique thin snapshot slots so A/B pins don't overwrite each other.
+THIN_A = 4
+THIN_B = 5
+# Thick probe slots for live-cache fingerprints (isolation assert).
+PROBE_A = 7
+PROBE_B = 8
+
+
 def write_raw_i32(path: Path, ids: list[int]) -> None:
     path.write_bytes(struct.pack(f"<{len(ids)}i", *ids))
 
 
 def write_counted_i32(path: Path, ids: list[int]) -> None:
     path.write_bytes(struct.pack("<i", len(ids)) + struct.pack(f"<{len(ids)}i", *ids))
+
+
+def parse_cur_pos(line: str) -> int:
+    m = re.search(r"cur_pos=(-?\d+)", line)
+    if not m:
+        raise AssertionError(f"no cur_pos in: {line}")
+    return int(m.group(1))
 
 
 class Daemon:
@@ -217,15 +237,116 @@ def gate_n1(d: Daemon, work: Path) -> None:
     assert "target_cache_slots=1" in out, out
 
     prompt = work / "p1.bin"
-    ids = [151644, 872, 198, 8948, 151645, 198, 151644, 77091, 198]
-    write_counted_i32(prompt, ids)
+    write_counted_i32(prompt, TOOL_IDS)
     out_path = work / "o1.bin"
     print("== N=1 generate ==")
-    out = d.cmd(f"generate {prompt} 8 {out_path}", expect_prefix="ok ", timeout=300)
+    out = d.cmd(f"generate {prompt} 4 {out_path}", expect_prefix="ok ", timeout=300)
     assert out.startswith("ok "), out
     assert out_path.exists() and out_path.stat().st_size > 4
-    # RESTORE_CHAIN is an M2b tool-pin gate; N=1 here only certifies layer-split boot.
+
+    print(f"== N=1 SNAPSHOT_THIN tool pin slot={THIN_A} kv=0,{TOOL_LEN} ==")
+    # N=1: SLOT prefix optional. Pin tool region [0, TOOL_LEN).
+    thin = d.cmd(f"SNAPSHOT_THIN {THIN_A} 0 {TOOL_LEN}", expect_prefix="[snap] thin", timeout=120)
+    assert f"thin slot={THIN_A}" in thin, thin
+    d.read_stream(idle=0.3)
+
+    # Full prompt = tool prefix + short chat suffix; restore should suffix-prefill only.
+    suffix_ids = [220, 220, 1110, 264]
+    full = TOOL_IDS + suffix_ids
+    restore_prompt = work / "restore1.raw"
+    write_raw_i32(restore_prompt, full)
+    print("== N=1 RESTORE_CHAIN (tool pin) ==")
+    out = d.cmd(
+        f"RESTORE_CHAIN -1 {THIN_A} {restore_prompt} 4",
+        expect_prefix="ok ",
+        timeout=300,
+    )
+    assert out.startswith("ok "), out
+    assert "RESTORE_CHAIN thick=-1" in out, out
+    assert f"prefix_len={TOOL_LEN}" in out or "suffix_n=" in out, out
+    d.read_stream(idle=0.5)
     print("N=1 OK")
+
+
+def _finger_live(d: Daemon, live_slot: int, probe_slot: int) -> int:
+    """Activate live_slot, SNAPSHOT into probe_slot, return cur_pos fingerprint."""
+    snap = d.cmd(
+        f"SLOT {live_slot} SNAPSHOT {probe_slot}",
+        expect_prefix="[snap] inline",
+        timeout=120,
+    )
+    assert f"inline slot={probe_slot}" in snap, snap
+    assert f"live={live_slot}" in snap, snap
+    return parse_cur_pos(snap)
+
+
+def _seed_and_pin(
+    d: Daemon,
+    work: Path,
+    live_slot: int,
+    thin_slot: int,
+    prompt_ids: list[int],
+    tool_len: int,
+) -> Path:
+    """Prefill live_slot via generate, pin thin tool region, return work dir tag."""
+    p = work / f"seed_s{live_slot}.bin"
+    o = work / f"seed_o{live_slot}.bin"
+    write_counted_i32(p, prompt_ids)
+    # SLOT before generate so the seed lands in the intended live TargetCache.
+    # generate itself does not parse SLOT — activate first, then generate.
+    act = d.cmd(f"SLOT {live_slot} LIST_TARGET_CACHE_SLOTS", expect_prefix="[daemon]")
+    assert f"active={live_slot}" in act, act
+    out = d.cmd(f"generate {p} 4 {o}", expect_prefix="ok ", timeout=300)
+    assert out.startswith("ok "), out
+    thin = d.cmd(
+        f"SLOT {live_slot} SNAPSHOT_THIN {thin_slot} 0 {tool_len}",
+        expect_prefix="[snap] thin",
+        timeout=120,
+    )
+    assert f"thin slot={thin_slot}" in thin, thin
+    d.read_stream(idle=0.3)
+    return p
+
+
+def _isolation_restore(
+    d: Daemon,
+    work: Path,
+    *,
+    restore_slot: int,
+    idle_slot: int,
+    thin_slot: int,
+    idle_probe: int,
+) -> None:
+    print(f"== N=2 isolation: RESTORE on live={restore_slot}, idle={idle_slot} ==")
+    idle_pos_before = _finger_live(d, idle_slot, idle_probe)
+    print(f"  idle slot {idle_slot} fingerprint cur_pos={idle_pos_before}")
+
+    # Bare RESTORE_CHAIN must refuse when N>1 (no SLOT).
+    bare = work / "bare.raw"
+    write_raw_i32(bare, TOOL_IDS + [220, 220])
+    bad = d.cmd(f"RESTORE_CHAIN -1 {thin_slot} {bare} 2", expect_prefix="err ", timeout=30)
+    assert "err slot_required" in bad, bad
+    print("  slot_required OK")
+
+    suffix = TOOL_IDS + [220, 1110, 264, 1234]
+    rp = work / f"restore_s{restore_slot}.raw"
+    write_raw_i32(rp, suffix)
+    out = d.cmd(
+        f"SLOT {restore_slot} RESTORE_CHAIN -1 {thin_slot} {rp} 4",
+        expect_prefix="ok ",
+        timeout=300,
+    )
+    assert out.startswith("ok "), out
+    assert f"live={restore_slot}" in out, out
+    assert "RESTORE_CHAIN thick=-1" in out, out
+    d.read_stream(idle=0.5)
+
+    idle_pos_after = _finger_live(d, idle_slot, idle_probe + 1)
+    print(f"  idle slot {idle_slot} after restore cur_pos={idle_pos_after}")
+    assert idle_pos_after == idle_pos_before, (
+        f"idle live slot {idle_slot} mutated: {idle_pos_before} -> {idle_pos_after}"
+    )
+    print(f"  isolation OK (live {restore_slot} restored, {idle_slot} untouched)")
 
 
 def gate_n2(d: Daemon, work: Path) -> None:
@@ -236,9 +357,8 @@ def gate_n2(d: Daemon, work: Path) -> None:
     p0 = work / "p0.raw"
     p1 = work / "p1.raw"
     # START expects raw int32 LE tokens (not count-prefixed).
-    ids = [151644, 872, 198, 8948, 151645, 198, 151644, 77091, 198]
-    write_raw_i32(p0, ids)
-    write_raw_i32(p1, ids + [220, 220])
+    write_raw_i32(p0, TOOL_IDS)
+    write_raw_i32(p1, TOOL_IDS + [220, 220])
 
     print("== N=2 START req0 ==")
     # REQ/SLOT are prefixes on the same line — not standalone commands.
@@ -265,20 +385,64 @@ def gate_n2(d: Daemon, work: Path) -> None:
     print("== N=2 busy RESTORE_CHAIN ==")
     listing = d.cmd("LIST_REQUESTS", expect_prefix="[scheduler]")
     if "requests=" in listing and listing.strip() != "[scheduler] requests=":
-        bad = d.cmd(f"RESTORE_CHAIN 0 - {p0} 2", expect_prefix="err ", timeout=30)
+        bad = d.cmd(f"SLOT 0 RESTORE_CHAIN 0 - {p0} 2", expect_prefix="err ", timeout=30)
         assert "err slot_busy" in bad, bad
         print("  slot_busy OK")
     else:
-        start = d.cmd(f"REQ 3 START {p0} 64 8", expect_prefix="ok START", timeout=300)
+        start = d.cmd(f"REQ 3 SLOT 0 START {p0} 64 8", expect_prefix="ok START", timeout=300)
         assert start.startswith("ok START"), start
         d.read_stream(idle=0.5)
-        bad = d.cmd(f"RESTORE_CHAIN 0 - {p0} 2", expect_prefix="err ", timeout=30)
+        bad = d.cmd(f"SLOT 0 RESTORE_CHAIN 0 - {p0} 2", expect_prefix="err ", timeout=30)
         assert "err slot_busy" in bad, bad
         print("  slot_busy OK (re-admit)")
-        # CANCEL prints a scheduler line; accept either cancelled or silence via LIST.
         out = d.cmd("CANCEL 3", expect_prefix="[scheduler]", timeout=30)
         assert "cancelled" in out or out.startswith("[scheduler]"), out
         d.read_stream(idle=0.5)
+
+    # --- M2b: tool pin + RESTORE isolation (after scheduler traffic settles) ---
+    # Cancel any leftover busy requests so generate/RESTORE are free.
+    listing = d.cmd("LIST_REQUESTS", expect_prefix="[scheduler]")
+    for m in re.finditer(r"(\d+)@slot", listing):
+        rid = m.group(1)
+        d.cmd(f"CANCEL {rid}", expect_prefix="[scheduler]", timeout=30)
+        d.read_stream(idle=0.2)
+
+    # Distinct seeds so idle fingerprint differs from restore target.
+    seed0 = TOOL_IDS
+    seed1 = TOOL_IDS + [220, 220, 220, 1110]
+    assert len(seed0) == TOOL_LEN
+    assert len(seed1) > TOOL_LEN
+
+    print("== N=2 seed slot 0 + pin thin A ==")
+    _seed_and_pin(d, work, live_slot=0, thin_slot=THIN_A, prompt_ids=seed0, tool_len=TOOL_LEN)
+    print("== N=2 seed slot 1 (idle victim, longer) ==")
+    # Seed slot 1 but do NOT pin from it for first isolation — leave as parked live KV.
+    p = work / "seed_s1.bin"
+    o = work / "seed_o1.bin"
+    write_counted_i32(p, seed1)
+    act = d.cmd("SLOT 1 LIST_TARGET_CACHE_SLOTS", expect_prefix="[daemon]")
+    assert "active=1" in act, act
+    out = d.cmd(f"generate {p} 4 {o}", expect_prefix="ok ", timeout=300)
+    assert out.startswith("ok "), out
+
+    _isolation_restore(
+        d, work, restore_slot=0, idle_slot=1, thin_slot=THIN_A, idle_probe=PROBE_A
+    )
+
+    print("== N=2 inverse: pin thin B on slot 1, restore while slot 0 idle ==")
+    _seed_and_pin(d, work, live_slot=1, thin_slot=THIN_B, prompt_ids=seed1, tool_len=TOOL_LEN)
+    # Refresh slot 0 parked state with a known distinct seed for fingerprint.
+    p0b = work / "seed_s0b.bin"
+    o0b = work / "seed_o0b.bin"
+    write_counted_i32(p0b, seed0 + [999])
+    act = d.cmd("SLOT 0 LIST_TARGET_CACHE_SLOTS", expect_prefix="[daemon]")
+    assert "active=0" in act, act
+    out = d.cmd(f"generate {p0b} 4 {o0b}", expect_prefix="ok ", timeout=300)
+    assert out.startswith("ok "), out
+
+    _isolation_restore(
+        d, work, restore_slot=1, idle_slot=0, thin_slot=THIN_B, idle_probe=PROBE_B
+    )
     print("N=2 OK")
 
 
@@ -303,7 +467,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="phase2-ls-smoke-") as td:
         work = Path(td)
         if args.gate in ("n1", "all"):
-            print("\n===== GATE N=1 (layer-split) =====")
+            print("\n===== GATE N=1 (layer-split / M2b tool-pin) =====")
             d = launch(
                 bin_path, target, draft, slots=1, tagged=False,
                 max_ctx=args.max_ctx, work=work, target_gpus=args.target_gpus,
@@ -314,7 +478,7 @@ def main() -> int:
                 d.close()
 
         if args.gate in ("n2", "all"):
-            print("\n===== GATE N=2 (layer-split) =====")
+            print("\n===== GATE N=2 (layer-split / M2b isolation) =====")
             d = launch(
                 bin_path, target, draft, slots=2, tagged=True,
                 max_ctx=args.max_ctx, work=work, target_gpus=args.target_gpus,
@@ -324,7 +488,7 @@ def main() -> int:
             finally:
                 d.close()
 
-    print("\nALL PHASE-2 M2a GATES PASSED")
+    print("\nALL PHASE-2 M2b GATES PASSED")
     return 0
 
 

@@ -1,6 +1,6 @@
 # Phase 2 spike — Layer-split multi-slot
 
-**Status:** M2a smoke PASSED on ai.local (2026-07-14) · M2b next  
+**Status:** M2b implemented · smoke pending ai.local  
 **Branch:** `feat/native-mmproj-multi-request`  
 **Parent:** [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)
 
@@ -13,6 +13,10 @@ Prod path (`LayerSplitBackend` + `Qwen35LayerSplitAdapter`) now allocates **N
 live `TargetCache`s per GPU shard** when `--target-cache-slots=N` (fail init on
 OOM; **refuse N>1 with kvflash** until pager reattach exists).
 
+When `N>1`, `SNAPSHOT` / `SNAPSHOT_THIN` / `RESTORE_CHAIN` require an explicit
+`SLOT k` prefix on the same stdin line (`err slot_required` otherwise) so
+restore cannot silently hit the wrong live cache.
+
 ---
 
 ## M2a — first shippable gate (ai.local, side binary)
@@ -23,8 +27,12 @@ OOM; **refuse N>1 with kvflash** until pager reattach exists).
 4. ~~Smoke: `scripts/phase2_layer_split_multi_request_smoke.py`~~ passed
    (`--target-gpus=0,1`, N=2 tagged START+SCHED_DRAIN, `slot_busy`; AR-only, no kvflash).
 
-**M2b (exit gate):** tool pin + `RESTORE_CHAIN` on slot 0 while slot 1 idle
-(and inverse); N=1 certify still green. **Do not** set compose `N=2` until M2b.
+## M2b — tool-pin restore isolation
+
+1. ~~`SLOT k` required for multi-slot snap/restore (`daemon_loop`)~~ done.
+2. ~~Smoke: N=1 thin pin + `RESTORE_CHAIN`; N=2 pin+restore on slot 0 / idle 1 (+ inverse);
+   keep `slot_busy` / `slot_required`~~ ready to run on ai.local.
+3. **Do not** set compose `N=2` until M2b smoke is green. Phase 3 still blocked.
 
 ---
 
@@ -34,8 +42,8 @@ OOM; **refuse N>1 with kvflash** until pager reattach exists).
 2. ~~Allocate N live caches — `Qwen35LayerSplitAdapter::allocate_extra_live_slots`~~
 3. ~~Activate/swap per shard — `activate_target_cache_slot` / `swap_live_slot_state`~~
 4. ~~`LayerSplitBackend` slot façade + `continue_generate`~~
-5. RESTORE_CHAIN — `SLOT k` then restore into live slot `k` (M2b harden)
-6. Smoke — `model-runner-v4/scripts/phase2_layer_split_multi_request_smoke.py`
+5. ~~RESTORE_CHAIN — `SLOT k` then restore into live slot `k` (M2b harden)~~
+6. Smoke — `model-runner-v4/scripts/phase2_layer_split_multi_request_smoke.py` (M2b)
 
 ---
 
