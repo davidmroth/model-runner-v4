@@ -113,8 +113,10 @@ from handler_reliability import (
 )
 from target_cache_admission import (
     TargetCacheSlotPool,
+    append_restore_chain_quantum,
     format_slot_command,
     multi_slot_drop_exclusive,
+    overlap_mode_enabled,
     reset_active_live_slot,
     set_active_live_slot,
     stream_tagged_enabled,
@@ -705,17 +707,47 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         wall_timeout: float,
         use_stops: bool = True,
     ) -> list[int]:
-        """Register (if tagged), write command, collect tokens."""
+        """Register (if tagged), write command, collect tokens.
+
+        When overlap mode is on (N>1 + tagged + drop-exclusive) and the command
+        is ``RESTORE_CHAIN``, append a schedule quantum and kick ``SCHED_DRAIN``
+        after ``ok RESTORE_CHAIN_ADMIT`` so decode can time-slice with peers.
+        """
         req_id: int | None = None
         queue = None
+        cmd = cmd_line
+        use_admit = (
+            overlap_mode_enabled()
+            and multi_slot_drop_exclusive()
+            and tagged_demux is not None
+            and "RESTORE_CHAIN" in cmd.upper()
+        )
+        if use_admit:
+            cmd = append_restore_chain_quantum(cmd)
         if tagged_demux is not None:
             req_id = tagged_demux.alloc_req_id()
             queue = await tagged_demux.register(req_id)
+        sched_task: asyncio.Task[None] | None = None
         try:
             if tagged_demux is None:
                 drain_pipe_residual(r_pipe)
             bus.begin_request()
-            await _write_daemon_cmd_async(cmd_line, req_id=req_id)
+            await _write_daemon_cmd_async(cmd, req_id=req_id)
+            if use_admit:
+                async def _kick_sched() -> None:
+                    try:
+                        await bus.await_reply("ok RESTORE_CHAIN_ADMIT", timeout=wall_timeout)
+                    except Exception as exc:
+                        print(
+                            f"  [handler] RESTORE_CHAIN_ADMIT wait failed: {exc!r}",
+                            flush=True,
+                        )
+                        return
+                    async with daemon_stdin_lock:
+                        daemon_proc.stdin.write(b"SCHED_DRAIN\n")
+                        daemon_proc.stdin.flush()
+
+                sched_task = asyncio.create_task(_kick_sched())
             if tagged_demux is not None and req_id is not None and queue is not None:
                 stops = stop_ids if use_stops else frozenset()
                 return [
@@ -732,6 +764,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 gen_len, req_id=None, wall_timeout=wall_timeout, use_stops=use_stops,
             )
         finally:
+            if sched_task is not None:
+                try:
+                    await asyncio.wait_for(sched_task, timeout=max(1.0, wall_timeout))
+                except Exception:
+                    sched_task.cancel()
             if tagged_demux is not None and req_id is not None:
                 await tagged_demux.unregister(req_id)
 

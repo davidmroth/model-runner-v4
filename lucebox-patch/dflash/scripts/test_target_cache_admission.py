@@ -69,7 +69,21 @@ class FormatSlotCommandTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             format_slot_command("RESTORE 0 /tmp/p.bin 4\n", slots=2)
 
-    def test_orchestrator_and_snapshot_thin_emit_slot(self) -> None:
+    def test_append_restore_chain_quantum(self) -> None:
+        from target_cache_admission import append_restore_chain_quantum
+
+        base = "RESTORE_CHAIN -1 4 /tmp/p.bin 12\n"
+        self.assertEqual(
+            append_restore_chain_quantum(base, quantum=4),
+            "RESTORE_CHAIN -1 4 /tmp/p.bin 12 4\n",
+        )
+        already = "RESTORE_CHAIN -1 4 /tmp/p.bin 12 8\n"
+        self.assertEqual(append_restore_chain_quantum(already, quantum=4), already)
+        with_snap = "RESTORE_CHAIN -1 4 /tmp/p.bin 12 snap=10:0\n"
+        self.assertEqual(
+            append_restore_chain_quantum(with_snap, quantum=4),
+            "RESTORE_CHAIN -1 4 /tmp/p.bin 12 4 snap=10:0\n",
+        )
         plan = ToolSplitPlan(
             prompt_bin_path="/tmp/p.bin",
             prompt_token_count=10,

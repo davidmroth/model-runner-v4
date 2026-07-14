@@ -50,6 +50,47 @@ def overlap_mode_enabled() -> bool:
     return target_cache_slots() > 1 and stream_tagged_enabled()
 
 
+def schedule_quantum() -> int:
+    """Decode quantum for RESTORE_CHAIN admit / START (default 8)."""
+    raw = os.environ.get("DFLASH_SCHED_QUANTUM", "8").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 8
+    return max(1, min(n, 4096))
+
+
+def append_restore_chain_quantum(line: str, quantum: int | None = None) -> str:
+    """Append ``<quantum>`` to a RESTORE_CHAIN line when missing.
+
+    Leaves non-RESTORE_CHAIN lines and already-quantized lines unchanged.
+    """
+    q = schedule_quantum() if quantum is None else max(1, int(quantum))
+    nl = line.endswith("\n")
+    body = line[:-1] if nl else line
+    body = body.strip()
+    if not body.upper().startswith("RESTORE_CHAIN "):
+        return line
+    # Strip trailing snap= so quantum sits before snap=.
+    snap = ""
+    if " snap=" in body:
+        body, snap_part = body.split(" snap=", 1)
+        snap = f" snap={snap_part}"
+        body = body.strip()
+    parts = body.split()
+    # RESTORE_CHAIN thick thin path n_gen [quantum]
+    if len(parts) >= 6:
+        try:
+            int(parts[5])
+            return line  # already has quantum
+        except ValueError:
+            pass
+    if len(parts) < 5:
+        return line
+    body = f"{' '.join(parts[:5])} {q}{snap}"
+    return body + ("\n" if nl else "")
+
+
 def format_req_prefix_needed() -> bool:
     """Commands should carry ``REQ <id>`` when the daemon uses tagged emit."""
     return stream_tagged_enabled()
