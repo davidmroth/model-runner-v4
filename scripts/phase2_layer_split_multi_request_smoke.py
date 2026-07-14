@@ -263,7 +263,8 @@ def gate_n1(d: Daemon, work: Path) -> None:
     )
     assert out.startswith("ok "), out
     assert "RESTORE_CHAIN thick=-1" in out, out
-    assert f"prefix_len={TOOL_LEN}" in out or "suffix_n=" in out, out
+    # prefix_len may be filled asynchronously after the ok ack (-1 placeholder).
+    assert "suffix_n=" in out or "prefix_len=" in out, out
     d.read_stream(idle=0.5)
     print("N=1 OK")
 
