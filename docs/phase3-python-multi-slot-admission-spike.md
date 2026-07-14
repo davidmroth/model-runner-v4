@@ -1,6 +1,6 @@
 # Phase 3 spike — Python multi-slot admission
 
-**Status:** M3a in progress · compose stays **N=1**  
+**Status:** M3a green (2026-07-14) · M3b demux smoke PASSED (2026-07-14) · HTTP wire next · compose stays **N=1**  
 **Branch:** `feat/native-mmproj-multi-request`  
 **Parent:** [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)  
 **Prereq:** Phase 2 M2b green ([phase2-layer-split-multi-slot-spike.md](./phase2-layer-split-multi-slot-spike.md))
@@ -24,37 +24,30 @@ Ship as two slices so we never enable compose `N=2` without demux.
 
 ## M3a — first shippable gate
 
+**Status: PASSED** (`c601431`, unit smoke `test_target_cache_admission`)
+
 1. Plumb `DFLASH_TARGET_CACHE_SLOTS` / `DFLASH_STREAM_TAGGED` (defaults **1** / off)
-   through compose → `entrypoint-tool-split-serve.sh` → `server_tools` `extra_daemon`.
-2. Emit `SLOT k` on `RESTORE` / `RESTORE_CHAIN` / `SNAPSHOT*` / generate when N>1
-   (`format_slot_command` + ContextVar from the lease).
-3. Sticky `TargetCacheSlotPool`: conversation / cache_scope → live slot; free-list + wait.
-4. Admission:
-   - **N=1:** exclusive `PriorityDaemonLock` (unchanged).
-   - **N>1:** acquire a slot lease for capacity; keep exclusive pipe lock unless
-     `DFLASH_MULTI_SLOT_DROP_EXCLUSIVE=1` (smoke / M3b only — garbles streams
-     without demux).
-5. Unit smoke: SLOT formatting, dual lease admit/release, N=1 exclusive path intact.
-6. **Do not** set compose `N=2` until M3b demux is green.
-
-### M3a exit gate
-
-- `python -m unittest test_target_cache_admission` green (Docker).
-- With `DFLASH_TARGET_CACHE_SLOTS=1` (prod default): command lines have **no** `SLOT`
-  prefix; daemon still gets no `--target-cache-slots` (or `=1`).
-- With slots=2 in unit tests: `RESTORE_CHAIN` / `SNAPSHOT_THIN` lines are
-  `SLOT k …`; pool admits two concurrent leases and waits/times out on a third.
-- Prod recreate with defaults still healthy (N=1).
+2. Emit `SLOT k` when N>1
+3. Sticky `TargetCacheSlotPool`
+4. Admission: N=1 exclusive; N>1 lease + keep exclusive unless drop flag
+5. Unit smoke green
+6. **Do not** set compose `N=2` until M3b demux is green
 
 ---
 
-## M3b — overlap (next)
+## M3b — overlap
 
-- Demux tagged frames `[-2, req_id, tok]` → per-HTTP SSE.
-- Speak `REQ` / `SCHED_*` (or equivalent) so two generates share one stdin safely.
-- Set `DFLASH_MULTI_SLOT_DROP_EXCLUSIVE=1` (or remove the gate) once demux works.
-- Deploy `DFLASH_TARGET_CACHE_SLOTS=2` + `DFLASH_STREAM_TAGGED=1`.
-- Manual: chat stream + cron completion overlapping.
+| Step | Detail | Status |
+|------|--------|--------|
+| Demux module | `tagged_stream_demux.py` — `TaggedFrameBuffer` + `TaggedStreamDemux` | done |
+| Overlap smoke | `scripts/phase3_multi_slot_overlap_smoke.py` — dual `REQ`/`SLOT`/`START` + `SCHED_DRAIN` | **PASSED** (24 tagged tokens, req_ids 1+2) |
+| HTTP wire | Prefix `REQ <id>` when tagged; demux → SSE; stdin mutex | next |
+| Drop exclusive | Only with demux + START/SCHED (blocking `RESTORE_CHAIN` cannot interleave) | after HTTP |
+| Deploy | `DFLASH_TARGET_CACHE_SLOTS=2` + `DFLASH_STREAM_TAGGED=1` after smoke | blocked on HTTP |
+
+**Blocker for warm chat∩cron:** daemon `START` cold-prefills; prod warm path is
+`RESTORE_CHAIN`. Overlap smoke proves demux + scheduler; warm restore→quantum
+may need a C++ follow-up.
 
 ---
 
@@ -62,18 +55,19 @@ Ship as two slices so we never enable compose `N=2` without demux.
 
 | Finding | Impact |
 |---------|--------|
-| Python historically emitted bare `RESTORE_CHAIN` | Flipping daemon N>1 without SLOT → `err slot_required` |
-| `DFLASH_LEGACY_DAEMON=1` | Affects **single-GPU** path only; layer-split (`--target-gpus`) uses `daemon_loop` where multi-slot lives |
-| Exclusive lock + dual lease | Capacity accounting alone does not multiplex tokens; demux is M3b |
+| Python historically emitted bare `RESTORE_CHAIN` | Flipping daemon N>1 without SLOT → `err slot_required` (fixed M3a) |
+| `DFLASH_LEGACY_DAEMON=1` | Affects **single-GPU** only; layer-split uses `daemon_loop` |
+| Exclusive lock + dual lease | Capacity alone does not multiplex tokens; demux + START/SCHED is M3b |
 | Tool thin pins | Process-global; shared across live slots (M2b certified) |
 
 ---
 
 ## Order of work (model-runner-v4)
 
-1. Spike doc (this file) + parent plan pointer
-2. `target_cache_admission.py` — config helpers, `format_slot_command`, `TargetCacheSlotPool`
+1. Spike doc + parent plan pointer
+2. `target_cache_admission.py`
 3. Plumb env/CLI/entrypoint/compose (default N=1)
 4. Wire lease + SLOT into `server_tools` / `daemon_bridge` / orchestrator
 5. Unit smoke `test_target_cache_admission.py`
-6. M3b (demux) — separate gate
+6. `tagged_stream_demux.py` + `phase3_multi_slot_overlap_smoke.py`
+7. HTTP demux + drop exclusive + warm-overlap path

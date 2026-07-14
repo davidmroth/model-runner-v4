@@ -38,10 +38,21 @@ def multi_slot_drop_exclusive() -> bool:
     """When N>1, skip PriorityDaemonLock (needs tagged demux — M3b).
 
     Default off so compose can plumb N>1 for SLOT sticky tests without
-    interleaving untagged token streams.
+    interleaving untagged token streams. Prefer ``overlap_mode_enabled()``
+    once demux + START/SCHED are wired on the HTTP path.
     """
     raw = os.environ.get("DFLASH_MULTI_SLOT_DROP_EXCLUSIVE", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def overlap_mode_enabled() -> bool:
+    """True when live multi-slot + tagged stream are both configured."""
+    return target_cache_slots() > 1 and stream_tagged_enabled()
+
+
+def format_req_prefix_needed() -> bool:
+    """Commands should carry ``REQ <id>`` when the daemon uses tagged emit."""
+    return stream_tagged_enabled()
 
 
 def active_live_slot() -> int | None:

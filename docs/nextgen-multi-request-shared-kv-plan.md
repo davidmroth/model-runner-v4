@@ -1,6 +1,6 @@
 # Next-Gen Plan: Multi-Request Admission + Shared KV Pages
 
-**Status:** Phase 0 done · Phase 1 gate passed (2026-07-13) · Phase 2 M2b green (2026-07-14) · Phase 3 M3a in progress · July 2026  
+**Status:** Phase 0 done · Phase 1 gate passed (2026-07-13) · Phase 2 M2b green (2026-07-14) · Phase 3 M3a green · M3b in progress · July 2026  
 **Branches:** `feat/native-mmproj-multi-request` (`lucebox-hub`, `model-runner-v4`)  
 **Related:** [research-nextgen-archecture.md](./research-nextgen-archecture.md) (GPU1 roles),
 [ephemeral-503-flood-fix-plan.md](./ephemeral-503-flood-fix-plan.md) (lock/503 behavior),
