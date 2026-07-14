@@ -125,6 +125,38 @@ class TaggedStreamDemuxAsyncTests(unittest.IsolatedAsyncioTestCase):
             except OSError:
                 pass
 
+    async def test_iter_tokens_stops_on_stop_id(self) -> None:
+        r, w = os.pipe()
+        demux = TaggedStreamDemux(r)
+        await demux.start()
+
+        async def writer() -> None:
+            await asyncio.sleep(0.05)
+            os.write(
+                w,
+                pack_tagged_frame(7, 10)
+                + pack_tagged_frame(7, 99)  # stop
+                + pack_tagged_frame(7, 11)
+                + pack_tagged_frame(7, STREAM_DONE_SENTINEL),
+            )
+            os.close(w)
+
+        try:
+            asyncio.create_task(writer())
+            tokens = [
+                t
+                async for t in demux.iter_tokens(
+                    7, n_gen=8, stop_ids={99}, wall_timeout=2.0
+                )
+            ]
+            self.assertEqual(tokens, [10])
+        finally:
+            await demux.stop()
+            try:
+                os.close(r)
+            except OSError:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

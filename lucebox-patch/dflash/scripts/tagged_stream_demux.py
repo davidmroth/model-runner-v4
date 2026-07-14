@@ -186,11 +186,17 @@ class TaggedStreamDemux:
         stop_ids: set[int] | frozenset[int] | None = None,
         *,
         wall_timeout: float = 600.0,
+        post_token_idle: float = 3.0,
         queue: asyncio.Queue[StreamFrame | None] | None = None,
     ) -> AsyncIterator[int]:
-        """Yield vocab tokens for ``req_id`` until DONE, n_gen, or timeout.
+        """Yield vocab tokens for ``req_id`` until DONE, stop, n_gen, or timeout.
 
         CONTINUE frames are skipped (scheduler will emit more tokens later).
+        Stop ids end the stream (same as a soft EOS) — do not ``continue`` past
+        them or we hang waiting for DONE when the engine already finished.
+        ``post_token_idle`` mirrors legacy ``iter_pipe_tokens`` so a missing
+        DONE after the last vocab token cannot stall the HTTP handler.
+
         Pass ``queue`` from a prior :meth:`register` so the caller can write the
         daemon command before frames arrive (avoids a subscribe race).
         """
@@ -200,11 +206,17 @@ class TaggedStreamDemux:
         generated = 0
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wall_timeout
+        last_token_at: float | None = None
         try:
             while generated < n_gen:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
+                if last_token_at is not None:
+                    idle_left = post_token_idle - (loop.time() - last_token_at)
+                    if idle_left <= 0:
+                        break
+                    remaining = min(remaining, idle_left)
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=remaining)
                 except asyncio.TimeoutError:
@@ -212,15 +224,19 @@ class TaggedStreamDemux:
                 if item is None:
                     break
                 if item.kind == "cont":
+                    # CONTINUE means more tokens are scheduled later —
+                    # reset idle clock so we don't false-stop between quanta.
+                    last_token_at = loop.time()
                     continue
                 if item.kind == "done":
                     break
                 tok = item.value
-                if tok in stops:
-                    continue
                 if tok < 0:
                     continue
+                if tok in stops:
+                    break
                 generated += 1
+                last_token_at = loop.time()
                 yield tok
         finally:
             if own_reg:

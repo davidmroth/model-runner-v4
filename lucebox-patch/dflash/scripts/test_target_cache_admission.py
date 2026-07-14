@@ -84,6 +84,21 @@ class FormatSlotCommandTests(unittest.TestCase):
             append_restore_chain_quantum(with_snap, quantum=4),
             "RESTORE_CHAIN -1 4 /tmp/p.bin 12 4 snap=10:0\n",
         )
+        slotted = "SLOT 1 RESTORE_CHAIN -1 4 /tmp/p.bin 12\n"
+        self.assertEqual(
+            append_restore_chain_quantum(slotted, quantum=4),
+            "SLOT 1 RESTORE_CHAIN -1 4 /tmp/p.bin 12 4\n",
+        )
+        req_slot = "REQ 3 SLOT 0 RESTORE_CHAIN -1 4 /tmp/p.bin 12 snap=10:0\n"
+        self.assertEqual(
+            append_restore_chain_quantum(req_slot, quantum=8),
+            "REQ 3 SLOT 0 RESTORE_CHAIN -1 4 /tmp/p.bin 12 8 snap=10:0\n",
+        )
+        from target_cache_admission import is_restore_chain_command
+
+        self.assertTrue(is_restore_chain_command(slotted))
+        self.assertTrue(is_restore_chain_command(req_slot))
+        self.assertFalse(is_restore_chain_command("SLOT 0 /tmp/p.bin 8\n"))
         plan = ToolSplitPlan(
             prompt_bin_path="/tmp/p.bin",
             prompt_token_count=10,

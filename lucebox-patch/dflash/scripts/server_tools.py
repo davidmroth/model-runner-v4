@@ -115,6 +115,7 @@ from target_cache_admission import (
     TargetCacheSlotPool,
     append_restore_chain_quantum,
     format_slot_command,
+    is_restore_chain_command,
     multi_slot_drop_exclusive,
     overlap_mode_enabled,
     reset_active_live_slot,
@@ -648,11 +649,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     def _exit_daemon_admission(admission: _DaemonAdmission | None) -> None:
         if admission is None:
             return
-        if admission.exclusive:
-            daemon_lock.release()
-        reset_active_live_slot(admission.slot_tok)
-        if admission.lease is not None:
-            slot_pool.release(admission.lease)
+        try:
+            if admission.exclusive:
+                daemon_lock.release()
+        finally:
+            # Always clear ContextVar + lease — even if lock release or
+            # ContextVar.reset fails (SSE task-group context mismatch).
+            try:
+                reset_active_live_slot(admission.slot_tok)
+            except Exception as exc:
+                print(f"  [handler] reset_active_live_slot: {exc!r}", flush=True)
+            if admission.lease is not None:
+                try:
+                    slot_pool.release(admission.lease)
+                except Exception as exc:
+                    print(f"  [handler] slot_pool.release: {exc!r}", flush=True)
 
     def _write_daemon_cmd(cmd_line: str, *, req_id: int | None = None) -> None:
         """Write a daemon stdin line, adding ``SLOT k`` / ``REQ id`` when needed."""
@@ -675,19 +686,36 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         req_id: int | None,
         wall_timeout: float,
         use_stops: bool = True,
+        queue=None,
     ) -> list[int]:
-        """Read decode tokens for one request (tagged demux or legacy pipe)."""
+        """Read decode tokens for one request (tagged demux or legacy pipe).
+
+        When tagged demux owns ``r_pipe``, never call ``iter_pipe_tokens`` /
+        ``drain_pipe_residual`` on that fd — dual readers desync the frame parser.
+        """
         stops = stop_ids if use_stops else frozenset()
-        if tagged_demux is not None and req_id is not None:
-            return [
-                t
-                async for t in tagged_demux.iter_tokens(
-                    req_id,
-                    gen_len,
-                    stops,
-                    wall_timeout=wall_timeout,
-                )
-            ]
+        if tagged_demux is not None:
+            rid = req_id
+            q = queue
+            own_reg = False
+            if rid is None:
+                rid = tagged_demux.alloc_req_id()
+                q = await tagged_demux.register(rid)
+                own_reg = True
+            try:
+                return [
+                    t
+                    async for t in tagged_demux.iter_tokens(
+                        rid,
+                        gen_len,
+                        stops,
+                        wall_timeout=wall_timeout,
+                        queue=q,
+                    )
+                ]
+            finally:
+                if own_reg:
+                    await tagged_demux.unregister(rid)
         return await asyncio.to_thread(
             lambda: list(
                 iter_pipe_tokens(
@@ -720,7 +748,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             overlap_mode_enabled()
             and multi_slot_drop_exclusive()
             and tagged_demux is not None
-            and "RESTORE_CHAIN" in cmd.upper()
+            and is_restore_chain_command(cmd)
         )
         if use_admit:
             cmd = append_restore_chain_quantum(cmd)
@@ -928,20 +956,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 f"RESTORE_CHAIN -1 {tool_slot} {tail_bin} 1",
                 (conv_slot, conv_cut),
             ) + "\n"
-            drain_pipe_residual(r_pipe)
             bus.begin_request()
-            _write_daemon_cmd(line)
+            snap_req: int | None = None
+            snap_q = None
+            if tagged_demux is not None:
+                snap_req = tagged_demux.alloc_req_id()
+                snap_q = await tagged_demux.register(snap_req)
+            else:
+                drain_pipe_residual(r_pipe)
             try:
-                await asyncio.to_thread(
-                    lambda: list(
-                        iter_pipe_tokens(
-                            r_pipe,
-                            1,
-                            stop_ids,
-                            bus=bus,
-                            wall_timeout=120.0,
-                        )
-                    ),
+                await _write_daemon_cmd_async(line, req_id=snap_req)
+                await _collect_gen_tokens(
+                    1,
+                    req_id=snap_req,
+                    wall_timeout=120.0,
+                    use_stops=True,
+                    queue=snap_q,
                 )
                 # The deferred conv snap only needs the inline snap ack; skip
                 # drain_timings entirely.  The target-split RESTORE_CHAIN timing
@@ -960,6 +990,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     scope=job.cache_scope,
                 )
             finally:
+                if tagged_demux is not None and snap_req is not None:
+                    await tagged_demux.unregister(snap_req)
                 try:
                     tail_bin.unlink()
                 except Exception:
@@ -1381,20 +1413,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     if tool_snap is not None:
                         cmd = append_inline_snap(cmd, tool_snap)
                     cmd += "\n"
-                    drain_pipe_residual(r_pipe)
                     bus.begin_request()
-                    _write_daemon_cmd(cmd)
-                    await asyncio.to_thread(
-                        lambda: list(
-                            iter_pipe_tokens(
-                                r_pipe,
-                                1,
-                                stop_ids,
-                                bus=bus,
-                                wall_timeout=request_wall_timeout_seconds(),
-                            )
-                        ),
-                    )
+                    # Tagged demux owns r_pipe — never drain/iter the same fd.
+                    warm_req: int | None = None
+                    warm_q = None
+                    if tagged_demux is not None:
+                        warm_req = tagged_demux.alloc_req_id()
+                        warm_q = await tagged_demux.register(warm_req)
+                    try:
+                        await _write_daemon_cmd_async(cmd, req_id=warm_req)
+                        await _collect_gen_tokens(
+                            1,
+                            req_id=warm_req,
+                            wall_timeout=request_wall_timeout_seconds(),
+                            use_stops=True,
+                            queue=warm_q,
+                        )
+                    finally:
+                        if tagged_demux is not None and warm_req is not None:
+                            await tagged_demux.unregister(warm_req)
+                    await bus.drain_timings()
+                    if tagged_demux is None:
+                        drain_pipe_residual(r_pipe)
                     pinned = False
                     if tool_snap is not None:
                         pinned = await finish_tool_inline_snap(

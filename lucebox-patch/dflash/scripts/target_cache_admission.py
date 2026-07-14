@@ -60,24 +60,67 @@ def schedule_quantum() -> int:
     return max(1, min(n, 4096))
 
 
+def _peel_req_slot_prefixes(body: str) -> tuple[str, str]:
+    """Split leading ``REQ`` / ``SLOT`` tokens from a daemon command body.
+
+    Returns ``(prefix_with_trailing_space, remainder)``. Prefix is empty when
+    neither decorator is present.
+    """
+    prefixes: list[str] = []
+    rest = body.strip()
+    while rest:
+        upper = rest.upper()
+        if upper.startswith("REQ ") or upper.startswith("REQUEST "):
+            skip = 8 if upper.startswith("REQUEST ") else 4
+            p = skip
+            while p < len(rest) and rest[p].isspace():
+                p += 1
+            while p < len(rest) and not rest[p].isspace():
+                p += 1
+            prefixes.append(rest[:p].strip())
+            rest = rest[p:].lstrip()
+            continue
+        if upper.startswith("SLOT "):
+            p = 5
+            while p < len(rest) and rest[p].isspace():
+                p += 1
+            while p < len(rest) and not rest[p].isspace():
+                p += 1
+            prefixes.append(rest[:p].strip())
+            rest = rest[p:].lstrip()
+            continue
+        break
+    prefix = (" ".join(prefixes) + " ") if prefixes else ""
+    return prefix, rest
+
+
+def is_restore_chain_command(line: str) -> bool:
+    """True when the command is RESTORE_CHAIN after optional REQ/SLOT prefixes."""
+    body = line[:-1] if line.endswith("\n") else line
+    _, rest = _peel_req_slot_prefixes(body.strip())
+    return rest.upper().startswith("RESTORE_CHAIN ")
+
+
 def append_restore_chain_quantum(line: str, quantum: int | None = None) -> str:
     """Append ``<quantum>`` to a RESTORE_CHAIN line when missing.
 
     Leaves non-RESTORE_CHAIN lines and already-quantized lines unchanged.
+    Honors leading ``REQ`` / ``SLOT`` prefixes produced by format helpers.
     """
     q = schedule_quantum() if quantum is None else max(1, int(quantum))
     nl = line.endswith("\n")
     body = line[:-1] if nl else line
     body = body.strip()
-    if not body.upper().startswith("RESTORE_CHAIN "):
+    prefix, rest = _peel_req_slot_prefixes(body)
+    if not rest.upper().startswith("RESTORE_CHAIN "):
         return line
     # Strip trailing snap= so quantum sits before snap=.
     snap = ""
-    if " snap=" in body:
-        body, snap_part = body.split(" snap=", 1)
+    if " snap=" in rest:
+        rest, snap_part = rest.split(" snap=", 1)
         snap = f" snap={snap_part}"
-        body = body.strip()
-    parts = body.split()
+        rest = rest.strip()
+    parts = rest.split()
     # RESTORE_CHAIN thick thin path n_gen [quantum]
     if len(parts) >= 6:
         try:
@@ -87,9 +130,8 @@ def append_restore_chain_quantum(line: str, quantum: int | None = None) -> str:
             pass
     if len(parts) < 5:
         return line
-    body = f"{' '.join(parts[:5])} {q}{snap}"
-    return body + ("\n" if nl else "")
-
+    rest = f"{' '.join(parts[:5])} {q}{snap}"
+    return f"{prefix}{rest}" + ("\n" if nl else "")
 
 def format_req_prefix_needed() -> bool:
     """Commands should carry ``REQ <id>`` when the daemon uses tagged emit."""
@@ -104,8 +146,20 @@ def set_active_live_slot(slot: int) -> Token:
     return _active_live_slot.set(int(slot))
 
 
-def reset_active_live_slot(token: Token) -> None:
-    _active_live_slot.reset(token)
+def reset_active_live_slot(token: Token | None) -> None:
+    """Reset the live-slot ContextVar; tolerate cross-context SSE teardown.
+
+    Starlette/anyio may run StreamingResponse finally in a different context
+    than the one that called ``set_active_live_slot``. ``Token.reset`` then
+    raises ``ValueError`` and would otherwise skip lease release.
+    """
+    if token is None:
+        _active_live_slot.set(None)
+        return
+    try:
+        _active_live_slot.reset(token)
+    except ValueError:
+        _active_live_slot.set(None)
 
 
 def format_slot_command(

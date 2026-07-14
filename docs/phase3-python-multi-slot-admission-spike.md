@@ -1,6 +1,6 @@
 # Phase 3 spike — Python multi-slot admission
 
-**Status:** M3a green · M3b demux smoke green · warm `RESTORE_CHAIN` admit smoke PASSED (2026-07-14) · HTTP SCHED driver next · compose stays **N=1**  
+**Status:** M3a green · M3b demux/cold/warm side-binary green · warm admit PASSED · **HTTP overlap smoke PASSED** (2026-07-14) · compose ready for **N=2**  
 **Branch:** `feat/native-mmproj-multi-request`  
 **Parent:** [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)  
 **Prereq:** Phase 2 M2b green ([phase2-layer-split-multi-slot-spike.md](./phase2-layer-split-multi-slot-spike.md))
@@ -43,8 +43,8 @@ Ship as two slices so we never enable compose `N=2` without demux.
 | Cold overlap smoke | `phase3_multi_slot_overlap_smoke.py` START+SCHED_DRAIN | PASSED |
 | Warm admit (C++) | `RESTORE_CHAIN … total quantum` → `ok RESTORE_CHAIN_ADMIT` + CONTINUE; SCHED_* completes | **PASSED** (`phase3_warm_restore_admit_smoke.py`, 24 tagged toks, req 1+2) |
 | HTTP wire | Prefix `REQ <id>` + demux collect for chat | chat path (default tagged off) |
-| HTTP SCHED driver | After warm admit, emit `SCHED_DRAIN` while demux collects | next |
-| Drop exclusive + deploy N=2 | After HTTP SCHED green | blocked |
+| HTTP SCHED driver | After warm admit, emit `SCHED_DRAIN`; quantum must survive `SLOT`/`REQ` prefixes | **PASSED** (`phase3_http_overlap_smoke.py`) |
+| Drop exclusive + deploy N=2 | After HTTP overlap smoke green | **ready** |
 
 **Protocol (warm):**
 ```text
@@ -65,6 +65,10 @@ Omitting `<quantum>` keeps legacy blocking full generate (prod N=1).
 | `DFLASH_LEGACY_DAEMON=1` | Affects **single-GPU** only; layer-split uses `daemon_loop` |
 | Exclusive lock + dual lease | Capacity alone does not multiplex tokens; demux + START/SCHED is M3b |
 | Tool thin pins | Process-global; shared across live slots (M2b certified) |
+| `append_restore_chain_quantum` + `SLOT` prefix | Prefixed lines skipped quantum → blocking restore + hung ADMIT wait (fixed) |
+| Tagged demux + warmup dual-read | Warmup `iter_pipe_tokens` raced demux on `r_pipe` (fixed) |
+| Demux `stop_ids` `continue` | EOS skipped → hang waiting for DONE (fixed: break + idle) |
+| ContextVar reset in SSE teardown | Slot lease leak → 503 slot wait (fixed) |
 
 ---
 
@@ -77,3 +81,5 @@ Omitting `<quantum>` keeps legacy blocking full generate (prod N=1).
 5. Unit smoke `test_target_cache_admission.py`
 6. `tagged_stream_demux.py` + `phase3_multi_slot_overlap_smoke.py`
 7. HTTP demux + drop exclusive + warm-overlap path
+8. `phase3_http_overlap_smoke.py` behind `GATE_PHASE3_HTTP_OVERLAP=1` — **PASSED**
+9. Deploy compose `N=2` + tagged + drop-exclusive; manual chat∩cron check
