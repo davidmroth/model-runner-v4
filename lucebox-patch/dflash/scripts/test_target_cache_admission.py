@@ -1,0 +1,170 @@
+"""Unit tests for Phase 3 M3a target-cache slot admission."""
+from __future__ import annotations
+
+import asyncio
+import os
+import unittest
+from unittest.mock import patch
+
+from target_cache_admission import (
+    TargetCacheSlotPool,
+    format_slot_command,
+    multi_slot_drop_exclusive,
+    set_active_live_slot,
+    stream_tagged_enabled,
+    target_cache_slots,
+)
+from tool_split.daemon_bridge import snapshot_thin
+from tool_split.orchestrator import ToolSplitOrchestrator, ToolSplitPlan
+
+
+class ConfigHelpersTests(unittest.TestCase):
+    def test_target_cache_slots_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DFLASH_TARGET_CACHE_SLOTS", None)
+            self.assertEqual(target_cache_slots(), 1)
+
+    def test_target_cache_slots_clamp(self) -> None:
+        with patch.dict(os.environ, {"DFLASH_TARGET_CACHE_SLOTS": "99"}):
+            self.assertEqual(target_cache_slots(), 16)
+        with patch.dict(os.environ, {"DFLASH_TARGET_CACHE_SLOTS": "0"}):
+            self.assertEqual(target_cache_slots(), 1)
+
+    def test_stream_tagged_and_drop_exclusive_flags(self) -> None:
+        with patch.dict(os.environ, {"DFLASH_STREAM_TAGGED": "1"}):
+            self.assertTrue(stream_tagged_enabled())
+        with patch.dict(os.environ, {"DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "yes"}):
+            self.assertTrue(multi_slot_drop_exclusive())
+        with patch.dict(
+            os.environ,
+            {"DFLASH_STREAM_TAGGED": "0", "DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "0"},
+        ):
+            self.assertFalse(stream_tagged_enabled())
+            self.assertFalse(multi_slot_drop_exclusive())
+
+
+class FormatSlotCommandTests(unittest.TestCase):
+    def test_n1_unchanged(self) -> None:
+        line = "RESTORE_CHAIN -1 4 /tmp/p.bin 8\n"
+        self.assertEqual(format_slot_command(line, slot=0, slots=1), line)
+
+    def test_n2_prefixes_slot(self) -> None:
+        line = "RESTORE_CHAIN -1 4 /tmp/p.bin 8\n"
+        self.assertEqual(
+            format_slot_command(line, slot=1, slots=2),
+            "SLOT 1 RESTORE_CHAIN -1 4 /tmp/p.bin 8\n",
+        )
+
+    def test_uses_active_context_slot(self) -> None:
+        tok = set_active_live_slot(0)
+        try:
+            out = format_slot_command("SNAPSHOT_THIN 4 0 10\n", slots=2)
+            self.assertEqual(out, "SLOT 0 SNAPSHOT_THIN 4 0 10\n")
+        finally:
+            from target_cache_admission import reset_active_live_slot
+
+            reset_active_live_slot(tok)
+
+    def test_n2_without_slot_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            format_slot_command("RESTORE 0 /tmp/p.bin 4\n", slots=2)
+
+    def test_orchestrator_and_snapshot_thin_emit_slot(self) -> None:
+        plan = ToolSplitPlan(
+            prompt_bin_path="/tmp/p.bin",
+            prompt_token_count=10,
+            tool_slot=4,
+            conv_restore_slot=-1,
+            conv_restore_prefix_len=0,
+            use_restore_chain=True,
+            thin_slot_ids=[4],
+            inline_snap=None,
+            compression_fired=False,
+            started_in_thinking=False,
+            tools_fingerprint="fp",
+            pending_tool_snap=None,
+            tool_prefix_len=8,
+        )
+        # ToolSplitOrchestrator.format_daemon_command needs a real object — call helper path.
+        orch = object.__new__(ToolSplitOrchestrator)
+        with patch.dict(os.environ, {"DFLASH_TARGET_CACHE_SLOTS": "2"}):
+            tok = set_active_live_slot(1)
+            try:
+                line = ToolSplitOrchestrator.format_daemon_command(orch, plan, 4)
+                self.assertTrue(line.startswith("SLOT 1 RESTORE_CHAIN "), line)
+            finally:
+                from target_cache_admission import reset_active_live_slot
+
+                reset_active_live_slot(tok)
+
+
+class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dual_admit_and_third_waits(self) -> None:
+        pool = TargetCacheSlotPool(2)
+        a = await pool.acquire("conv:a", scoped=True)
+        b = await pool.acquire("conv:b", scoped=True)
+        self.assertEqual({a.slot, b.slot}, {0, 1})
+
+        third = asyncio.create_task(pool.acquire("conv:c", scoped=True, max_wait=0.05))
+        with self.assertRaises(asyncio.TimeoutError):
+            await third
+
+        pool.release(a)
+        c = await pool.acquire("conv:c", scoped=True, max_wait=1.0)
+        self.assertEqual(c.slot, a.slot)
+        pool.release(b)
+        pool.release(c)
+
+    async def test_sticky_affinity(self) -> None:
+        pool = TargetCacheSlotPool(2)
+        a1 = await pool.acquire("conv:sticky", scoped=True)
+        other = await pool.acquire("conv:other", scoped=True)
+        slot = a1.slot
+        self.assertNotEqual(other.slot, slot)
+        pool.release(a1)
+        a2 = await pool.acquire("conv:sticky", scoped=True)
+        self.assertEqual(a2.slot, slot)
+        pool.release(other)
+        pool.release(a2)
+
+    async def test_lease_context_sets_active_slot(self) -> None:
+        pool = TargetCacheSlotPool(2)
+        async with pool.lease("conv:x", scoped=True) as lease:
+            self.assertEqual(format_slot_command("RESTORE 0 /t 2\n", slots=2),
+                             f"SLOT {lease.slot} RESTORE 0 /t 2\n")
+
+
+class SnapshotThinSlotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_thin_prefixes_slot(self) -> None:
+        written: list[str] = []
+
+        class _Stdin:
+            def write(self, data: bytes) -> None:
+                written.append(data.decode("utf-8"))
+
+            def flush(self) -> None:
+                pass
+
+        async def await_reply(prefix: str, timeout: float = 30.0) -> str:
+            return "[snap] thin slot=4 kv=0,8"
+
+        with patch.dict(os.environ, {"DFLASH_TARGET_CACHE_SLOTS": "2"}):
+            tok = set_active_live_slot(0)
+            try:
+                ok = await snapshot_thin(
+                    daemon_stdin=_Stdin(),
+                    await_reply=await_reply,
+                    slot=4,
+                    kv_start=0,
+                    kv_end=8,
+                )
+            finally:
+                from target_cache_admission import reset_active_live_slot
+
+                reset_active_live_slot(tok)
+        self.assertTrue(ok)
+        self.assertEqual(written, ["SLOT 0 SNAPSHOT_THIN 4 0 8\n"])
+
+
+if __name__ == "__main__":
+    unittest.main()

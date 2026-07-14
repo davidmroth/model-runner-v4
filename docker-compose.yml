@@ -83,6 +83,10 @@ services:
       DFLASH_REQUEST_WALL_TIMEOUT_SEC: ${DFLASH_REQUEST_WALL_TIMEOUT_SEC:-600}
       DFLASH_TOOL_SNAPSHOT_MAX_KV: ${DFLASH_TOOL_SNAPSHOT_MAX_KV:-16384}
       DFLASH_QUIET_ACCESS_LOGS: ${DFLASH_QUIET_ACCESS_LOGS:-1}
+      # Phase 3 multi-slot — keep N=1 until M3b tagged demux is green.
+      DFLASH_TARGET_CACHE_SLOTS: ${DFLASH_TARGET_CACHE_SLOTS:-1}
+      DFLASH_STREAM_TAGGED: ${DFLASH_STREAM_TAGGED:-0}
+      DFLASH_MULTI_SLOT_DROP_EXCLUSIVE: ${DFLASH_MULTI_SLOT_DROP_EXCLUSIVE:-0}
       # CUDA graphs reset on every spec-decode step (variable batch sizes in verify+replay).
       # Per-step timing probe: verify=150ms, replay=144ms at 1.5K ctx (12x over bandwidth bound).
       # Disabling graphs eliminates the ~134ms/phase recompile overhead → expected 6x decode speedup.

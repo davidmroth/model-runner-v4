@@ -1,8 +1,9 @@
 # Phase 2 spike — Layer-split multi-slot
 
-**Status:** M2b smoke PASSED on ai.local (2026-07-14) · Phase 3 next  
+**Status:** M2b smoke PASSED on ai.local (2026-07-14) · Phase 3 M3a next  
 **Branch:** `feat/native-mmproj-multi-request`  
 **Parent:** [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)
+**Phase 3 spike:** [phase3-python-multi-slot-admission-spike.md](./phase3-python-multi-slot-admission-spike.md)
 
 ---
 

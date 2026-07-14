@@ -76,7 +76,9 @@ async def snapshot_thin(
     kv_end: int,
 ) -> bool:
     """Capture KV range ``[kv_start, kv_end)`` into a thin snapshot slot."""
-    line = f"SNAPSHOT_THIN {slot} {kv_start} {kv_end}\n"
+    from target_cache_admission import format_slot_command
+
+    line = format_slot_command(f"SNAPSHOT_THIN {slot} {kv_start} {kv_end}\n")
     daemon_stdin.write(line.encode("utf-8"))
     daemon_stdin.flush()
     try:

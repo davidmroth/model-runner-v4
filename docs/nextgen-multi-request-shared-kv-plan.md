@@ -1,12 +1,13 @@
 # Next-Gen Plan: Multi-Request Admission + Shared KV Pages
 
-**Status:** Phase 0 done · Phase 1 gate passed (2026-07-13) · Phase 2 next · July 2026  
+**Status:** Phase 0 done · Phase 1 gate passed (2026-07-13) · Phase 2 M2b green (2026-07-14) · Phase 3 M3a in progress · July 2026  
 **Branches:** `feat/native-mmproj-multi-request` (`lucebox-hub`, `model-runner-v4`)  
 **Related:** [research-nextgen-archecture.md](./research-nextgen-archecture.md) (GPU1 roles),
 [ephemeral-503-flood-fix-plan.md](./ephemeral-503-flood-fix-plan.md) (lock/503 behavior),
 [lucebox-sharded-snapshots-spec.md](./lucebox-sharded-snapshots-spec.md) (RESTORE_CHAIN),
 [inference-engine-north-star.md](./inference-engine-north-star.md),
-[warm-ttft-and-usage-timings.md](./warm-ttft-and-usage-timings.md) (warm deepen + WebUI metrics)
+[warm-ttft-and-usage-timings.md](./warm-ttft-and-usage-timings.md) (warm deepen + WebUI metrics),
+[phase3-python-multi-slot-admission-spike.md](./phase3-python-multi-slot-admission-spike.md)
 
 This plan turns the multi-request / shared-KV conversation into **deployable
 phases**. It does **not** replace layer-split or tool-split; it sits on top of
@@ -239,9 +240,15 @@ layer-split `usage.timings` parse for WebUI metrics — see
 ### Phase 3 — Python multi-slot admission
 
 **Repos:** `model-runner-v4` `lucebox-patch/dflash/scripts/`  
-**Deploy:** lucebox recreate; `DFLASH_TARGET_CACHE_SLOTS=2` (name TBD)
+**Spike:** [phase3-python-multi-slot-admission-spike.md](./phase3-python-multi-slot-admission-spike.md)  
+**Deploy:** lucebox recreate; `DFLASH_TARGET_CACHE_SLOTS=2` only after **M3b** demux
 
-| Work | Detail |
+| Slice | Work | Detail |
+|-------|------|--------|
+| **M3a** | Plumb + SLOT + sticky lease | Env/CLI; `format_slot_command`; `TargetCacheSlotPool`; keep exclusive lock unless `DFLASH_MULTI_SLOT_DROP_EXCLUSIVE=1`; compose **N=1** |
+| **M3b** | Demux + drop exclusive | Tagged stream → SSE; speak scheduler; chat∩cron; then `N=2` |
+
+| Work (full) | Detail |
 |------|--------|
 | Replace exclusive lock | Slot allocator: conversation → slot; free list; wait queue |
 | Protocol driver | Speak scheduler + demux tagged stream → per-HTTP SSE |
@@ -251,9 +258,8 @@ layer-split `usage.timings` parse for WebUI metrics — see
 
 **Exit gate:**
 
-- Manual: chat stream + cron completion overlapping; cron succeeds or waits.
-- Cert: warm tool path, vision smoke, no exclusive-lock 503 under controlled overlap.
-- Metrics: log `slot_id`, `queue_wait_ms`, `quantum` stats.
+- **M3a:** unit smoke `test_target_cache_admission` green; prod defaults N=1 healthy.
+- **M3b / product:** Manual chat stream + cron completion overlapping; cert warm tool path + vision; metrics `slot_id`, `queue_wait_ms`.
 
 ---
 

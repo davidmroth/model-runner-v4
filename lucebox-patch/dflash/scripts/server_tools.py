@@ -111,6 +111,15 @@ from handler_reliability import (
     scoped_lock_priority_enabled,
     should_log_ephemeral_busy,
 )
+from target_cache_admission import (
+    TargetCacheSlotPool,
+    format_slot_command,
+    multi_slot_drop_exclusive,
+    reset_active_live_slot,
+    set_active_live_slot,
+    stream_tagged_enabled,
+    target_cache_slots,
+)
 
 # Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "add_generation_prompt", "tools"})
@@ -529,6 +538,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         )
     app = FastAPI(title="Luce DFlash OpenAI server (tool-aware)")
     daemon_lock = PriorityDaemonLock()
+    live_slots_n = target_cache_slots()
+    slot_pool = TargetCacheSlotPool(live_slots_n)
+    if live_slots_n > 1:
+        print(
+            f"  [cfg] target_cache_slots={live_slots_n} "
+            f"stream_tagged={1 if stream_tagged_enabled() else 0} "
+            f"drop_exclusive={1 if multi_slot_drop_exclusive() else 0}",
+            flush=True,
+        )
+
+    class _DaemonAdmission:
+        __slots__ = ("lease", "slot_tok", "exclusive")
+
+        def __init__(self, lease, slot_tok, exclusive: bool) -> None:
+            self.lease = lease
+            self.slot_tok = slot_tok
+            self.exclusive = exclusive
 
     async def _acquire_daemon_lock(
         label: str,
@@ -572,18 +598,77 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
             raise DaemonBusyError(label)
 
+    async def _enter_daemon_admission(
+        label: str,
+        *,
+        max_wait: float | None = None,
+        scoped: bool = True,
+        affinity_key: str | None = None,
+    ) -> _DaemonAdmission:
+        """Lease a live target-cache SLOT (N>1) and optionally the exclusive pipe lock."""
+        wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
+        lease = None
+        key = affinity_key or (f"scoped:{label}" if scoped else f"ephemeral:{label}")
+        if live_slots_n > 1:
+            try:
+                lease = await slot_pool.acquire(key, scoped=scoped, max_wait=wait_sec)
+            except asyncio.TimeoutError:
+                print(
+                    f"  [handler] target_cache_slot wait timed out after "
+                    f"{wait_sec:.0f}s ({label})",
+                    flush=True,
+                )
+                raise DaemonBusyError(label)
+            slot_tok = set_active_live_slot(lease.slot)
+            print(
+                f"  [handler] target_cache_slot={lease.slot} ({label})",
+                flush=True,
+            )
+        else:
+            slot_tok = set_active_live_slot(0)
+
+        exclusive = live_slots_n <= 1 or not multi_slot_drop_exclusive()
+        try:
+            if exclusive:
+                await _acquire_daemon_lock(label, max_wait=max_wait, scoped=scoped)
+        except Exception:
+            reset_active_live_slot(slot_tok)
+            if lease is not None:
+                slot_pool.release(lease)
+            raise
+        return _DaemonAdmission(lease, slot_tok, exclusive)
+
+    def _exit_daemon_admission(admission: _DaemonAdmission | None) -> None:
+        if admission is None:
+            return
+        if admission.exclusive:
+            daemon_lock.release()
+        reset_active_live_slot(admission.slot_tok)
+        if admission.lease is not None:
+            slot_pool.release(admission.lease)
+
+    def _write_daemon_cmd(cmd_line: str) -> None:
+        """Write a daemon stdin line, adding ``SLOT k`` when N>1."""
+        line = format_slot_command(cmd_line)
+        daemon_proc.stdin.write(line.encode("utf-8"))
+        daemon_proc.stdin.flush()
+
     @asynccontextmanager
     async def _daemon_request_lock(
         label: str,
         *,
         max_wait: float | None = None,
         scoped: bool = True,
+        affinity_key: str | None = None,
     ):
-        await _acquire_daemon_lock(label, max_wait=max_wait, scoped=scoped)
+        """Admit one in-flight daemon request (N=1 exclusive; N>1 sticky SLOT)."""
+        admission = await _enter_daemon_admission(
+            label, max_wait=max_wait, scoped=scoped, affinity_key=affinity_key,
+        )
         try:
             yield
         finally:
-            daemon_lock.release()
+            _exit_daemon_admission(admission)
 
     def _busy_response(*, retry_after_sec: float | None = None) -> JSONResponse:
         # 503 when lock-wait cap is exceeded (streaming acquires lock before 200).
@@ -723,8 +808,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             ) + "\n"
             drain_pipe_residual(r_pipe)
             bus.begin_request()
-            daemon_proc.stdin.write(line.encode("utf-8"))
-            daemon_proc.stdin.flush()
+            _write_daemon_cmd(line)
             try:
                 await asyncio.to_thread(
                     lambda: list(
@@ -776,6 +860,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 "deferred-conv-snap",
                 max_wait=request_wall_timeout_seconds(),
                 scoped=scoped,
+                affinity_key=job.cache_scope,
             ):
                 await _restart_daemon_if_dead()
                 await _execute_deferred_conv_snap_job(job)
@@ -937,12 +1022,24 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         """Build daemon stdin line, optional inline snap_prep, conv prefix len, tool snap."""
         if full_hit is not None:
             slot, cached_cur_bin, cached_len = full_hit
-            return f"RESTORE {slot} {cached_cur_bin} {gen_len}\n", None, cached_len, None
+            return (
+                format_slot_command(f"RESTORE {slot} {cached_cur_bin} {gen_len}\n"),
+                None,
+                cached_len,
+                None,
+            )
         if compression_fired:
             if full_snap_prep is not None:
                 fslot, _ = full_snap_prep
-                return f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n", None, None, None
-            return f"{cur_bin} {gen_len}\n", None, None, None
+                return (
+                    format_slot_command(
+                        f"{cur_bin} {gen_len} snap={len(cur_ids)}:{fslot}\n"
+                    ),
+                    None,
+                    None,
+                    None,
+                )
+            return format_slot_command(f"{cur_bin} {gen_len}\n"), None, None, None
 
         hit = prefix_cache.lookup(prompt_ids, scope=cache_scope)
         conv_prefix_len = hit[1] if hit else None
@@ -1012,7 +1109,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             cmd = append_inline_snap(cmd, tool_snap_prep)
         elif snap_prep:
             cmd = append_inline_snap(cmd, snap_prep)
-        return cmd + "\n", snap_prep, conv_prefix_len, tool_snap_prep
+        return format_slot_command(cmd + "\n"), snap_prep, conv_prefix_len, tool_snap_prep
 
     async def _commit_tool_snap_if_needed(
         tool_ctx: ToolRequestContext | None,
@@ -1157,8 +1254,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cmd += "\n"
                     drain_pipe_residual(r_pipe)
                     bus.begin_request()
-                    daemon_proc.stdin.write(cmd.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                    _write_daemon_cmd(cmd)
                     await asyncio.to_thread(
                         lambda: list(
                             iter_pipe_tokens(
@@ -1578,9 +1674,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         if req.stream:
             # Streaming vision response (SSE)
+            admission = None
             try:
-                await _acquire_daemon_lock("chat-vision-stream",
-                                           max_wait=lock_wait, scoped=scoped)
+                admission = await _enter_daemon_admission(
+                    "chat-vision-stream",
+                    max_wait=lock_wait,
+                    scoped=scoped,
+                )
             except DaemonBusyError:
                 _cleanup()
                 return _busy_response(retry_after_sec=lock_wait)
@@ -1589,13 +1689,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             finish_reason = "stop"
 
             async def sse_vision() -> AsyncIterator[str]:
-                nonlocal completion_tokens, finish_reason
+                nonlocal completion_tokens, finish_reason, admission
                 try:
                     await _restart_daemon_if_dead()
                     drain_pipe_residual(r_pipe)
                     bus.begin_request()
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                    _write_daemon_cmd(cmd_line)
 
                     stops = normalize_stop(req.stop)
                     wall_timeout_sec = request_wall_timeout_seconds()
@@ -1658,51 +1757,49 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 finally:
-                    daemon_lock.release()
+                    _exit_daemon_admission(admission)
+                    admission = None
                     _cleanup()
 
             return StreamingResponse(sse_vision(), media_type="text/event-stream")
 
         # Non-streaming vision response
         try:
-            await _acquire_daemon_lock("chat-vision", max_wait=lock_wait,
-                                       scoped=scoped)
+            async with _daemon_request_lock(
+                "chat-vision", max_wait=lock_wait, scoped=scoped,
+            ):
+                await _restart_daemon_if_dead()
+                drain_pipe_residual(r_pipe)
+                bus.begin_request()
+                _write_daemon_cmd(cmd_line)
+
+                # Multimodal uses AR decode: tokens hit the pipe before the
+                # ``ok N=… gen=…`` line. Read concurrently (same as text chat);
+                # do not await ``ok`` first or completion_tokens stays 0.
+                wall_timeout_sec = request_wall_timeout_seconds()
+                tokens = await asyncio.to_thread(
+                    lambda: list(
+                        iter_pipe_tokens(
+                            r_pipe,
+                            gen_len,
+                            bus=bus,
+                            wall_timeout=wall_timeout_sec,
+                        )
+                    ),
+                )
+                await bus.drain_timings()
+
+                text = tokenizer.decode(tokens, skip_special_tokens=True)
+                stops = normalize_stop(req.stop)
+                if stops:
+                    i = first_stop_match(text, stops)
+                    if i != -1:
+                        text = text[:i]
+                text, _reasoning = parse_reasoning(text, thinking_enabled=False)
         except DaemonBusyError:
             _cleanup()
             return _busy_response(retry_after_sec=lock_wait)
-
-        try:
-            await _restart_daemon_if_dead()
-            drain_pipe_residual(r_pipe)
-            bus.begin_request()
-            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-            daemon_proc.stdin.flush()
-
-            # Multimodal uses AR decode: tokens hit the pipe before the
-            # ``ok N=… gen=…`` line. Read concurrently (same as text chat);
-            # do not await ``ok`` first or completion_tokens stays 0.
-            wall_timeout_sec = request_wall_timeout_seconds()
-            tokens = await asyncio.to_thread(
-                lambda: list(
-                    iter_pipe_tokens(
-                        r_pipe,
-                        gen_len,
-                        bus=bus,
-                        wall_timeout=wall_timeout_sec,
-                    )
-                ),
-            )
-            await bus.drain_timings()
-
-            text = tokenizer.decode(tokens, skip_special_tokens=True)
-            stops = normalize_stop(req.stop)
-            if stops:
-                i = first_stop_match(text, stops)
-                if i != -1:
-                    text = text[:i]
-            text, _reasoning = parse_reasoning(text, thinking_enabled=False)
         finally:
-            daemon_lock.release()
             _cleanup()
 
         return JSONResponse({
@@ -1826,7 +1923,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
         deferred_job: _DeferredConvSnapJob | None = None
         try:
-            async with _daemon_request_lock("chat", max_wait=lock_wait, scoped=scoped):
+            async with _daemon_request_lock("chat", max_wait=lock_wait, scoped=scoped,
+                                           affinity_key=cache_scope):
                 await _restart_daemon_if_dead()
                 (
                     cur_bin,
@@ -1856,8 +1954,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 )
                 drain_pipe_residual(r_pipe)
                 bus.begin_request()
-                daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                daemon_proc.stdin.flush()
+                _write_daemon_cmd(cmd_line)
                 snap_ok = False
                 try:
                     wall_timeout_sec = request_wall_timeout_seconds()
@@ -2009,11 +2106,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         wall_timeout_sec = request_wall_timeout_seconds()
         scoped = not is_ephemeral_cache_scope(cache_scope)
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
-        lock_held = False
+        admission = None
         try:
-            await _acquire_daemon_lock(
-                "chat-stream", max_wait=lock_wait, scoped=scoped)
-            lock_held = True
+            admission = await _enter_daemon_admission(
+                "chat-stream",
+                max_wait=lock_wait,
+                scoped=scoped,
+                affinity_key=cache_scope,
+            )
         except DaemonBusyError:
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
@@ -2030,7 +2130,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                   "finish_reason": finish}]}
 
         async def sse() -> AsyncIterator[str]:
-            nonlocal prompt_bin, prompt_len, started_in_thinking, gen_len, lock_held
+            nonlocal prompt_bin, prompt_len, started_in_thinking, gen_len, admission
             snap_prep = None
             tool_snap_prep = None
             conv_prefix_len = None
@@ -2096,8 +2196,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 )
                 drain_pipe_residual(r_pipe)
                 bus.begin_request()
-                daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                daemon_proc.stdin.flush()
+                _write_daemon_cmd(cmd_line)
 
                 mode = "reasoning" if started_in_thinking else "content"
                 window = ""
@@ -2347,9 +2446,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         except Exception:
                             pass
             finally:
-                if lock_held:
-                    daemon_lock.release()
-                    lock_held = False
+                if admission is not None:
+                    _exit_daemon_admission(admission)
+                    admission = None
                 if pending_deferred_jobs:
                     _schedule_deferred_conv_snap_jobs(pending_deferred_jobs)
                     pending_deferred_jobs.clear()
@@ -2501,7 +2600,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
-                async with _daemon_request_lock("anthropic-stream"):
+                async with _daemon_request_lock(
+                    "anthropic-stream", affinity_key=cache_scope,
+                    scoped=not is_ephemeral_cache_scope(cache_scope),
+                ):
                     cur_bin_local = cur_bin
                     prompt_len_local = prompt_len
                     compression_fired_local = compression_fired
@@ -2570,8 +2672,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
                     drain_pipe_residual(r_pipe)
                     bus.begin_request()
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                    _write_daemon_cmd(cmd_line)
 
                     out_tokens = 0
                     stop_reason = "end_turn"
@@ -2689,7 +2790,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             return StreamingResponse(sse(), media_type="text/event-stream")
 
         # Non-streaming
-        async with _daemon_request_lock("anthropic"):
+        async with _daemon_request_lock(
+            "anthropic",
+            affinity_key=cache_scope,
+            scoped=not is_ephemeral_cache_scope(cache_scope),
+        ):
             (
                 cur_bin,
                 prompt_len,
@@ -2731,8 +2836,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 cmd_line += "\n"
             drain_pipe_residual(r_pipe)
             bus.begin_request()
-            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-            daemon_proc.stdin.flush()
+            _write_daemon_cmd(cmd_line)
             snap_ok = False
             try:
                 tokens = [
@@ -2837,6 +2941,13 @@ def main():
                     help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
+    ap.add_argument("--target-cache-slots", type=int, default=None,
+                    help="Live target-cache slots for multi-request (default: "
+                         "DFLASH_TARGET_CACHE_SLOTS or 1). Keep at 1 until Phase 3 "
+                         "M3b demux is enabled.")
+    ap.add_argument("--stream-tagged", action="store_true",
+                    help="Pass --stream-tagged to the daemon (tagged token frames). "
+                         "Required for overlapping generate once exclusive lock is dropped.")
     ap.add_argument("--daemon", action="store_true",
                     help="No-op: accepted for parity with server.py / Compose; "
                          "this process always runs test_dflash with --daemon.")
@@ -3002,6 +3113,19 @@ def main():
         extra_daemon.append("--draft-feature-mirror")
     if args.peer_access:
         extra_daemon.append("--peer-access")
+    # Live target-cache multi-slot (Phase 3). Defaults stay N=1.
+    slots_n = args.target_cache_slots
+    if slots_n is None:
+        slots_n = target_cache_slots()
+    else:
+        slots_n = max(1, min(int(slots_n), 16))
+        os.environ["DFLASH_TARGET_CACHE_SLOTS"] = str(slots_n)
+    if slots_n > 1:
+        extra_daemon.append(f"--target-cache-slots={slots_n}")
+    tagged = bool(args.stream_tagged) or stream_tagged_enabled()
+    if tagged:
+        os.environ["DFLASH_STREAM_TAGGED"] = "1"
+        extra_daemon.append("--stream-tagged")
     if args.target_gpus:
         extra_daemon.append(f"--target-gpus={args.target_gpus}")
         if args.target_layer_split:
@@ -3026,6 +3150,13 @@ def main():
                 f"tool_pins={tool_split_cfg.pinned_tool_slots}",
                 flush=True,
             )
+    if slots_n > 1 or tagged:
+        print(
+            f"  [cfg] multi-slot: target_cache_slots={slots_n} "
+            f"stream_tagged={1 if tagged else 0} "
+            f"drop_exclusive={1 if multi_slot_drop_exclusive() else 0}",
+            flush=True,
+        )
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,

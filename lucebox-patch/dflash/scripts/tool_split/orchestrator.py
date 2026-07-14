@@ -327,6 +327,8 @@ class ToolSplitOrchestrator:
         gen_len: int,
     ) -> str:
         """Format stdin line for test_dflash (RESTORE / RESTORE_CHAIN)."""
+        from target_cache_admission import format_slot_command
+
         path = plan.prompt_bin_path
         if plan.use_restore_chain and plan.thin_slot_ids:
             thick = plan.conv_restore_slot if plan.conv_restore_slot is not None else -1
@@ -339,4 +341,4 @@ class ToolSplitOrchestrator:
         if plan.inline_snap:
             slot, cut = plan.inline_snap
             line += f" snap={cut}:{slot}"
-        return line + "\n"
+        return format_slot_command(line + "\n")
