@@ -186,13 +186,17 @@ class TaggedStreamDemux:
         stop_ids: set[int] | frozenset[int] | None = None,
         *,
         wall_timeout: float = 600.0,
+        queue: asyncio.Queue[StreamFrame | None] | None = None,
     ) -> AsyncIterator[int]:
         """Yield vocab tokens for ``req_id`` until DONE, n_gen, or timeout.
 
         CONTINUE frames are skipped (scheduler will emit more tokens later).
+        Pass ``queue`` from a prior :meth:`register` so the caller can write the
+        daemon command before frames arrive (avoids a subscribe race).
         """
         stops = stop_ids or frozenset()
-        q = await self.register(req_id)
+        own_reg = queue is None
+        q = queue if queue is not None else await self.register(req_id)
         generated = 0
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wall_timeout
@@ -219,7 +223,8 @@ class TaggedStreamDemux:
                 generated += 1
                 yield tok
         finally:
-            await self.unregister(req_id)
+            if own_reg:
+                await self.unregister(req_id)
 
 
 def format_req_command(line: str, req_id: int) -> str:

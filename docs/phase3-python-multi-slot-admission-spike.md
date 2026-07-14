@@ -41,7 +41,7 @@ Ship as two slices so we never enable compose `N=2` without demux.
 |------|--------|--------|
 | Demux module | `tagged_stream_demux.py` — `TaggedFrameBuffer` + `TaggedStreamDemux` | done |
 | Overlap smoke | `scripts/phase3_multi_slot_overlap_smoke.py` — dual `REQ`/`SLOT`/`START` + `SCHED_DRAIN` | **PASSED** (24 tagged tokens, req_ids 1+2) |
-| HTTP wire | Prefix `REQ <id>` when tagged; demux → SSE; stdin mutex | next |
+| HTTP wire | Prefix `REQ <id>` when tagged; demux → chat collect via `_generate_via_daemon`; stdin mutex; drop exclusive only with demux | chat path wired (default tagged off) |
 | Drop exclusive | Only with demux + START/SCHED (blocking `RESTORE_CHAIN` cannot interleave) | after HTTP |
 | Deploy | `DFLASH_TARGET_CACHE_SLOTS=2` + `DFLASH_STREAM_TAGGED=1` after smoke | blocked on HTTP |
 

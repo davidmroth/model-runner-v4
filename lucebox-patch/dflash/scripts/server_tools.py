@@ -120,6 +120,7 @@ from target_cache_admission import (
     stream_tagged_enabled,
     target_cache_slots,
 )
+from tagged_stream_demux import TaggedStreamDemux, format_req_command
 
 # Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "add_generation_prompt", "tools"})
@@ -540,6 +541,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     daemon_lock = PriorityDaemonLock()
     live_slots_n = target_cache_slots()
     slot_pool = TargetCacheSlotPool(live_slots_n)
+    daemon_stdin_lock = asyncio.Lock()
+    tagged_demux: TaggedStreamDemux | None = None
     if live_slots_n > 1:
         print(
             f"  [cfg] target_cache_slots={live_slots_n} "
@@ -627,7 +630,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         else:
             slot_tok = set_active_live_slot(0)
 
-        exclusive = live_slots_n <= 1 or not multi_slot_drop_exclusive()
+        exclusive = live_slots_n <= 1 or not (
+            multi_slot_drop_exclusive() and tagged_demux is not None
+        )
         try:
             if exclusive:
                 await _acquire_daemon_lock(label, max_wait=max_wait, scoped=scoped)
@@ -647,11 +652,88 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         if admission.lease is not None:
             slot_pool.release(admission.lease)
 
-    def _write_daemon_cmd(cmd_line: str) -> None:
-        """Write a daemon stdin line, adding ``SLOT k`` when N>1."""
+    def _write_daemon_cmd(cmd_line: str, *, req_id: int | None = None) -> None:
+        """Write a daemon stdin line, adding ``SLOT k`` / ``REQ id`` when needed."""
         line = format_slot_command(cmd_line)
+        if tagged_demux is not None:
+            rid = 0 if req_id is None else int(req_id)
+            line = format_req_command(line, rid)
         daemon_proc.stdin.write(line.encode("utf-8"))
         daemon_proc.stdin.flush()
+
+    async def _write_daemon_cmd_async(
+        cmd_line: str, *, req_id: int | None = None,
+    ) -> None:
+        async with daemon_stdin_lock:
+            _write_daemon_cmd(cmd_line, req_id=req_id)
+
+    async def _collect_gen_tokens(
+        gen_len: int,
+        *,
+        req_id: int | None,
+        wall_timeout: float,
+        use_stops: bool = True,
+    ) -> list[int]:
+        """Read decode tokens for one request (tagged demux or legacy pipe)."""
+        stops = stop_ids if use_stops else frozenset()
+        if tagged_demux is not None and req_id is not None:
+            return [
+                t
+                async for t in tagged_demux.iter_tokens(
+                    req_id,
+                    gen_len,
+                    stops,
+                    wall_timeout=wall_timeout,
+                )
+            ]
+        return await asyncio.to_thread(
+            lambda: list(
+                iter_pipe_tokens(
+                    r_pipe,
+                    gen_len,
+                    stops,
+                    bus=bus,
+                    wall_timeout=wall_timeout,
+                )
+            ),
+        )
+
+    async def _generate_via_daemon(
+        cmd_line: str,
+        gen_len: int,
+        *,
+        wall_timeout: float,
+        use_stops: bool = True,
+    ) -> list[int]:
+        """Register (if tagged), write command, collect tokens."""
+        req_id: int | None = None
+        queue = None
+        if tagged_demux is not None:
+            req_id = tagged_demux.alloc_req_id()
+            queue = await tagged_demux.register(req_id)
+        try:
+            if tagged_demux is None:
+                drain_pipe_residual(r_pipe)
+            bus.begin_request()
+            await _write_daemon_cmd_async(cmd_line, req_id=req_id)
+            if tagged_demux is not None and req_id is not None and queue is not None:
+                stops = stop_ids if use_stops else frozenset()
+                return [
+                    t
+                    async for t in tagged_demux.iter_tokens(
+                        req_id,
+                        gen_len,
+                        stops,
+                        wall_timeout=wall_timeout,
+                        queue=queue,
+                    )
+                ]
+            return await _collect_gen_tokens(
+                gen_len, req_id=None, wall_timeout=wall_timeout, use_stops=use_stops,
+            )
+        finally:
+            if tagged_demux is not None and req_id is not None:
+                await tagged_demux.unregister(req_id)
 
     @asynccontextmanager
     async def _daemon_request_lock(
@@ -738,6 +820,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
     bus = DaemonStdoutBus(daemon_proc.stdout)
     runtime["bus"] = bus
+    if stream_tagged_enabled():
+        tagged_demux = TaggedStreamDemux(r_pipe)
+        print("  [cfg] tagged stream demux enabled (M3b)", flush=True)
     # Mirror server.py: resolve effective KV-K type + FA window from env so
     # they participate in the prefix-cache hash key.
     def _resolve_kv_k_type():
@@ -1138,10 +1223,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
     async def _restart_daemon_if_dead() -> bool:
         """Respawn test_dflash after crash. Caller must hold ``daemon_lock``."""
-        nonlocal daemon_proc, bus, r_pipe
+        nonlocal daemon_proc, bus, r_pipe, tagged_demux
         if daemon_proc.poll() is None:
             return True
         print("  [daemon] process exited — restarting", flush=True)
+        if tagged_demux is not None:
+            await tagged_demux.stop()
+            tagged_demux = None
         if bus._task is not None:
             bus._task.cancel()
             try:
@@ -1169,6 +1257,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         if tool_split is not None:
             tool_split.tool_slots.reset()
         bus.start(asyncio.get_running_loop())
+        if stream_tagged_enabled():
+            tagged_demux = TaggedStreamDemux(r_pipe)
+            await tagged_demux.start()
+            print("  [cfg] tagged stream demux re-enabled after restart", flush=True)
         await prefix_cache.startup_sync()
         print("  [daemon] restart complete", flush=True)
         await _run_tool_warmup()
@@ -1316,6 +1408,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     async def _startup():
         import asyncio
         bus.start(asyncio.get_running_loop())
+        if tagged_demux is not None:
+            await tagged_demux.start()
         await prefix_cache.startup_sync()
         await _run_tool_warmup()
 
@@ -1952,22 +2046,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     tool_ctx=tool_ctx,
                     cache_scope=cache_scope,
                 )
-                drain_pipe_residual(r_pipe)
-                bus.begin_request()
-                _write_daemon_cmd(cmd_line)
                 snap_ok = False
                 try:
                     wall_timeout_sec = request_wall_timeout_seconds()
-                    tokens = await asyncio.to_thread(
-                        lambda: list(
-                            iter_pipe_tokens(
-                                r_pipe,
-                                gen_len,
-                                stop_ids,
-                                bus=bus,
-                                wall_timeout=wall_timeout_sec,
-                            )
-                        ),
+                    tokens = await _generate_via_daemon(
+                        cmd_line,
+                        gen_len,
+                        wall_timeout=wall_timeout_sec,
                     )
                     await bus.drain_timings()
                     snap_ok = True
@@ -2194,9 +2279,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     tool_ctx=tool_ctx,
                     cache_scope=cache_scope,
                 )
-                drain_pipe_residual(r_pipe)
-                bus.begin_request()
-                _write_daemon_cmd(cmd_line)
 
                 mode = "reasoning" if started_in_thinking else "content"
                 window = ""
@@ -2220,16 +2302,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 # under uvicorn even with a background pump task.
                 try:
                     token_ids = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            lambda: list(
-                                iter_pipe_tokens(
-                                    r_pipe,
-                                    gen_len,
-                                    stop_ids,
-                                    bus=bus,
-                                    wall_timeout=wall_timeout_sec,
-                                )
-                            ),
+                        _generate_via_daemon(
+                            cmd_line,
+                            gen_len,
+                            wall_timeout=wall_timeout_sec,
                         ),
                         timeout=wall_timeout_sec,
                     )
