@@ -133,6 +133,20 @@ def append_restore_chain_quantum(line: str, quantum: int | None = None) -> str:
     rest = f"{' '.join(parts[:5])} {q}{snap}"
     return f"{prefix}{rest}" + ("\n" if nl else "")
 
+
+def parse_restore_chain_admit_remaining(line: str) -> int | None:
+    """Parse ``remaining=N`` from an ``ok RESTORE_CHAIN_ADMIT …`` reply."""
+    if "RESTORE_CHAIN_ADMIT" not in line:
+        return None
+    for part in line.split():
+        if part.startswith("remaining="):
+            try:
+                return int(part.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
 def format_req_prefix_needed() -> bool:
     """Commands should carry ``REQ <id>`` when the daemon uses tagged emit."""
     return stream_tagged_enabled()

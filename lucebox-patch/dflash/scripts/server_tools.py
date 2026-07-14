@@ -118,6 +118,7 @@ from target_cache_admission import (
     is_restore_chain_command,
     multi_slot_drop_exclusive,
     overlap_mode_enabled,
+    parse_restore_chain_admit_remaining,
     reset_active_live_slot,
     set_active_live_slot,
     stream_tagged_enabled,
@@ -739,7 +740,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         When overlap mode is on (N>1 + tagged + drop-exclusive) and the command
         is ``RESTORE_CHAIN``, append a schedule quantum and kick ``SCHED_DRAIN``
-        after ``ok RESTORE_CHAIN_ADMIT`` so decode can time-slice with peers.
+        after ``ok RESTORE_CHAIN_ADMIT`` only when ``remaining>0`` so decode can
+        time-slice with peers. Early-stop admits (EOS in first quantum) must
+        not kick a phantom drain of leftover ``max_tokens``.
         """
         req_id: int | None = None
         queue = None
@@ -764,10 +767,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             if use_admit:
                 async def _kick_sched() -> None:
                     try:
-                        await bus.await_reply("ok RESTORE_CHAIN_ADMIT", timeout=wall_timeout)
+                        admit = await bus.await_reply(
+                            "ok RESTORE_CHAIN_ADMIT", timeout=wall_timeout,
+                        )
                     except Exception as exc:
                         print(
                             f"  [handler] RESTORE_CHAIN_ADMIT wait failed: {exc!r}",
+                            flush=True,
+                        )
+                        return
+                    rem = parse_restore_chain_admit_remaining(admit)
+                    if rem is not None and rem <= 0:
+                        print(
+                            f"  [handler] skip SCHED_DRAIN (admit remaining={rem})",
                             flush=True,
                         )
                         return
@@ -793,8 +805,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
         finally:
             if sched_task is not None:
+                # Kick task only waits for ADMIT + writes SCHED; do not hold the
+                # HTTP lock for the whole drain (demux already finished).
                 try:
-                    await asyncio.wait_for(sched_task, timeout=max(1.0, wall_timeout))
+                    await asyncio.wait_for(sched_task, timeout=5.0)
                 except Exception:
                     sched_task.cancel()
             if tagged_demux is not None and req_id is not None:

@@ -1,6 +1,6 @@
 # Phase 3 spike — Python multi-slot admission
 
-**Status:** M3a green · M3b demux/cold/warm side-binary green · warm admit PASSED · **HTTP overlap smoke PASSED** (2026-07-14) · compose ready for **N=2**  
+**Status:** M3a green · M3b demux/cold/warm side-binary green · warm admit PASSED · **HTTP overlap smoke PASSED** (2026-07-14) · **EOS/SCHED one-shot fix** (early-stop clears remaining; skip SCHED when remaining=0) · compose **prod stays N=1** until post-fix smokes green  
 **Branch:** `feat/native-mmproj-multi-request`  
 **Parent:** [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)  
 **Prereq:** Phase 2 M2b green ([phase2-layer-split-multi-slot-spike.md](./phase2-layer-split-multi-slot-spike.md))
@@ -19,6 +19,30 @@ Ship as two slices so we never enable compose `N=2` without demux.
 |-------|-------------|---------|
 | **M3a** | Env/CLI plumb, `SLOT k` on snap/restore/generate, sticky slot lease pool | **N=1** |
 | **M3b** | `--stream-tagged` demux + drop exclusive lock when N>1; chat∩cron | **N=2** after green |
+
+---
+
+## Regression (2026-07-14): N=2 short completions + phantom SCHED_DRAIN
+
+**Symptom:** Under `SLOTS=2 TAGGED=1 DROP=1`, agent turns returned HTTP 200 with only
+~8–16 completion tokens after long TTFB; daemon logged
+`SCHED_DRAIN steps≈32760 in ~140ms` after a first quantum of `gen=8`.
+
+**Cause:** Admit kept `remaining = max_tokens − emitted` after the first quantum even
+when generation had already hit EOS (or finished early). `CONTINUE` re-seeded on the
+EOS last-token and SCHED burned the leftover budget one phantom step at a time.
+Demux already stopped on EOS → short answers. HTTP `finally` also awaited the long
+SCHED kick.
+
+**Fix (one-shot):**
+1. **C++** — After each quantum, if `produced < requested` or last token is EOS (or
+   `continue_generate` sees an EOS seed), set `remaining=0` and emit DONE.
+2. **Python** — Parse `remaining=` from `ok RESTORE_CHAIN_ADMIT`; **skip SCHED_DRAIN**
+   when `remaining<=0`; do not hold the request lock for a long SCHED await.
+
+**Gate:** `phase3_warm_restore_admit_smoke.py` includes
+`gate_large_max_tokens_no_phantom_drain` (`total_gen=64000`). Keep prod on **N=1**
+until that + HTTP overlap smokes pass on a temporary N=2 recreate.
 
 ---
 
@@ -69,6 +93,7 @@ Omitting `<quantum>` keeps legacy blocking full generate (prod N=1).
 | Tagged demux + warmup dual-read | Warmup `iter_pipe_tokens` raced demux on `r_pipe` (fixed) |
 | Demux `stop_ids` `continue` | EOS skipped → hang waiting for DONE (fixed: break + idle) |
 | ContextVar reset in SSE teardown | Slot lease leak → 503 slot wait (fixed) |
+| EOS first quantum + huge `max_tokens` | `remaining` kept alive → phantom `SCHED_DRAIN` ~32k steps; demux already stopped → 8–16 tok answers (fixed: early-stop clears remaining; skip SCHED when remaining=0) |
 
 ---
 

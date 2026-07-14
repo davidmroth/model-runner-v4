@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 from target_cache_admission import (
     TargetCacheSlotPool,
+    append_restore_chain_quantum,
     format_slot_command,
     multi_slot_drop_exclusive,
+    parse_restore_chain_admit_remaining,
     set_active_live_slot,
     stream_tagged_enabled,
     target_cache_slots,
@@ -99,6 +101,21 @@ class FormatSlotCommandTests(unittest.TestCase):
         self.assertTrue(is_restore_chain_command(slotted))
         self.assertTrue(is_restore_chain_command(req_slot))
         self.assertFalse(is_restore_chain_command("SLOT 0 /tmp/p.bin 8\n"))
+        self.assertEqual(
+            parse_restore_chain_admit_remaining(
+                "ok RESTORE_CHAIN_ADMIT req=1 slot=0 emitted=8 remaining=0 "
+                "total_gen=64000 quantum=8"
+            ),
+            0,
+        )
+        self.assertEqual(
+            parse_restore_chain_admit_remaining(
+                "ok RESTORE_CHAIN_ADMIT req=2 slot=1 emitted=4 remaining=20 "
+                "total_gen=24 quantum=4"
+            ),
+            20,
+        )
+        self.assertIsNone(parse_restore_chain_admit_remaining("ok RESTORE_CHAIN"))
         plan = ToolSplitPlan(
             prompt_bin_path="/tmp/p.bin",
             prompt_token_count=10,

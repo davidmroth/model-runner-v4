@@ -298,6 +298,63 @@ def gate_warm_admit(d: Daemon, work: Path) -> None:
     print("WARM RESTORE_CHAIN ADMIT OK")
 
 
+def gate_large_max_tokens_no_phantom_drain(d: Daemon, work: Path) -> None:
+    """Agent-shaped max_tokens must not yield SCHED_DRAIN steps≈remaining.
+
+    Repro for the N=2 truncation bug: first quantum ends (often EOS) while
+    remaining keeps a huge leftover; SCHED burnt remaining 1-by-1 in ~100ms.
+    """
+    import re
+
+    print("== large max_tokens admit (no phantom SCHED) ==")
+    _pin_tools(d, work, live_slot=0, thin_slot=THIN_A)
+    # Short assistant-bound suffix so the first quantum often hits EOS.
+    suffix = [220, 220, 1110, 264, 198]
+    p = work / "eos_budget.raw"
+    write_raw_i32(p, TOOL_IDS + suffix)
+    huge = 64000
+    quantum = 8
+    out = d.cmd(
+        f"REQ 9 SLOT 0 RESTORE_CHAIN -1 {THIN_A} {p} {huge} {quantum}",
+        expect_prefix="ok ",
+        timeout=300,
+    )
+    assert out.startswith("ok "), out
+    admit = out if "RESTORE_CHAIN_ADMIT" in out else d.await_stdout(
+        expect_prefix="ok RESTORE_CHAIN_ADMIT", timeout=30,
+    )
+    assert "RESTORE_CHAIN_ADMIT" in admit and "remaining=" in admit, admit
+    m_rem = re.search(r"remaining=(\d+)", admit)
+    assert m_rem, admit
+    remaining = int(m_rem.group(1))
+    print(f"  admit: {admit.strip()} → remaining={remaining}")
+    d.read_stream(idle=0.5)
+
+    t0 = time.time()
+    drain = d.cmd("SCHED_DRAIN", expect_prefix="ok SCHED_DRAIN", timeout=300)
+    elapsed = time.time() - t0
+    assert drain.startswith("ok SCHED_DRAIN"), drain
+    m_steps = re.search(r"steps=(\d+)", drain)
+    assert m_steps, drain
+    steps = int(m_steps.group(1))
+    print(f"  SCHED_DRAIN steps={steps} elapsed={elapsed:.3f}s")
+    if remaining == 0:
+        assert steps <= 16, (
+            f"remaining=0 but SCHED_DRAIN still spun steps={steps} ({drain})"
+        )
+    else:
+        # Real decode of leftover tokens can't finish in a flash at ~32k steps.
+        assert steps < 512 or elapsed >= 2.0, (
+            f"phantom drain suspected: remaining={remaining} steps={steps} "
+            f"elapsed={elapsed:.3f}s ({drain})"
+        )
+        assert steps < remaining, (
+            f"SCHED burned more steps than remaining budget "
+            f"({steps} >= {remaining})"
+        )
+    print("LARGE max_tokens NO-PHANTOM-DRAIN OK")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -327,6 +384,7 @@ def main() -> int:
         )
         try:
             gate_warm_admit(d, work)
+            gate_large_max_tokens_no_phantom_drain(d, work)
         finally:
             d.close()
 
