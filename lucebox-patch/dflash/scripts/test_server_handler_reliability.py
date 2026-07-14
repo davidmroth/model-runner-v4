@@ -141,6 +141,17 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(ephemeral_lock_wait_seconds(), 5.0)
 
+    def test_ephemeral_max_tokens_defaults_and_clamp(self):
+        from handler_reliability import ephemeral_max_tokens
+
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("DFLASH_EPHEMERAL_MAX_TOKENS", None)
+            self.assertEqual(ephemeral_max_tokens(), 2048)
+        with patch.dict(os.environ, {"DFLASH_EPHEMERAL_MAX_TOKENS": "512"}):
+            self.assertEqual(ephemeral_max_tokens(), 512)
+        with patch.dict(os.environ, {"DFLASH_EPHEMERAL_MAX_TOKENS": "999999"}):
+            self.assertEqual(ephemeral_max_tokens(), 65536)
+
     def test_scoped_lock_wait_cap_when_unbounded(self):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "0"}):
             self.assertEqual(

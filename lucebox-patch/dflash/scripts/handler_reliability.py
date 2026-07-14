@@ -221,6 +221,19 @@ def ephemeral_lock_wait_seconds() -> float:
         return 5.0
 
 
+def ephemeral_max_tokens() -> int:
+    """Hard cap on completion tokens for ephemeral (no conversation id) traffic.
+
+    Background extractors often send ``max_tokens=64000`` which can hold a live
+    slot for minutes and starve scoped chat under N=2. Default 2048.
+    """
+    raw = os.environ.get("DFLASH_EPHEMERAL_MAX_TOKENS", "2048")
+    try:
+        return max(16, min(int(raw), 65536))
+    except ValueError:
+        return 2048
+
+
 def chat_stream_lock_wait_seconds(*, scoped: bool) -> float:
     """Lock wait for chat/chat-stream before 503.
 

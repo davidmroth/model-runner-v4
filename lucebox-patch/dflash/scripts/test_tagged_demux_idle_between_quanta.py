@@ -53,9 +53,8 @@ class DemuxIdleBetweenQuantaTests(unittest.IsolatedAsyncioTestCase):
         await demux.unregister(req)
         self.assertEqual(got, [10, 11, 12, 13, 20, 21, 22, 23, 24, 25])
 
-    async def test_continue_then_gap_beyond_idle_truncates(self) -> None:
-        """Documents the hazard: CONTINUE resets idle, but a slow next quantum
-        still loses the stream once ``post_token_idle`` elapses."""
+    async def test_continue_then_gap_beyond_idle_still_accepts_next_quantum(self) -> None:
+        """After CONTINUE, idle must not truncate — SCHED may be slow to kick."""
         demux = _demux()
         req = demux.alloc_req_id()
         q = await demux.register(req)
@@ -81,8 +80,7 @@ class DemuxIdleBetweenQuantaTests(unittest.IsolatedAsyncioTestCase):
             got.append(t)
         await task
         await demux.unregister(req)
-        # Truncation: second quantum never collected.
-        self.assertEqual(got, [10, 11, 12, 13])
+        self.assertEqual(got, [10, 11, 12, 13, 20, 21, 22, 23])
 
     async def test_idle_without_continue_stops_after_first_quantum(self) -> None:
         demux = _demux()

@@ -173,6 +173,22 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
         pool.release(other)
         pool.release(a2)
 
+    async def test_ephemeral_fails_fast_when_scoped_waiting(self) -> None:
+        pool = TargetCacheSlotPool(2)
+        a = await pool.acquire("conv:a", scoped=True)
+        b = await pool.acquire("conv:b", scoped=True)
+        waiter = asyncio.create_task(
+            pool.acquire("conv:c", scoped=True, max_wait=2.0)
+        )
+        await asyncio.sleep(0.05)  # let scoped join _high
+        with self.assertRaises(asyncio.TimeoutError):
+            await pool.acquire("ephemeral:bg", scoped=False, max_wait=1.0)
+        pool.release(a)
+        c = await waiter
+        self.assertEqual(c.slot, a.slot)
+        pool.release(b)
+        pool.release(c)
+
     async def test_lease_context_sets_active_slot(self) -> None:
         pool = TargetCacheSlotPool(2)
         async with pool.lease("conv:x", scoped=True) as lease:

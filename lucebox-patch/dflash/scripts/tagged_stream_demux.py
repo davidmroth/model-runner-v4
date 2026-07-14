@@ -191,11 +191,14 @@ class TaggedStreamDemux:
     ) -> AsyncIterator[int]:
         """Yield vocab tokens for ``req_id`` until DONE, stop, n_gen, or timeout.
 
-        CONTINUE frames are skipped (scheduler will emit more tokens later).
+        CONTINUE frames mean more quanta are scheduled — idle timeout is
+        suspended until the next vocab token (or DONE) so a slow SCHED kick
+        cannot truncate the HTTP stream after the first quantum.
+
         Stop ids end the stream (same as a soft EOS) — do not ``continue`` past
         them or we hang waiting for DONE when the engine already finished.
-        ``post_token_idle`` mirrors legacy ``iter_pipe_tokens`` so a missing
-        DONE after the last vocab token cannot stall the HTTP handler.
+        ``post_token_idle`` still applies after the final vocab burst when no
+        CONTINUE has been seen, so a missing DONE cannot stall forever.
 
         Pass ``queue`` from a prior :meth:`register` so the caller can write the
         daemon command before frames arrive (avoids a subscribe race).
@@ -207,12 +210,18 @@ class TaggedStreamDemux:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wall_timeout
         last_token_at: float | None = None
+        # After CONTINUE, wait on wall timeout only until more tokens/DONE.
+        suspend_idle = False
         try:
             while generated < n_gen:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
-                if last_token_at is not None:
+                if (
+                    not suspend_idle
+                    and last_token_at is not None
+                    and post_token_idle > 0
+                ):
                     idle_left = post_token_idle - (loop.time() - last_token_at)
                     if idle_left <= 0:
                         break
@@ -224,9 +233,9 @@ class TaggedStreamDemux:
                 if item is None:
                     break
                 if item.kind == "cont":
-                    # CONTINUE means more tokens are scheduled later —
-                    # reset idle clock so we don't false-stop between quanta.
-                    last_token_at = loop.time()
+                    # More decode is scheduled — do not idle-cut between quanta.
+                    suspend_idle = True
+                    last_token_at = None
                     continue
                 if item.kind == "done":
                     break
@@ -236,6 +245,7 @@ class TaggedStreamDemux:
                 if tok in stops:
                     break
                 generated += 1
+                suspend_idle = False
                 last_token_at = loop.time()
                 yield tok
         finally:

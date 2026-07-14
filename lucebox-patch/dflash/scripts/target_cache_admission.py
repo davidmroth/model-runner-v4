@@ -307,6 +307,11 @@ class TargetCacheSlotPool:
         if lease is not None:
             return lease
 
+        # Ephemeral must not sit in line ahead of (or beside) scoped waiters —
+        # fail fast so background storms 503 instead of starving chat.
+        if not scoped and self._high:
+            raise asyncio.TimeoutError()
+
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[SlotLease] = loop.create_future()
         (self._high if scoped else self._low).append((fut, key, scoped))

@@ -104,6 +104,7 @@ from handler_reliability import (
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
     deferred_conv_snap_max_tail,
+    ephemeral_max_tokens,
     install_quiet_access_log_filter,
     is_ephemeral_cache_scope,
     quiet_access_logs_enabled,
@@ -811,6 +812,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     await asyncio.wait_for(sched_task, timeout=5.0)
                 except Exception:
                     sched_task.cancel()
+            # Always cancel the live scheduler request after the HTTP collect
+            # ends — if demux stopped early (stop id / idle), leftover remaining
+            # must not keep SCHED_DRAIN orphan-decoding into an unsubscribed pipe.
+            if use_admit and req_id is not None:
+                try:
+                    async with daemon_stdin_lock:
+                        daemon_proc.stdin.write(f"CANCEL {int(req_id)}\n".encode())
+                        daemon_proc.stdin.flush()
+                    print(
+                        f"  [handler] CANCEL req={req_id} after generate collect",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"  [handler] CANCEL req={req_id} failed: {exc!r}",
+                        flush=True,
+                    )
             if tagged_demux is not None and req_id is not None:
                 await tagged_demux.unregister(req_id)
 
@@ -1656,9 +1674,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             full_snap_prep,
         )
 
-    def _clamp_gen_len(req: ChatRequest, prompt_len: int) -> int:
+    def _clamp_gen_len(
+        req: ChatRequest,
+        prompt_len: int,
+        *,
+        ephemeral: bool = False,
+    ) -> int:
         available_gen = max_ctx - prompt_len - 20
-        return min(_max_gen_tokens(req), available_gen)
+        gen = min(_max_gen_tokens(req), available_gen)
+        if ephemeral:
+            cap = ephemeral_max_tokens()
+            if gen > cap:
+                print(
+                    f"  [handler] ephemeral max_tokens clamped {gen} → {cap}",
+                    flush=True,
+                )
+                gen = cap
+        return gen
 
     def _tokenize_prompt(req: ChatRequest) -> tuple[Path, bool]:
         """Returns (prompt_bin_path, started_in_thinking). started_in_thinking
@@ -2072,7 +2104,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             prompt_len = cached_cur_ids_len
             started_in_thinking = False  # cached result: no think prefill
 
-        gen_len = _clamp_gen_len(req, prompt_len)
+        gen_len = _clamp_gen_len(
+            req, prompt_len, ephemeral=is_ephemeral_cache_scope(cache_scope),
+        )
         if gen_len <= 0:
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
@@ -2127,7 +2161,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     prompt_ids,
                     cache_scope,
                 )
-                gen_len = _clamp_gen_len(req, prompt_len)
+                gen_len = _clamp_gen_len(
+                    req, prompt_len, ephemeral=is_ephemeral_cache_scope(cache_scope),
+                )
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     cur_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
@@ -2360,7 +2396,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     prompt_ids,
                     cache_scope,
                 )
-                gen_len = _clamp_gen_len(req, prompt_len)
+                gen_len = _clamp_gen_len(
+                    req, prompt_len, ephemeral=is_ephemeral_cache_scope(cache_scope),
+                )
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     prompt_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
