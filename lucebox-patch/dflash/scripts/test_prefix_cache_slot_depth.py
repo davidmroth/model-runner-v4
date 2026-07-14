@@ -1,4 +1,5 @@
 """Unit tests: prefix cache slot depth vs lookup cut (cross-session safety)."""
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -108,6 +109,35 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
         self.assertIn(deep, pc.entries)
         self.assertEqual(pc.entries[deep], 0)
         self.assertEqual(pc._slot_prefix_len[0], 480)
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_prepare_inline_snap_deepens_large_tail(self, mock_bounds):
+        pc = self._make_cache()
+        ids = list(range(5000))
+        # role openings: after-sys, after-prev-asst, start of big user, start of gen asst
+        mock_bounds.return_value = [50, 100, 120, 4990]
+        scope = "sess-a"
+        with patch.dict(os.environ, {"DFLASH_PREFIX_DEEPEN_TAIL": "256"}):
+            prep = pc.prepare_inline_snap(ids, scope=scope)
+        # Deepen to last role-start (gen-prompt), not len(ids)
+        self.assertEqual(prep, (0, 4990))
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_lookup_includes_committed_non_boundary_cut(self, mock_bounds):
+        """Live deepen may register between role boundaries; lookup must see it."""
+        pc = self._make_cache()
+        ids = list(range(5000))
+        mock_bounds.return_value = [50, 100]  # only role openings
+        scope = "sess-deep"
+        deep = 4800
+        entry_key = self._scoped_entry(pc, ids, deep, scope)
+        pc.entries[entry_key] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = deep
+        pc._slot_scope[0] = scope
+
+        hit = pc.lookup(ids, scope=scope)
+        self.assertEqual(hit, (0, deep))
 
     @patch("prefix_cache.find_all_boundaries_markers")
     def test_abort_inline_snap_purges_reuse_slot_mappings(self, mock_bounds):

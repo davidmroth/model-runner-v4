@@ -696,6 +696,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 scope=cache_scope,
             )
 
+    # (live post-gen SNAPSHOT deepen removed — raw gen tokens diverge from the
+    # next turn's chat-templated assistant message.  End-of-prompt inline snaps
+    # for large tails live in PrefixCache.prepare_inline_snap instead.)
+
     async def _execute_deferred_conv_snap_job(job: _DeferredConvSnapJob) -> None:
         conv_slot, conv_cut = job.conv_slot, job.conv_cut
         tool_slot, tool_kv_end = job.tool_slot, job.tool_kv_end

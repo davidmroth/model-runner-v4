@@ -1,11 +1,12 @@
 # Next-Gen Plan: Multi-Request Admission + Shared KV Pages
 
-**Status:** Phase 0 done · Phase 1 gate passed (2026-07-13) · July 2026  
+**Status:** Phase 0 done · Phase 1 gate passed (2026-07-13) · Phase 2 next · July 2026  
 **Branches:** `feat/native-mmproj-multi-request` (`lucebox-hub`, `model-runner-v4`)  
 **Related:** [research-nextgen-archecture.md](./research-nextgen-archecture.md) (GPU1 roles),
 [ephemeral-503-flood-fix-plan.md](./ephemeral-503-flood-fix-plan.md) (lock/503 behavior),
 [lucebox-sharded-snapshots-spec.md](./lucebox-sharded-snapshots-spec.md) (RESTORE_CHAIN),
-[inference-engine-north-star.md](./inference-engine-north-star.md)
+[inference-engine-north-star.md](./inference-engine-north-star.md),
+[warm-ttft-and-usage-timings.md](./warm-ttft-and-usage-timings.md) (warm deepen + WebUI metrics)
 
 This plan turns the multi-request / shared-KV conversation into **deployable
 phases**. It does **not** replace layer-split or tool-split; it sits on top of
@@ -208,6 +209,10 @@ or a local overlay outside this fork; do not land Phase 0 cron policy in hermes-
   (`req_ids=[1,2]`; busy `RESTORE_CHAIN` → `err slot_busy`).
 
 **Do not** enable in lucebox compose yet.
+
+**Follow-on (same branch, not Phase 2):** Warm TTFT deepen for large tool dumps +
+layer-split `usage.timings` parse for WebUI metrics — see
+[warm-ttft-and-usage-timings.md](./warm-ttft-and-usage-timings.md).
 
 ---
 

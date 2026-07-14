@@ -90,8 +90,10 @@ class DaemonStdoutBus:
         r"avg commit/step=([\d.]+)"
     )
 
+    # Layer-split / dual-GPU decode line (note: not the single-GPU [dflash] form).
     _TARGET_SPLIT_DECODE_RE = re.compile(
-        r"\[target-split-dflash\] decode tokens=(\d+)"
+        r"\[target-split-dflash\] decode tokens=(\d+) "
+        r"time=([\d.]+) s speed=([\d.]+) tok/s"
     )
     # Layer-split daemon_loop success line (AR + multimodal GENERATE_*).
     _OK_GEN_RE = re.compile(r"^ok N=(\d+) gen=(\d+)\b")
@@ -153,11 +155,40 @@ class DaemonStdoutBus:
         m = self._TARGET_SPLIT_DECODE_RE.search(decoded)
         if m:
             self._timings["completion_tokens"] = int(m.group(1))
+            self._timings["decode_ms"] = round(float(m.group(2)) * 1000.0, 2)
+            self._timings["decode_tokens_per_sec"] = round(float(m.group(3)), 2)
             return
         m = self._OK_GEN_RE.match(decoded)
         if m:
             # Prefer gen= (decode count); N= is the same for GENERATE_MULTIMODAL.
             self._timings["completion_tokens"] = int(m.group(2))
+            rm = re.search(r"restore_s=([\d.]+)", decoded)
+            if rm:
+                self._timings["restore_ms"] = round(float(rm.group(1)) * 1000.0, 2)
+            pm = re.search(r"prefill_s=([\d.]+)", decoded)
+            if pm and "prefill_ms" not in self._timings:
+                self._timings["prefill_ms"] = round(float(pm.group(1)) * 1000.0, 2)
+            dm = re.search(r"decode_s=([\d.]+)", decoded)
+            if dm and "decode_ms" not in self._timings:
+                self._timings["decode_ms"] = round(float(dm.group(1)) * 1000.0, 2)
+            dts = re.search(r"decode_tok_s=([\d.]+)", decoded)
+            if dts and "decode_tokens_per_sec" not in self._timings:
+                self._timings["decode_tokens_per_sec"] = round(float(dts.group(1)), 2)
+            sm = re.search(r"suffix_n=(-?\d+)", decoded)
+            if sm:
+                self._timings["suffix_n"] = int(sm.group(1))
+            return
+        rm = re.search(
+            r"\[restore-chain\].*restore_s=([\d.]+).*suffix_n=(-?\d+).*prefill_s=([\d.]+).*decode_s=([\d.]+)",
+            decoded,
+        )
+        if rm:
+            self._timings["restore_ms"] = round(float(rm.group(1)) * 1000.0, 2)
+            self._timings["suffix_n"] = int(rm.group(2))
+            if "prefill_ms" not in self._timings:
+                self._timings["prefill_ms"] = round(float(rm.group(3)) * 1000.0, 2)
+            if "decode_ms" not in self._timings:
+                self._timings["decode_ms"] = round(float(rm.group(4)) * 1000.0, 2)
             return
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._task = loop.create_task(self._run())
@@ -763,6 +794,13 @@ class PrefixCache:
             return None
         cache_scope = scope or "global"
         candidates = self._all_boundaries(prompt_ids)
+        # Post-gen / live SNAPSHOT depths may land between chat-role
+        # boundaries (e.g. end of a long user turn). Include them so warm
+        # turns can restore past the last role-opening cut.
+        for committed in self._slot_prefix_len.values():
+            if 0 < committed <= len(prompt_ids) and committed not in candidates:
+                candidates.append(committed)
+        candidates.sort()
         best: tuple[int, int] | None = None   # (slot_id, prefix_len)
         for cut in candidates:
             key = hash_prefix(prompt_ids[:cut], self.kv_k_type, self.fa_window, cache_scope)
@@ -846,10 +884,16 @@ class PrefixCache:
              prompt_ids)`` to register the entry in the LRU.
 
         For an agent loop that monotonically grows conversation history, the
-        most valuable cache point is "end of the most recent completed
+        most valuable cache point is usually "end of the most recent completed
         assistant message" — i.e., the second-to-last `<|im_start|>`
-        boundary. The LAST boundary is the current turn's opening, whose
-        content hasn't been generated yet.
+        boundary. The LAST boundary is the current turn's opening.
+
+        When the current turn's body past that boundary is large (tool dumps,
+        pasted logs), snap at the **last** role-start boundary instead — that
+        cut is after the large user body and at `<|im_start|>assistant` for the
+        generation prompt.  ``len(prompt_ids)`` would include the empty
+        generation trailer and diverge from the next turn's templated assistant
+        message; the last role-start is shared between those encodings.
         """
         if self.disabled:
             return None
@@ -859,7 +903,16 @@ class PrefixCache:
         candidates = self._all_boundaries(prompt_ids)
         if not candidates:
             return None
-        target_cut = candidates[-2] if len(candidates) >= 2 else candidates[-1]
+        role_cut = candidates[-2] if len(candidates) >= 2 else candidates[-1]
+        deepen_tail = 256
+        env_tail = os.getenv("DFLASH_PREFIX_DEEPEN_TAIL")
+        if env_tail and env_tail.strip().lstrip("-").isdigit():
+            deepen_tail = max(0, int(env_tail))
+        target_cut = role_cut
+        if deepen_tail > 0 and len(prompt_ids) - role_cut >= deepen_tail:
+            # Include the large last user message; land on the trailing
+            # generation-prompt role start (shared with the next turn).
+            target_cut = candidates[-1]
 
         target_key = hash_prefix(prompt_ids[:target_cut],
                                   self.kv_k_type, self.fa_window, cache_scope)
@@ -1138,6 +1191,94 @@ class PrefixCache:
         stale_keys = [k for k, (s, _, _) in self.full_entries.items() if s == slot]
         for k in stale_keys:
             self.full_entries.pop(k, None)
+
+    async def snapshot_live_prefix(
+        self,
+        prefix_ids: list[int],
+        *,
+        prefer_slot: int | None = None,
+        scope: str = "global",
+        reply_await=None,
+    ) -> bool:
+        """SNAPSHOT the daemon's current GPU KV and register ``prefix_ids``.
+
+        Call while holding the daemon lock, immediately after a successful
+        generate whose live cache matches ``prefix_ids`` (prompt + emitted
+        completion tokens).  This deepens thick slots past the shallow
+        ``candidates[-2]`` inline cut so the next turn does not re-prefill
+        already-completed history.
+        """
+        if self.disabled or not prefix_ids:
+            return False
+        cache_scope = scope or "global"
+        if scope_skips_prefix_snap(cache_scope):
+            return False
+        cut = len(prefix_ids)
+        existing = self.lookup(prefix_ids, scope=cache_scope)
+        if existing is not None and existing[1] >= cut:
+            return False
+
+        slot: int | None = None
+        if prefer_slot is not None and 0 <= prefer_slot < self.cap:
+            slot = prefer_slot
+        elif existing is not None:
+            slot = existing[0]
+        else:
+            for s, sc in self._slot_scope.items():
+                if sc == cache_scope and s in self._populated_slots and 0 <= s < self.cap:
+                    slot = s
+                    break
+        if slot is None:
+            prep = self.prepare_inline_snap(prefix_ids, scope=cache_scope)
+            if prep is None:
+                # Already hashed at some shallower boundary only — force
+                # overwrite of an in-scope slot or allocate next_slot.
+                if self._populated_slots:
+                    for s, sc in self._slot_scope.items():
+                        if sc == cache_scope and 0 <= s < self.cap:
+                            slot = s
+                            break
+                if slot is None:
+                    slot = self.next_slot % max(self.cap, 1) if self.cap else None
+                    if slot is not None:
+                        self.next_slot = (slot + 1) % self.cap
+            else:
+                slot, _ = prep
+        if slot is None:
+            return False
+
+        await_fn = reply_await or self._await_reply
+        try:
+            self._send(f"SNAPSHOT {slot}\n")
+            reply = await await_fn("[snap] inline slot=", timeout=60.0)
+            # "[snap] inline slot=N cur_pos=M"
+            pos = -1
+            if "cur_pos=" in reply:
+                try:
+                    pos = int(reply.split("cur_pos=", 1)[1].split()[0])
+                except (IndexError, ValueError):
+                    pos = -1
+            if pos >= 0 and pos != cut:
+                # Generation may include an extra stop / special token past
+                # what we hash.  Only register when live KV covers the hash.
+                if pos < cut:
+                    print(
+                        f"{self.log_prefix} skip live deepen slot={slot} "
+                        f"cur_pos={pos} < cut={cut}",
+                        flush=True,
+                    )
+                    return False
+            self.confirm_inline_snap(slot, cut, prefix_ids, scope=cache_scope)
+            print(
+                f"{self.log_prefix} live deepen slot={slot} prefix_len={cut} "
+                f"daemon_cur_pos={pos} scope={cache_scope!r}",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"{self.log_prefix} live deepen failed: {exc}", flush=True)
+            self.abort_inline_snap(slot, scope=cache_scope)
+            return False
 
     async def maybe_snapshot(self, prompt_ids: list[int],
                               token_stream_consumer=None,

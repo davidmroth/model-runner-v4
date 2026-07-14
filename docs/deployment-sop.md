@@ -203,6 +203,10 @@ cat /media/data/projects/lucebox-hub-src/server/build-mmproj/BUILD_PROVENANCE
 docker logs model-runner-v4-lucebox 2>&1 | grep -E "deferred conv snap failed|RESTORE_CHAIN thick=" | tail -20
 ```
 
+Warm TTFT + WebUI TTFT/t/s strip: see
+[warm-ttft-and-usage-timings.md](./warm-ttft-and-usage-timings.md)
+(decode parse for `[target-split-dflash]`, large-tail deepen snap).
+
 ---
 
 ## Fixing `git pull` blocked by untracked files
