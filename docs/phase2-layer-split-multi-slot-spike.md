@@ -1,6 +1,6 @@
 # Phase 2 spike — Layer-split multi-slot
 
-**Status:** M2b implemented · smoke pending ai.local  
+**Status:** M2b smoke PASSED on ai.local (2026-07-14) · Phase 3 next  
 **Branch:** `feat/native-mmproj-multi-request`  
 **Parent:** [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)
 
@@ -30,9 +30,10 @@ restore cannot silently hit the wrong live cache.
 ## M2b — tool-pin restore isolation
 
 1. ~~`SLOT k` required for multi-slot snap/restore (`daemon_loop`)~~ done.
-2. ~~Smoke: N=1 thin pin + `RESTORE_CHAIN`; N=2 pin+restore on slot 0 / idle 1 (+ inverse);
-   keep `slot_busy` / `slot_required`~~ ready to run on ai.local.
-3. **Do not** set compose `N=2` until M2b smoke is green. Phase 3 still blocked.
+2. ~~Smoke: N=1 thin pin + `RESTORE_CHAIN`; N=2 `slot_required` + pin/restore on
+   slot 0 while slot 1 idle (and inverse); keep `slot_busy`~~ **PASSED**
+   (2026-07-14; side binary `built_sha=0f808e7`, AR-only).
+3. **Do not** set compose `N=2` yet — Phase 3 (Python admission) is next.
 
 ---
 
@@ -43,7 +44,7 @@ restore cannot silently hit the wrong live cache.
 3. ~~Activate/swap per shard — `activate_target_cache_slot` / `swap_live_slot_state`~~
 4. ~~`LayerSplitBackend` slot façade + `continue_generate`~~
 5. ~~RESTORE_CHAIN — `SLOT k` then restore into live slot `k` (M2b harden)~~
-6. Smoke — `model-runner-v4/scripts/phase2_layer_split_multi_request_smoke.py` (M2b)
+6. ~~Smoke — `model-runner-v4/scripts/phase2_layer_split_multi_request_smoke.py` (M2b)~~
 
 ---
 
