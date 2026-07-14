@@ -57,19 +57,43 @@ class Daemon:
         self.stream_r = stream_r
         self.stderr_lines: list[str] = []
         self._stream_lock = threading.Lock()
+        self._out_lock = threading.Lock()
+        self._out_lines: list[str] = []
+        self._out_cv = threading.Condition(self._out_lock)
         self._parsed_frames: list[tuple[str, int, int | None]] = []
         self._stream_buf = b""
         self._stderr_thr = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thr.start()
+        self._stdout_thr = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._stdout_thr.start()
         self._stream_thr = threading.Thread(target=self._drain_stream, daemon=True)
         self._stream_thr.start()
         self._await_ready()
+
+    def _echo(self, tag: str, line: str) -> None:
+        # Never block the drain paths on a full agent/SSH stderr pipe —
+        # that deadlocks the daemon on its next stdout write (missing "ok").
+        try:
+            sys.stderr.write(f"[{tag}] {line}")
+            sys.stderr.flush()
+        except BrokenPipeError:
+            pass
 
     def _drain_stderr(self) -> None:
         assert self.proc.stderr is not None
         for line in self.proc.stderr:
             self.stderr_lines.append(line.rstrip("\n"))
-            sys.stderr.write(f"[daemon.err] {line}")
+            self._echo("daemon.err", line)
+
+    def _drain_stdout(self) -> None:
+        """Always drain daemon stdout so protocol acks cannot stall on a full pipe."""
+        assert self.proc.stdout is not None
+        for line in self.proc.stdout:
+            text = line.rstrip("\n")
+            self._echo("daemon.out", line)
+            with self._out_cv:
+                self._out_lines.append(text)
+                self._out_cv.notify_all()
 
     def _drain_stream(self) -> None:
         # Keep the token pipe drained so generate cannot block on a full pipe.
@@ -80,7 +104,7 @@ class Daemon:
                     return
                 continue
             try:
-                chunk = os.read(self.stream_r, 4096)
+                chunk = os.read(self.stream_r, 65536)
             except OSError:
                 return
             if not chunk:
@@ -102,7 +126,6 @@ class Daemon:
                         self._parsed_frames.append((kind, v, None))
 
     def _await_ready(self, timeout: float = 600.0) -> None:
-        assert self.proc.stdout is not None
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -110,35 +133,39 @@ class Daemon:
                     f"daemon exited early code={self.proc.returncode}\n"
                     + "\n".join(self.stderr_lines[-40:])
                 )
-            ready, _, _ = select.select([self.proc.stdout], [], [], 1.0)
-            if not ready:
-                continue
-            line = self.proc.stdout.readline()
-            if not line:
-                continue
-            sys.stderr.write(f"[daemon.out] {line}")
-            low = line.lower()
-            if "[daemon] ready" in low or "target_cache_slots=" in low:
-                return
+            with self._out_cv:
+                while self._out_lines:
+                    line = self._out_lines.pop(0)
+                    low = line.lower()
+                    if "[daemon] ready" in low or "target_cache_slots=" in low:
+                        return
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._out_cv.wait(timeout=min(1.0, remaining))
         raise TimeoutError("daemon ready banner timeout\n" + "\n".join(self.stderr_lines[-40:]))
 
     def cmd(self, line: str, expect_prefix: str | None = None, timeout: float = 120.0) -> str:
-        assert self.proc.stdin is not None and self.proc.stdout is not None
+        assert self.proc.stdin is not None
         self.proc.stdin.write(line + "\n")
         self.proc.stdin.flush()
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"daemon died after '{line}'")
-            ready, _, _ = select.select([self.proc.stdout], [], [], 1.0)
-            if not ready:
-                continue
-            out = self.proc.stdout.readline()
-            if not out:
-                continue
-            sys.stderr.write(f"[daemon.out] {out}")
-            if expect_prefix is None or out.startswith(expect_prefix) or out.startswith("err "):
-                return out.rstrip("\n")
+            with self._out_cv:
+                while self._out_lines:
+                    out = self._out_lines.pop(0)
+                    if (
+                        expect_prefix is None
+                        or out.startswith(expect_prefix)
+                        or out.startswith("err ")
+                    ):
+                        return out
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._out_cv.wait(timeout=min(1.0, remaining))
         raise TimeoutError(f"timeout waiting for response to: {line}")
 
     def read_stream(self, max_frames: int = 64, idle: float = 0.5) -> list[tuple[str, int, int | None]]:
@@ -183,6 +210,13 @@ def launch(
     target_gpus: str = "0,1",
 ) -> Daemon:
     stream_r, stream_w = os.pipe()
+    try:
+        # Prefer a large stream pipe so tagged START can't stall on emit().
+        import fcntl
+
+        fcntl.fcntl(stream_w, fcntl.F_SETPIPE_SZ, 1 << 20)
+    except Exception:
+        pass
     env = os.environ.copy()
     env.pop("DFLASH_LEGACY_DAEMON", None)
     env.pop("DFLASH_KVFLASH", None)
