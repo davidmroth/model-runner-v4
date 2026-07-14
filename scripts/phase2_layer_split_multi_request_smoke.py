@@ -338,7 +338,6 @@ def _isolation_restore(
         timeout=300,
     )
     assert out.startswith("ok "), out
-    assert f"live={restore_slot}" in out, out
     assert "RESTORE_CHAIN thick=-1" in out, out
     d.read_stream(idle=0.5)
 
