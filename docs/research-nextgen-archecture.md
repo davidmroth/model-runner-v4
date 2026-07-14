@@ -8,6 +8,13 @@ second GPU sits idle. This document analyzes how (and whether) GPU1 can be
 recruited — what is physically possible, what is not, and what each viable
 option buys.
 
+**Parallel next-gen track (multi-request):** layer-split is now live on
+`ai.local`; the remaining admission problem (chat vs cron / exclusive
+daemon lock → 503) is planned in
+[nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md)
+— single-pipe scheduler (C) → multi-pipe (B), plus shared tool-prefix KV
+pages. That track does not reopen §2 (remote live KV).
+
 ## 1. Current State
 
 ```mermaid

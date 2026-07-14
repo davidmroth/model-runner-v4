@@ -7,7 +7,9 @@
 This document states the **non-negotiable product goal** for the inference engine.
 Tactical gates and deploy steps live in
 [engine-certification-plan.md](./engine-certification-plan.md). Program context
-lives in [agent-inference-program.md](./agent-inference-program.md).
+lives in [agent-inference-program.md](./agent-inference-program.md). Multi-request
+admission + shared KV pages (next-gen concurrency) live in
+[nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md).
 
 ---
 
