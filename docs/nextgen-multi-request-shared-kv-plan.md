@@ -154,7 +154,7 @@ native mmproj + RESTORE_CHAIN + tool warmup on `feat/native-mmproj-multi-request
 |-------|-------------|--------|--------|
 | **0** | Docs / design freeze only (no hermes-agent fork) | Low — clarifies path; **no** cron-503 fix | **Done** — see [phase1-pr135-port-map.md](./phase1-pr135-port-map.md) |
 | **1** | Single-GPU scheduler + slots (`N=2` spike) | Medium (dev) — proves C works; **no** prod admission yet | **Gate passed (2026-07-13)** — `scripts/phase1_multi_request_smoke.py` on `ai.local` side binary `test_dflash.phase1`; prod compose still `N=1` |
-| **2** | Layer-split multi-slot on real 2×3090 path | High (engine) — required for `ai.local`; still no HTTP fix until 3 | Flag-gated recreate |
+| **2** | Layer-split multi-slot on real 2×3090 path | High (engine) — required for `ai.local`; still no HTTP fix until 3 | Flag-gated recreate — [phase2-layer-split-multi-slot-spike.md](./phase2-layer-split-multi-slot-spike.md) |
 | **3** | Python slot allocator; drop exclusive lock | **Critical (product)** — chat+cron can overlap; kills hard busy-503 | Compose `N=2` |
 | **4** | Shared tool-prefix KV pages | Medium (capacity) — lowers VRAM for `N>2` / long tools; not required for P0 | Optional flag |
 | **5** | Multi-pipe transport (B) | Low–medium (ops) — simpler clients; same scheduler | Optional |
