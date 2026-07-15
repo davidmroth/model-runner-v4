@@ -87,9 +87,14 @@ if [ -n "${DFLASH_TOOL_SPLIT_PLUGIN_DIR:-}" ]; then
   ARGS+=(--tool-split-plugin-dir "${DFLASH_TOOL_SPLIT_PLUGIN_DIR}")
 fi
 
-# Phase 3 M3a: live target-cache slots (default 1 — do not raise until M3b demux).
+# Live target-cache slots (default 1). N>1 auto-enables tagged demux +
+# drop-exclusive overlap — only DFLASH_TARGET_CACHE_SLOTS needs setting.
 _slots="${DFLASH_TARGET_CACHE_SLOTS:-1}"
 ARGS+=(--target-cache-slots "${_slots}")
+if [ "${_slots}" -gt 1 ]; then
+  export DFLASH_STREAM_TAGGED=1
+  export DFLASH_MULTI_SLOT_DROP_EXCLUSIVE=1
+fi
 if [ "${DFLASH_STREAM_TAGGED:-0}" = "1" ]; then
   ARGS+=(--stream-tagged)
 fi

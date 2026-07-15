@@ -30,24 +30,33 @@ def target_cache_slots() -> int:
 
 
 def stream_tagged_enabled() -> bool:
+    """Tagged demux framing for the shared token pipe.
+
+    Auto-on when ``DFLASH_TARGET_CACHE_SLOTS>1`` — multi-slot cannot safely
+    demux bare tokens. Env ``DFLASH_STREAM_TAGGED=1`` still enables tagging
+    under N=1 for deliberate demux tests.
+    """
+    if target_cache_slots() > 1:
+        return True
     raw = os.environ.get("DFLASH_STREAM_TAGGED", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def multi_slot_drop_exclusive() -> bool:
-    """When N>1, skip PriorityDaemonLock (needs tagged demux — M3b).
+    """Skip single-flight exclusive lock so N>1 requests can overlap.
 
-    Default off so compose can plumb N>1 for SLOT sticky tests without
-    interleaving untagged token streams. Prefer ``overlap_mode_enabled()``
-    once demux + START/SCHED are wired on the HTTP path.
+    Auto-on when ``DFLASH_TARGET_CACHE_SLOTS>1`` (pairing with tagged demux).
+    Env can still force it on under N=1 for spike tests.
     """
+    if target_cache_slots() > 1:
+        return True
     raw = os.environ.get("DFLASH_MULTI_SLOT_DROP_EXCLUSIVE", "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def overlap_mode_enabled() -> bool:
-    """True when live multi-slot + tagged stream are both configured."""
-    return target_cache_slots() > 1 and stream_tagged_enabled()
+    """True when live multi-slot overlap is active (slots>1 implies tagged)."""
+    return target_cache_slots() > 1
 
 
 def schedule_quantum() -> int:

@@ -33,16 +33,39 @@ class ConfigHelpersTests(unittest.TestCase):
             self.assertEqual(target_cache_slots(), 1)
 
     def test_stream_tagged_and_drop_exclusive_flags(self) -> None:
-        with patch.dict(os.environ, {"DFLASH_STREAM_TAGGED": "1"}):
+        with patch.dict(os.environ, {"DFLASH_TARGET_CACHE_SLOTS": "1", "DFLASH_STREAM_TAGGED": "1"}):
             self.assertTrue(stream_tagged_enabled())
-        with patch.dict(os.environ, {"DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "yes"}):
+        with patch.dict(
+            os.environ,
+            {"DFLASH_TARGET_CACHE_SLOTS": "1", "DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "yes"},
+        ):
             self.assertTrue(multi_slot_drop_exclusive())
         with patch.dict(
             os.environ,
-            {"DFLASH_STREAM_TAGGED": "0", "DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "0"},
+            {
+                "DFLASH_TARGET_CACHE_SLOTS": "1",
+                "DFLASH_STREAM_TAGGED": "0",
+                "DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "0",
+            },
         ):
             self.assertFalse(stream_tagged_enabled())
             self.assertFalse(multi_slot_drop_exclusive())
+
+    def test_n_gt_1_auto_enables_tagged_and_drop_exclusive(self) -> None:
+        """Operators only set slots; tagged + overlap follow automatically."""
+        with patch.dict(
+            os.environ,
+            {
+                "DFLASH_TARGET_CACHE_SLOTS": "2",
+                "DFLASH_STREAM_TAGGED": "0",
+                "DFLASH_MULTI_SLOT_DROP_EXCLUSIVE": "0",
+            },
+        ):
+            self.assertTrue(stream_tagged_enabled())
+            self.assertTrue(multi_slot_drop_exclusive())
+            from target_cache_admission import overlap_mode_enabled
+
+            self.assertTrue(overlap_mode_enabled())
 
 
 class FormatSlotCommandTests(unittest.TestCase):

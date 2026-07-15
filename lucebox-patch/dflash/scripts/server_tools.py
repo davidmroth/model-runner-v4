@@ -3512,10 +3512,15 @@ def main():
         os.environ["DFLASH_TARGET_CACHE_SLOTS"] = str(slots_n)
     if slots_n > 1:
         extra_daemon.append(f"--target-cache-slots={slots_n}")
+        # Multi-slot requires tagged demux + non-exclusive admit; auto-manage
+        # so operators only set DFLASH_TARGET_CACHE_SLOTS.
+        os.environ["DFLASH_STREAM_TAGGED"] = "1"
+        os.environ["DFLASH_MULTI_SLOT_DROP_EXCLUSIVE"] = "1"
     tagged = bool(args.stream_tagged) or stream_tagged_enabled()
     if tagged:
         os.environ["DFLASH_STREAM_TAGGED"] = "1"
-        extra_daemon.append("--stream-tagged")
+        if "--stream-tagged" not in extra_daemon:
+            extra_daemon.append("--stream-tagged")
     if args.target_gpus:
         extra_daemon.append(f"--target-gpus={args.target_gpus}")
         if args.target_layer_split:
