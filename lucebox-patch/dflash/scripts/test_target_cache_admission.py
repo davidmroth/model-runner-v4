@@ -191,12 +191,12 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_slow_lane_cannot_take_last_reserved_slot(self) -> None:
         pool = TargetCacheSlotPool(2)
-        fast = await pool.acquire("conv:a", scoped=True, lane="fast")
+        fast = await pool.acquire("conv:a", scoped=True, lane="priority")
         # One free remains, reserved=1 → slow must not grant.
         with self.assertRaises(asyncio.TimeoutError):
             await pool.acquire("ephemeral:slow", scoped=False, max_wait=0.05, lane="slow")
         # Fast may still take the reserved slot.
-        fast2 = await pool.acquire("conv:b", scoped=True, max_wait=0.05, lane="fast")
+        fast2 = await pool.acquire("conv:b", scoped=True, max_wait=0.05, lane="priority")
         self.assertNotEqual(fast.slot, fast2.slot)
         pool.release(fast)
         # Now free=1 again (reserved) — still no slow.
@@ -208,14 +208,14 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await pool.acquire("ephemeral:deny", scoped=False, max_wait=0.05, lane="slow")
         remaining_fast = await pool.acquire(
-            "conv:c", scoped=True, max_wait=0.05, lane="fast",
+            "conv:c", scoped=True, max_wait=0.05, lane="priority",
         )
         pool.release(slow)
         pool.release(remaining_fast)
 
     async def test_fast_v1_drains_waiting_slow_slot_waiter(self) -> None:
         pool = TargetCacheSlotPool(1)
-        held = await pool.acquire("conv:a", scoped=True, lane="fast")
+        held = await pool.acquire("conv:a", scoped=True, lane="priority")
         cancelled = asyncio.Event()
 
         async def slow_waiter():
@@ -229,7 +229,7 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.01)
         self.assertEqual(len(pool._low), 1)
         t_fast = asyncio.create_task(
-            pool.acquire("ephemeral:f", scoped=False, max_wait=5.0, lane="fast")
+            pool.acquire("ephemeral:f", scoped=False, max_wait=5.0, lane="priority")
         )
         await asyncio.wait_for(cancelled.wait(), timeout=1.0)
         self.assertEqual(len(pool._low), 0)

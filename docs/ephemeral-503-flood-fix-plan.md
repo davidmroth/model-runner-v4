@@ -328,8 +328,8 @@ Explicit background path on the **same daemon** as `/v1`:
 
 | Path | Lane | Admission |
 |------|------|-----------|
-| `/v1/chat/completions` | fast | scoped sticky; long hold; may use all live slots |
-| `/v1e/chat/completions` | slow | always ephemeral; short/medium wait; **cannot take reserved fast slot** |
+| `/v1/chat/completions` | priority | sticky/scoped when conv id; long hold; may use all live slots |
+| `/v1e/chat/completions` | slow | always ephemeral; short/medium wait; **cannot take reserved priority slot** |
 
 **Preemption:** any `/v1` request bumps `/v1e`:
 

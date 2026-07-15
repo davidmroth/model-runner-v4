@@ -216,7 +216,7 @@ def sticky_affinity_key(key: str | None, *, scoped: bool) -> str:
 
 
 def reserved_fast_slots(n_slots: int) -> int:
-    """Slots held exclusively for fast-lane (``/v1``) traffic.
+    """Slots held exclusively for priority-lane (``/v1``) traffic.
 
     Auto: reserve 1 when ``n_slots >= 2`` so ``/v1e`` cannot take the last
     live slot. Override with ``DFLASH_RESERVED_FAST_SLOTS`` (clamped to
@@ -237,11 +237,11 @@ class SlotLease:
     slot: int
     key: str
     scoped: bool
-    lane: str = "fast"
+    lane: str = "priority"
 
 
 class TargetCacheSlotPool:
-    """Sticky free-list of live target-cache slots with fast-over-slow waits.
+    """Sticky free-list of live target-cache slots with priority-over-slow waits.
 
     Queues (wake order: high → mid → low):
 
@@ -249,7 +249,7 @@ class TargetCacheSlotPool:
     - **mid** — legacy leftover
     - **low** — ``/v1e`` (slow)
 
-    Any ``/v1`` enqueue drains waiting ``/v1e``. When a fast waiter cannot
+    Any ``/v1`` enqueue drains waiting ``/v1e``. When a priority waiter cannot
     grant and a slow holder exists, ``bump_slow`` is invoked.
     """
 
@@ -283,7 +283,7 @@ class TargetCacheSlotPool:
 
     @staticmethod
     def _tier(*, scoped: bool, lane: str) -> str:
-        # All /v1 (fast) shares high priority over /v1e (slow).
+        # All /v1 (priority) shares high priority over /v1e (slow).
         if lane == "slow":
             return "low"
         return "high"
@@ -311,7 +311,7 @@ class TargetCacheSlotPool:
         key: str,
         *,
         scoped: bool,
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> SlotLease | None:
         sticky = self._sticky.get(key)
         if sticky is not None and sticky not in self._held:
@@ -393,9 +393,9 @@ class TargetCacheSlotPool:
         *,
         scoped: bool = True,
         max_wait: float = float("inf"),
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> SlotLease:
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
         if lane == "slow":
             scoped = False
         key = sticky_affinity_key(key, scoped=scoped)
@@ -452,7 +452,7 @@ class TargetCacheSlotPool:
         *,
         scoped: bool = True,
         max_wait: float = float("inf"),
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> AsyncIterator[SlotLease]:
         acquired = await self.acquire(
             key, scoped=scoped, max_wait=max_wait, lane=lane,

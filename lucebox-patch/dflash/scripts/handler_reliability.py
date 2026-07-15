@@ -72,7 +72,7 @@ class DaemonBusyError(Exception):
 
 
 class PriorityDaemonLock:
-    """Single-flight lock with fast (/v1) priority over slow (/v1e).
+    """Single-flight lock with priority (/v1) priority over slow (/v1e).
 
     Queues (release order: high → mid → low):
 
@@ -80,19 +80,19 @@ class PriorityDaemonLock:
     - **mid** — legacy leftover (unused for new admits)
     - **low** — slow lane ``/v1e``
 
-    Any fast enqueue drains low waiters and bumps an in-flight slow holder.
+    Any priority enqueue drains low waiters and bumps an in-flight slow holder.
     """
 
     def __init__(self) -> None:
         self._held = False
-        self._holder_lane: str = "fast"
+        self._holder_lane: str = "priority"
         self._high: deque[asyncio.Future[None]] = deque()
         self._mid: deque[asyncio.Future[None]] = deque()
         self._low: deque[asyncio.Future[None]] = deque()
         self._bump_slow: Callable[[], None] | None = None
 
     def set_bump_slow_callback(self, cb: Callable[[], None] | None) -> None:
-        """Called when a fast waiter needs the lock held by a slow request."""
+        """Called when a priority waiter needs the lock held by a slow request."""
         self._bump_slow = cb
 
     def locked(self) -> bool:
@@ -115,7 +115,7 @@ class PriorityDaemonLock:
 
     @staticmethod
     def _tier(*, scoped: bool, lane: str) -> str:
-        # All /v1 (fast) shares high priority over /v1e (slow). Scoped vs
+        # All /v1 (priority) shares high priority over /v1e (slow). Scoped vs
         # unscoped /v1 is FIFO within high; only /v1e sits on low.
         if lane == "slow":
             return "low"
@@ -153,9 +153,9 @@ class PriorityDaemonLock:
         *,
         scoped: bool,
         max_wait: float,
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> None:
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
         tier = self._tier(scoped=scoped, lane=lane)
         if not self._held:
             self._held = True
@@ -171,11 +171,11 @@ class PriorityDaemonLock:
         self._queue_for(tier).append(fut)
         if tier == "high":
             # Prefer draining leftover mid waiters (legacy) plus all /v1e.
-            self._drain_queue(self._mid, reason="fast /v1 enqueued")
-            self._drain_queue(self._low, reason="fast /v1 enqueued")
+            self._drain_queue(self._mid, reason="priority /v1 enqueued")
+            self._drain_queue(self._low, reason="priority /v1 enqueued")
             self._maybe_bump_slow_holder(waiter_lane=lane)
         elif tier == "mid":
-            self._drain_queue(self._low, reason="fast /v1 enqueued")
+            self._drain_queue(self._low, reason="priority /v1 enqueued")
             self._maybe_bump_slow_holder(waiter_lane=lane)
         try:
             if max_wait == float("inf"):
@@ -202,7 +202,7 @@ class PriorityDaemonLock:
         if not self._held:
             raise RuntimeError("release on unlocked PriorityDaemonLock")
         self._held = False
-        self._holder_lane = "fast"
+        self._holder_lane = "priority"
         for tier, queue in (
             ("high", self._high),
             ("mid", self._mid),
@@ -213,7 +213,7 @@ class PriorityDaemonLock:
                 if fut.cancelled():
                     continue
                 self._held = True
-                self._holder_lane = "slow" if tier == "low" else "fast"
+                self._holder_lane = "slow" if tier == "low" else "priority"
                 fut.set_result(None)
                 return
 
@@ -312,7 +312,7 @@ def slow_lane_lock_wait_seconds() -> float:
     """Max lock/slot wait for explicit slow-lane traffic (``/v1e``).
 
     Defaults to 30s (longer than accidental ``/v1`` ephemeral) so title-gen and
-    extractors can ride brief fast-lane occupancy without hammering. Override
+    extractors can ride brief priority-lane occupancy without hammering. Override
     with ``DFLASH_SLOW_LANE_LOCK_WAIT_SEC``.
     """
     raw = os.environ.get("DFLASH_SLOW_LANE_LOCK_WAIT_SEC", "30")
@@ -346,7 +346,7 @@ def slow_lane_max_tokens() -> int:
         return ephemeral_max_tokens()
 
 
-def chat_stream_lock_wait_seconds(*, scoped: bool, lane: str = "fast") -> float:
+def chat_stream_lock_wait_seconds(*, scoped: bool, lane: str = "priority") -> float:
     """Lock wait for chat/chat-stream before 503.
 
     Slow lane (``/v1e``) uses ``DFLASH_SLOW_LANE_LOCK_WAIT_SEC``. Accidental

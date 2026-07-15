@@ -591,13 +591,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         *,
         max_wait: float | None = None,
         scoped: bool = True,
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> None:
         wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
         loop = asyncio.get_running_loop()
         queued_at = loop.time()
         use_priority = scoped_lock_priority_enabled()
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
 
         if daemon_lock.locked() and (scoped or lane == "slow" or should_log_ephemeral_busy()):
             if wait_sec == float("inf"):
@@ -619,7 +619,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             else:
                 # Legacy FIFO: treat as scoped for asyncio.Lock semantics.
                 await daemon_lock.acquire(
-                    scoped=True, max_wait=wait_sec, lane="fast",
+                    scoped=True, max_wait=wait_sec, lane="priority",
                 )
             waited = loop.time() - queued_at
             if waited >= 1.0:
@@ -640,15 +640,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         max_wait: float | None = None,
         scoped: bool = True,
         affinity_key: str | None = None,
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> _DaemonAdmission:
         """Lease a live target-cache SLOT (N>1) and optionally the exclusive pipe lock."""
         wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
         if lane == "slow":
             scoped = False
         # Any /v1 arrival preempts waiting/in-flight /v1e before we contend.
-        if lane == "fast":
+        if lane == "priority":
             slow_bump.bump_all()
         lease = None
         key = affinity_key or (f"scoped:{label}" if scoped else f"ephemeral:{label}")
@@ -944,7 +944,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         max_wait: float | None = None,
         scoped: bool = True,
         affinity_key: str | None = None,
-        lane: str = "fast",
+        lane: str = "priority",
     ):
         """Admit one in-flight daemon request (N=1 exclusive; N>1 sticky SLOT)."""
         admission = await _enter_daemon_admission(
@@ -1796,7 +1796,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         prompt_len: int,
         *,
         ephemeral: bool = False,
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> int:
         available_gen = max_ctx - prompt_len - 20
         gen = min(_max_gen_tokens(req), available_gen)
@@ -1982,14 +1982,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         request: Request,
         vision: tuple[Path, Path],
         *,
-        lane: str = "fast",
+        lane: str = "priority",
     ) -> JSONResponse | StreamingResponse:
         """Handle a multimodal request via GENERATE_MULTIMODAL daemon command.
 
         Vision turns bypass the prefix cache and tool-split logic entirely (v1).
         KV caching of previous text context is not preserved across image turns.
         """
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
         img_path, text_path = vision
         gen_len = _max_gen_tokens(req)
         if lane == "slow":
@@ -2175,9 +2175,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         req: ChatRequest,
         request: Request,
         *,
-        lane: str = "fast",
+        lane: str = "priority",
     ):
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
         # ── Vision fast-path ────────────────────────────────────────────────
         # If any message contains image_url content, route to the multimodal
         # daemon command.  Vision turns are ephemeral (no KV caching v1) so
@@ -2460,7 +2460,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
-        return await _chat_completions_impl(req, request, lane="fast")
+        return await _chat_completions_impl(req, request, lane="priority")
 
     @app.post("/v1e/chat/completions")
     async def chat_completions_slow(req: ChatRequest, request: Request):
@@ -2486,11 +2486,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cur_ids=None,
         tool_ctx: ToolRequestContext | None = None,
         cache_scope: str = "global",
-        lane: str = "fast",
+        lane: str = "priority",
     ):
         # prompt_bin may be cur_bin (the compressed bin) when coming from the
         # compression or full-cache-hit path; prompt_len is derived from it.
-        lane = "slow" if lane == "slow" else "fast"
+        lane = "slow" if lane == "slow" else "priority"
         prompt_len = prompt_bin.stat().st_size // 4 if full_hit is None else (
             full_hit[2]  # cached_cur_ids_len
         )

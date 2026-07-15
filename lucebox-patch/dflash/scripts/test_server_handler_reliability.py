@@ -221,8 +221,8 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
                 order.append("slow-cancelled")
 
         async def fast_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
-            order.append("fast")
+            await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
+            order.append("priority")
             lock.release()
 
         lock._held = True
@@ -232,7 +232,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lock.scoped_waiting, 1)
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
-        self.assertIn("fast", order)
+        self.assertIn("priority", order)
         self.assertIn("slow-cancelled", order)
         self.assertNotIn("slow", order)
 
@@ -242,7 +242,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         lock._held = True
 
         async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
+            await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
             lock.release()
 
         t_user = asyncio.create_task(scoped_waiter())
@@ -252,7 +252,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         started = loop.time()
         with self.assertRaises(asyncio.TimeoutError):
-            await lock.acquire(scoped=False, max_wait=0.25, lane="fast")
+            await lock.acquire(scoped=False, max_wait=0.25, lane="priority")
         elapsed = loop.time() - started
         self.assertGreaterEqual(elapsed, 0.2)
         self.assertLess(elapsed, 1.0)
@@ -274,7 +274,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
                 raise
 
         async def fast_waiter():
-            await lock.acquire(scoped=False, max_wait=5.0, lane="fast")
+            await lock.acquire(scoped=False, max_wait=5.0, lane="priority")
             lock.release()
 
         t_slow = asyncio.create_task(slow_waiter())
@@ -299,7 +299,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         release_scoped = asyncio.Event()
 
         async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
+            await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
             order.append("scoped-acquired")
             scoped_holds.set()
             await release_scoped.wait()
@@ -308,7 +308,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
 
         async def unscoped_after_scoped():
             await scoped_holds.wait()
-            await lock.acquire(scoped=False, max_wait=5.0, lane="fast")
+            await lock.acquire(scoped=False, max_wait=5.0, lane="priority")
             order.append("unscoped-acquired")
             lock.release()
 
@@ -341,7 +341,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.append(name)
 
         async def fast_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
+            await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
             lock.release()
 
         t_e1 = asyncio.create_task(slow_waiter("e1"))
@@ -373,8 +373,8 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
                 order.append("slow-cancelled")
 
         async def fast_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
-            order.append("fast")
+            await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
+            order.append("priority")
             lock.release()
 
         t_slow = asyncio.create_task(slow_waiter())
@@ -386,7 +386,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
 
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
-        self.assertIn("fast", order)
+        self.assertIn("priority", order)
         self.assertNotIn("slow", order)
 
     def test_busy_retry_after_matches_ephemeral_wait(self):
@@ -416,7 +416,7 @@ class SlowLaneBumpTests(unittest.IsolatedAsyncioTestCase):
 
         # Unscoped /v1 (also high) must drain /v1e waiters.
         t_fast = asyncio.create_task(
-            lock.acquire(scoped=False, max_wait=5.0, lane="fast")
+            lock.acquire(scoped=False, max_wait=5.0, lane="priority")
         )
         await asyncio.wait_for(cancelled.wait(), timeout=1.0)
         self.assertEqual(len(lock._low), 0)
