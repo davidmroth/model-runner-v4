@@ -241,17 +241,16 @@ class SlotLease:
 
 
 class TargetCacheSlotPool:
-    """Sticky free-list of live target-cache slots with three-tier waits.
+    """Sticky free-list of live target-cache slots with fast-over-slow waits.
 
     Queues (wake order: high → mid → low):
 
-    - **high** — scoped ``/v1``
-    - **mid** — unscoped ``/v1``
-    - **low** — slow lane ``/v1e``
+    - **high** — all ``/v1`` (fast)
+    - **mid** — legacy leftover
+    - **low** — ``/v1e`` (slow)
 
-    Any ``/v1`` enqueue drains waiting ``/v1e``. Scoped also drains mid.
-    When a fast waiter cannot grant and a slow holder exists, ``bump_slow``
-    is invoked so in-flight ``/v1e`` can CANCEL and free a slot.
+    Any ``/v1`` enqueue drains waiting ``/v1e``. When a fast waiter cannot
+    grant and a slow holder exists, ``bump_slow`` is invoked.
     """
 
     def __init__(self, n_slots: int) -> None:
@@ -284,11 +283,10 @@ class TargetCacheSlotPool:
 
     @staticmethod
     def _tier(*, scoped: bool, lane: str) -> str:
+        # All /v1 (fast) shares high priority over /v1e (slow).
         if lane == "slow":
             return "low"
-        if scoped:
-            return "high"
-        return "mid"
+        return "high"
 
     def _queue_for(
         self, tier: str

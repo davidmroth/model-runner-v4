@@ -207,43 +207,42 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
 
 
 class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
-    async def test_scoped_jumps_ahead_of_ephemeral_waiter(self):
-        """Scoped request causes queued ephemeral to be cancelled, not merely deferred."""
+    async def test_fast_v1_cancels_waiting_v1e(self):
+        """Any /v1 cancels queued /v1e, not merely deferring it."""
         lock = PriorityDaemonLock()
         order: list[str] = []
 
-        async def ephemeral_waiter():
+        async def slow_waiter():
             try:
-                await lock.acquire(scoped=False, max_wait=5.0)
-                order.append("bench")
+                await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
+                order.append("slow")
                 lock.release()
             except (asyncio.CancelledError, DaemonBusyError):
-                order.append("bench-cancelled")
+                order.append("slow-cancelled")
 
-        async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0)
-            order.append("user")
+        async def fast_waiter():
+            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
+            order.append("fast")
             lock.release()
 
         lock._held = True
-        t_bench = asyncio.create_task(ephemeral_waiter())
-        t_user = asyncio.create_task(scoped_waiter())
+        t_slow = asyncio.create_task(slow_waiter())
+        t_fast = asyncio.create_task(fast_waiter())
         await asyncio.sleep(0.05)
         self.assertEqual(lock.scoped_waiting, 1)
         lock.release()
-        await asyncio.wait_for(asyncio.gather(t_bench, t_user), timeout=2.0)
-        # Ephemeral is cancelled when scoped enqueues; user runs first and only.
-        self.assertIn("user", order)
-        self.assertIn("bench-cancelled", order)
-        self.assertNotIn("bench", order)
+        await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
+        self.assertIn("fast", order)
+        self.assertIn("slow-cancelled", order)
+        self.assertNotIn("slow", order)
 
-    async def test_ephemeral_waits_then_times_out_when_scoped_queued(self):
-        """Ephemeral joins _mid and waits; does not instant-503 while scoped is queued."""
+    async def test_unscoped_v1_waits_with_scoped_on_high(self):
+        """Unscoped /v1 also joins high and can wait (no instant fail vs scoped)."""
         lock = PriorityDaemonLock()
         lock._held = True
 
         async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0)
+            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
             lock.release()
 
         t_user = asyncio.create_task(scoped_waiter())
@@ -253,7 +252,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         started = loop.time()
         with self.assertRaises(asyncio.TimeoutError):
-            await lock.acquire(scoped=False, max_wait=0.25)
+            await lock.acquire(scoped=False, max_wait=0.25, lane="fast")
         elapsed = loop.time() - started
         self.assertGreaterEqual(elapsed, 0.2)
         self.assertLess(elapsed, 1.0)
@@ -261,43 +260,38 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         lock.release()
         await t_user
 
-    async def test_ephemeral_cancelled_when_scoped_enqueues_while_waiting(self):
-        """scoped drain cancels an in-flight ephemeral wait well before max_wait."""
+    async def test_v1e_cancelled_when_any_v1_enqueues_while_waiting(self):
         lock = PriorityDaemonLock()
         lock._held = True
         cancelled = asyncio.Event()
 
-        async def ephemeral_waiter():
+        async def slow_waiter():
             try:
-                await lock.acquire(scoped=False, max_wait=10.0)
+                await lock.acquire(scoped=False, max_wait=10.0, lane="slow")
                 lock.release()
             except asyncio.CancelledError:
                 cancelled.set()
                 raise
 
-        async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0)
+        async def fast_waiter():
+            await lock.acquire(scoped=False, max_wait=5.0, lane="fast")
             lock.release()
 
-        t_bench = asyncio.create_task(ephemeral_waiter())
+        t_slow = asyncio.create_task(slow_waiter())
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._mid), 1)
+        self.assertEqual(len(lock._low), 1)
 
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        t_user = asyncio.create_task(scoped_waiter())
+        t_fast = asyncio.create_task(fast_waiter())
         await asyncio.wait_for(cancelled.wait(), timeout=1.0)
-        elapsed = loop.time() - started
-        self.assertLess(elapsed, 1.0)
-        self.assertEqual(len(lock._mid), 0)
+        self.assertEqual(len(lock._low), 0)
 
         lock.release()
         with self.assertRaises(asyncio.CancelledError):
-            await t_bench
-        await t_user
+            await t_slow
+        await t_fast
 
-    async def test_scoped_runs_before_ephemeral_after_release(self):
-        """After release, scoped waiter is granted before any ephemeral."""
+    async def test_scoped_runs_before_later_unscoped_after_release(self):
+        """After release, earlier high waiters are granted FIFO."""
         lock = PriorityDaemonLock()
         order: list[str] = []
         lock._held = True
@@ -305,100 +299,95 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         release_scoped = asyncio.Event()
 
         async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0)
+            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
             order.append("scoped-acquired")
             scoped_holds.set()
             await release_scoped.wait()
             order.append("scoped-releasing")
             lock.release()
 
-        async def ephemeral_after_scoped():
+        async def unscoped_after_scoped():
             await scoped_holds.wait()
-            await lock.acquire(scoped=False, max_wait=5.0)
-            order.append("ephemeral-acquired")
+            await lock.acquire(scoped=False, max_wait=5.0, lane="fast")
+            order.append("unscoped-acquired")
             lock.release()
 
         t_user = asyncio.create_task(scoped_waiter())
         await asyncio.sleep(0.01)
-        t_bench = asyncio.create_task(ephemeral_after_scoped())
+        t_other = asyncio.create_task(unscoped_after_scoped())
         await asyncio.sleep(0.01)
 
         lock.release()
         await asyncio.wait_for(scoped_holds.wait(), timeout=2.0)
         self.assertEqual(order, ["scoped-acquired"])
         release_scoped.set()
-        await asyncio.wait_for(asyncio.gather(t_user, t_bench), timeout=2.0)
+        await asyncio.wait_for(asyncio.gather(t_user, t_other), timeout=2.0)
         self.assertEqual(
             order,
-            ["scoped-acquired", "scoped-releasing", "ephemeral-acquired"],
+            ["scoped-acquired", "scoped-releasing", "unscoped-acquired"],
         )
 
-    async def test_scoped_drains_queued_ephemeral_waiters(self):
-        """Ephemerals already in _mid must be cancelled when a scoped request enqueues."""
+    async def test_fast_drains_queued_v1e_waiters(self):
+        """/v1e already in _low must be cancelled when any /v1 enqueues."""
         lock = PriorityDaemonLock()
         lock._held = True
         cancelled: list[str] = []
 
-        async def ephemeral_waiter(name: str):
+        async def slow_waiter(name: str):
             try:
-                await lock.acquire(scoped=False, max_wait=5.0)
+                await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
                 lock.release()
             except (asyncio.CancelledError, DaemonBusyError):
                 cancelled.append(name)
 
-        async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0)
+        async def fast_waiter():
+            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
             lock.release()
 
-        # Queue two ephemerals before scoped arrives.
-        t_e1 = asyncio.create_task(ephemeral_waiter("e1"))
-        t_e2 = asyncio.create_task(ephemeral_waiter("e2"))
+        t_e1 = asyncio.create_task(slow_waiter("e1"))
+        t_e2 = asyncio.create_task(slow_waiter("e2"))
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._mid), 2)
+        self.assertEqual(len(lock._low), 2)
 
-        # Scoped arrives — should drain both ephemeral waiters immediately.
-        t_s = asyncio.create_task(scoped_waiter())
+        t_s = asyncio.create_task(fast_waiter())
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._mid), 0, "ephemeral waiters not drained")
+        self.assertEqual(len(lock._low), 0, "slow waiters not drained")
 
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_e1, t_e2, t_s), timeout=2.0)
         self.assertIn("e1", cancelled)
         self.assertIn("e2", cancelled)
 
-    async def test_scoped_not_blocked_by_queued_ephemerals(self):
-        """Scoped must acquire before any previously-queued ephemeral can run."""
+    async def test_fast_not_blocked_by_queued_v1e(self):
+        """/v1 must acquire before any previously-queued /v1e can run."""
         lock = PriorityDaemonLock()
         order: list[str] = []
         lock._held = True
 
-        async def ephemeral_waiter():
+        async def slow_waiter():
             try:
-                await lock.acquire(scoped=False, max_wait=5.0)
-                order.append("bench")
+                await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
+                order.append("slow")
                 lock.release()
             except (asyncio.CancelledError, DaemonBusyError):
-                order.append("bench-cancelled")
+                order.append("slow-cancelled")
 
-        async def scoped_waiter():
-            await lock.acquire(scoped=True, max_wait=5.0)
-            order.append("user")
+        async def fast_waiter():
+            await lock.acquire(scoped=True, max_wait=5.0, lane="fast")
+            order.append("fast")
             lock.release()
 
-        # Ephemeral queues first, then scoped arrives.
-        t_bench = asyncio.create_task(ephemeral_waiter())
+        t_slow = asyncio.create_task(slow_waiter())
         await asyncio.sleep(0.01)
-        t_user = asyncio.create_task(scoped_waiter())
+        t_fast = asyncio.create_task(fast_waiter())
         await asyncio.sleep(0.01)
 
-        # Drain should have cancelled the bench waiter.
-        self.assertEqual(len(lock._mid), 0)
+        self.assertEqual(len(lock._low), 0)
 
         lock.release()
-        await asyncio.wait_for(asyncio.gather(t_bench, t_user), timeout=2.0)
-        # Scoped must run; bench must have been cancelled (never ran).
-        self.assertIn("user", order)
-        self.assertNotIn("bench", order)
+        await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
+        self.assertIn("fast", order)
+        self.assertNotIn("slow", order)
 
     def test_busy_retry_after_matches_ephemeral_wait(self):
         """_busy_response uses int(wait_sec) for Retry-After on ephemeral 503s."""
@@ -425,7 +414,7 @@ class SlowLaneBumpTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.01)
         self.assertEqual(len(lock._low), 1)
 
-        # Unscoped /v1 (mid) must drain /v1e waiters.
+        # Unscoped /v1 (also high) must drain /v1e waiters.
         t_fast = asyncio.create_task(
             lock.acquire(scoped=False, max_wait=5.0, lane="fast")
         )

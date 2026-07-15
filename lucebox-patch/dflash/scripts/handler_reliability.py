@@ -72,20 +72,15 @@ class DaemonBusyError(Exception):
 
 
 class PriorityDaemonLock:
-    """Single-flight lock with three-tier priority.
+    """Single-flight lock with fast (/v1) priority over slow (/v1e).
 
     Queues (release order: high → mid → low):
 
-    - **high** — scoped ``/v1`` (conversation id)
-    - **mid** — unscoped ``/v1`` (no conversation id)
+    - **high** — all ``/v1`` traffic (scoped or not)
+    - **mid** — legacy leftover (unused for new admits)
     - **low** — slow lane ``/v1e``
 
-    Enqueue rules:
-
-    - high drains mid + low waiters (scoped still bumps accidental ``/v1`` ephemeral)
-    - mid drains low waiters (any ``/v1`` bumps ``/v1e``)
-    - when a fast waiter enqueues while the holder is slow, ``bump_holder()`` runs
-      so in-flight ``/v1e`` can CANCEL and release
+    Any fast enqueue drains low waiters and bumps an in-flight slow holder.
     """
 
     def __init__(self) -> None:
@@ -120,11 +115,11 @@ class PriorityDaemonLock:
 
     @staticmethod
     def _tier(*, scoped: bool, lane: str) -> str:
+        # All /v1 (fast) shares high priority over /v1e (slow). Scoped vs
+        # unscoped /v1 is FIFO within high; only /v1e sits on low.
         if lane == "slow":
             return "low"
-        if scoped:
-            return "high"
-        return "mid"
+        return "high"
 
     def _queue_for(self, tier: str) -> deque[asyncio.Future[None]]:
         if tier == "high":
@@ -175,8 +170,9 @@ class PriorityDaemonLock:
         fut: asyncio.Future[None] = loop.create_future()
         self._queue_for(tier).append(fut)
         if tier == "high":
-            self._drain_queue(self._mid, reason="scoped enqueued")
-            self._drain_queue(self._low, reason="scoped enqueued")
+            # Prefer draining leftover mid waiters (legacy) plus all /v1e.
+            self._drain_queue(self._mid, reason="fast /v1 enqueued")
+            self._drain_queue(self._low, reason="fast /v1 enqueued")
             self._maybe_bump_slow_holder(waiter_lane=lane)
         elif tier == "mid":
             self._drain_queue(self._low, reason="fast /v1 enqueued")
