@@ -331,6 +331,11 @@ Explicit background path on the **same daemon** as `/v1`:
 | `/v1/chat/completions` | fast | scoped sticky; long hold; may use all live slots |
 | `/v1e/chat/completions` | slow | always ephemeral; short/medium wait; **cannot take reserved fast slot** |
 
+**Preemption:** any `/v1` request bumps `/v1e`:
+
+1. Waiting `/v1e` waiters are cancelled when any `/v1` enqueues (mid or high tier).
+2. In-flight `/v1e` is signalled via `SlowLaneBumpRegistry`; generation CANCEL+503s.
+
 Knobs:
 
 - `DFLASH_RESERVED_FAST_SLOTS` — auto `1` when `N>=2`, else `0`
