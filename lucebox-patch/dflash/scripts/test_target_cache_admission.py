@@ -189,6 +189,56 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
         pool.release(b)
         pool.release(c)
 
+    async def test_slow_lane_cannot_take_last_reserved_slot(self) -> None:
+        pool = TargetCacheSlotPool(2)
+        fast = await pool.acquire("conv:a", scoped=True, lane="fast")
+        # One free remains, reserved=1 → slow must not grant.
+        with self.assertRaises(asyncio.TimeoutError):
+            await pool.acquire("ephemeral:slow", scoped=False, max_wait=0.05, lane="slow")
+        # Fast may still take the reserved slot.
+        fast2 = await pool.acquire("conv:b", scoped=True, max_wait=0.05, lane="fast")
+        self.assertNotEqual(fast.slot, fast2.slot)
+        pool.release(fast)
+        # Now free=1 again (reserved) — still no slow.
+        with self.assertRaises(asyncio.TimeoutError):
+            await pool.acquire("ephemeral:slow2", scoped=False, max_wait=0.05, lane="slow")
+        pool.release(fast2)
+        # Both free → slow can take one, leave one reserved for fast.
+        slow = await pool.acquire("ephemeral:ok", scoped=False, max_wait=0.05, lane="slow")
+        with self.assertRaises(asyncio.TimeoutError):
+            await pool.acquire("ephemeral:deny", scoped=False, max_wait=0.05, lane="slow")
+        remaining_fast = await pool.acquire(
+            "conv:c", scoped=True, max_wait=0.05, lane="fast",
+        )
+        pool.release(slow)
+        pool.release(remaining_fast)
+
+    async def test_fast_v1_drains_waiting_slow_slot_waiter(self) -> None:
+        pool = TargetCacheSlotPool(1)
+        held = await pool.acquire("conv:a", scoped=True, lane="fast")
+        cancelled = asyncio.Event()
+
+        async def slow_waiter():
+            try:
+                await pool.acquire("ephemeral:s", scoped=False, max_wait=5.0, lane="slow")
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        t_slow = asyncio.create_task(slow_waiter())
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(pool._low), 1)
+        t_fast = asyncio.create_task(
+            pool.acquire("ephemeral:f", scoped=False, max_wait=5.0, lane="fast")
+        )
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+        self.assertEqual(len(pool._low), 0)
+        pool.release(held)
+        lease = await asyncio.wait_for(t_fast, timeout=1.0)
+        pool.release(lease)
+        with self.assertRaises(asyncio.CancelledError):
+            await t_slow
+
     async def test_lease_context_sets_active_slot(self) -> None:
         pool = TargetCacheSlotPool(2)
         async with pool.lease("conv:x", scoped=True) as lease:

@@ -43,6 +43,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
+from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -101,6 +102,7 @@ from stream_detokenize import IncrementalDetokenizer
 from handler_reliability import (
     DaemonBusyError,
     PriorityDaemonLock,
+    SlowLaneBumpRegistry,
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
     deferred_conv_snap_max_tail,
@@ -111,6 +113,7 @@ from handler_reliability import (
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
     should_log_ephemeral_busy,
+    slow_lane_max_tokens,
 )
 from target_cache_admission import (
     TargetCacheSlotPool,
@@ -546,6 +549,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     daemon_lock = PriorityDaemonLock()
     live_slots_n = target_cache_slots()
     slot_pool = TargetCacheSlotPool(live_slots_n)
+    slow_bump = SlowLaneBumpRegistry()
+    daemon_lock.set_bump_slow_callback(slow_bump.bump_all)
+    slot_pool.set_bump_slow_callback(slow_bump.bump_all)
+    _active_slow_bump: ContextVar[asyncio.Event | None] = ContextVar(
+        "dflash_active_slow_bump", default=None,
+    )
     daemon_stdin_lock = asyncio.Lock()
     tagged_demux: TaggedStreamDemux | None = None
     if live_slots_n > 1:
@@ -557,25 +566,40 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         )
 
     class _DaemonAdmission:
-        __slots__ = ("lease", "slot_tok", "exclusive")
+        __slots__ = ("lease", "slot_tok", "exclusive", "slow_id", "bump_event")
 
-        def __init__(self, lease, slot_tok, exclusive: bool) -> None:
+        def __init__(
+            self,
+            lease,
+            slot_tok,
+            exclusive: bool,
+            *,
+            slow_id: int | None = None,
+            bump_event: asyncio.Event | None = None,
+        ) -> None:
             self.lease = lease
             self.slot_tok = slot_tok
             self.exclusive = exclusive
+            self.slow_id = slow_id
+            self.bump_event = bump_event
+
+    class SlowLanePreempted(Exception):
+        """Raised when an in-flight /v1e request is bumped by /v1."""
 
     async def _acquire_daemon_lock(
         label: str,
         *,
         max_wait: float | None = None,
         scoped: bool = True,
+        lane: str = "fast",
     ) -> None:
         wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
         loop = asyncio.get_running_loop()
         queued_at = loop.time()
         use_priority = scoped_lock_priority_enabled()
+        lane = "slow" if lane == "slow" else "fast"
 
-        if daemon_lock.locked() and (scoped or should_log_ephemeral_busy()):
+        if daemon_lock.locked() and (scoped or lane == "slow" or should_log_ephemeral_busy()):
             if wait_sec == float("inf"):
                 print(
                     f"  [handler] daemon_lock busy — queueing ({label})",
@@ -589,10 +613,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 )
         try:
             if use_priority:
-                await daemon_lock.acquire(scoped=scoped, max_wait=wait_sec)
+                await daemon_lock.acquire(
+                    scoped=scoped, max_wait=wait_sec, lane=lane,
+                )
             else:
                 # Legacy FIFO: treat as scoped for asyncio.Lock semantics.
-                await daemon_lock.acquire(scoped=True, max_wait=wait_sec)
+                await daemon_lock.acquire(
+                    scoped=True, max_wait=wait_sec, lane="fast",
+                )
             waited = loop.time() - queued_at
             if waited >= 1.0:
                 print(
@@ -612,24 +640,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         max_wait: float | None = None,
         scoped: bool = True,
         affinity_key: str | None = None,
+        lane: str = "fast",
     ) -> _DaemonAdmission:
         """Lease a live target-cache SLOT (N>1) and optionally the exclusive pipe lock."""
         wait_sec = daemon_lock_wait_seconds() if max_wait is None else max_wait
+        lane = "slow" if lane == "slow" else "fast"
+        if lane == "slow":
+            scoped = False
+        # Any /v1 arrival preempts waiting/in-flight /v1e before we contend.
+        if lane == "fast":
+            slow_bump.bump_all()
         lease = None
         key = affinity_key or (f"scoped:{label}" if scoped else f"ephemeral:{label}")
         if live_slots_n > 1:
             try:
-                lease = await slot_pool.acquire(key, scoped=scoped, max_wait=wait_sec)
+                lease = await slot_pool.acquire(
+                    key, scoped=scoped, max_wait=wait_sec, lane=lane,
+                )
             except asyncio.TimeoutError:
                 print(
                     f"  [handler] target_cache_slot wait timed out after "
-                    f"{wait_sec:.0f}s ({label})",
+                    f"{wait_sec:.0f}s ({label} lane={lane})",
                     flush=True,
                 )
                 raise DaemonBusyError(label)
             slot_tok = set_active_live_slot(lease.slot)
             print(
-                f"  [handler] target_cache_slot={lease.slot} ({label})",
+                f"  [handler] target_cache_slot={lease.slot} ({label} lane={lane})",
                 flush=True,
             )
         else:
@@ -640,18 +677,30 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         )
         try:
             if exclusive:
-                await _acquire_daemon_lock(label, max_wait=max_wait, scoped=scoped)
+                await _acquire_daemon_lock(
+                    label, max_wait=max_wait, scoped=scoped, lane=lane,
+                )
         except Exception:
             reset_active_live_slot(slot_tok)
             if lease is not None:
                 slot_pool.release(lease)
             raise
-        return _DaemonAdmission(lease, slot_tok, exclusive)
+        slow_id = None
+        bump_event = None
+        if lane == "slow":
+            slow_id, bump_event = slow_bump.register()
+            _active_slow_bump.set(bump_event)
+        return _DaemonAdmission(
+            lease, slot_tok, exclusive, slow_id=slow_id, bump_event=bump_event,
+        )
 
     def _exit_daemon_admission(admission: _DaemonAdmission | None) -> None:
         if admission is None:
             return
         try:
+            if admission.slow_id is not None:
+                slow_bump.unregister(admission.slow_id)
+                _active_slow_bump.set(None)
             if admission.exclusive:
                 daemon_lock.release()
         finally:
@@ -666,6 +715,54 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     slot_pool.release(admission.lease)
                 except Exception as exc:
                     print(f"  [handler] slot_pool.release: {exc!r}", flush=True)
+
+    async def _await_or_bump(
+        awaitable,
+        bump_event: asyncio.Event | None,
+        *,
+        req_id: int | None = None,
+    ):
+        """Race ``awaitable`` against a slow-lane bump; CANCEL + raise if bumped."""
+        if bump_event is None:
+            return await awaitable
+        task = asyncio.ensure_future(awaitable)
+        bump_waiter = asyncio.create_task(bump_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, bump_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if bump_waiter in done and bump_event.is_set():
+                task.cancel()
+                if req_id is not None:
+                    try:
+                        async with daemon_stdin_lock:
+                            daemon_proc.stdin.write(
+                                f"CANCEL {int(req_id)}\n".encode()
+                            )
+                            daemon_proc.stdin.flush()
+                        print(
+                            f"  [handler] CANCEL req={req_id} — bumped by /v1",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"  [handler] CANCEL req={req_id} on bump failed: "
+                            f"{exc!r}",
+                            flush=True,
+                        )
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise SlowLanePreempted("slow lane bumped by /v1")
+            bump_waiter.cancel()
+            return await task
+        finally:
+            if not bump_waiter.done():
+                bump_waiter.cancel()
+            if not task.done():
+                task.cancel()
 
     def _write_daemon_cmd(cmd_line: str, *, req_id: int | None = None) -> None:
         """Write a daemon stdin line, adding ``SLOT k`` / ``REQ id`` when needed."""
@@ -789,20 +886,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         daemon_proc.stdin.flush()
 
                 sched_task = asyncio.create_task(_kick_sched())
-            if tagged_demux is not None and req_id is not None and queue is not None:
-                stops = stop_ids if use_stops else frozenset()
-                return [
-                    t
-                    async for t in tagged_demux.iter_tokens(
-                        req_id,
-                        gen_len,
-                        stops,
-                        wall_timeout=wall_timeout,
-                        queue=queue,
-                    )
-                ]
-            return await _collect_gen_tokens(
-                gen_len, req_id=None, wall_timeout=wall_timeout, use_stops=use_stops,
+
+            async def _collect() -> list[int]:
+                if tagged_demux is not None and req_id is not None and queue is not None:
+                    stops = stop_ids if use_stops else frozenset()
+                    return [
+                        t
+                        async for t in tagged_demux.iter_tokens(
+                            req_id,
+                            gen_len,
+                            stops,
+                            wall_timeout=wall_timeout,
+                            queue=queue,
+                        )
+                    ]
+                return await _collect_gen_tokens(
+                    gen_len, req_id=None, wall_timeout=wall_timeout, use_stops=use_stops,
+                )
+
+            return await _await_or_bump(
+                _collect(),
+                _active_slow_bump.get(),
+                req_id=req_id,
             )
         finally:
             if sched_task is not None:
@@ -839,10 +944,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         max_wait: float | None = None,
         scoped: bool = True,
         affinity_key: str | None = None,
+        lane: str = "fast",
     ):
         """Admit one in-flight daemon request (N=1 exclusive; N>1 sticky SLOT)."""
         admission = await _enter_daemon_admission(
-            label, max_wait=max_wait, scoped=scoped, affinity_key=affinity_key,
+            label,
+            max_wait=max_wait,
+            scoped=scoped,
+            affinity_key=affinity_key,
+            lane=lane,
         )
         try:
             yield
@@ -1050,7 +1160,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             ):
                 await _restart_daemon_if_dead()
                 await _execute_deferred_conv_snap_job(job)
-        except DaemonBusyError:
+        except (DaemonBusyError, SlowLanePreempted):
             prefix_cache.abort_inline_snap(job.conv_slot, scope=job.cache_scope)
             print(
                 "  [pc] deferred conv snap skipped — daemon busy",
@@ -1508,7 +1618,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         prompt_bin.unlink()
                     except Exception:
                         pass
-        except DaemonBusyError:
+        except (DaemonBusyError, SlowLanePreempted):
             print("  [tool-split] warmup skipped — daemon busy", flush=True)
         except Exception as exc:
             print(f"  [tool-split] warmup failed: {exc!r}", flush=True)
@@ -1529,7 +1639,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 # Never queue health/revive behind a long inference turn.
                 async with _daemon_request_lock("health-revive", max_wait=0):
                     await _restart_daemon_if_dead()
-            except DaemonBusyError:
+            except (DaemonBusyError, SlowLanePreempted):
                 return JSONResponse(
                     {
                         "status": "degraded",
@@ -1544,10 +1654,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
         return {"status": "ok"}
 
-    @app.get("/v1/models")
-    def list_models():
+    def _list_models_payload():
         return {"object": "list",
                 "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "luce"}]}
+
+    @app.get("/v1/models")
+    def list_models():
+        return _list_models_payload()
+
+    @app.get("/v1e/models")
+    def list_models_slow():
+        return _list_models_payload()
 
     def _maybe_compress_tool_chat(req: "ChatRequest", prompt_bin: Path,
                                   prompt_len: int, started_in_thinking: bool
@@ -1679,14 +1796,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         prompt_len: int,
         *,
         ephemeral: bool = False,
+        lane: str = "fast",
     ) -> int:
         available_gen = max_ctx - prompt_len - 20
         gen = min(_max_gen_tokens(req), available_gen)
-        if ephemeral:
-            cap = ephemeral_max_tokens()
+        if lane == "slow" or ephemeral:
+            cap = slow_lane_max_tokens() if lane == "slow" else ephemeral_max_tokens()
+            label = "slow-lane" if lane == "slow" else "ephemeral"
             if gen > cap:
                 print(
-                    f"  [handler] ephemeral max_tokens clamped {gen} → {cap}",
+                    f"  [handler] {label} max_tokens clamped {gen} → {cap}",
                     flush=True,
                 )
                 gen = cap
@@ -1862,19 +1981,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         req: ChatRequest,
         request: Request,
         vision: tuple[Path, Path],
+        *,
+        lane: str = "fast",
     ) -> JSONResponse | StreamingResponse:
         """Handle a multimodal request via GENERATE_MULTIMODAL daemon command.
 
         Vision turns bypass the prefix cache and tool-split logic entirely (v1).
         KV caching of previous text context is not preserved across image turns.
         """
+        lane = "slow" if lane == "slow" else "fast"
         img_path, text_path = vision
         gen_len = _max_gen_tokens(req)
+        if lane == "slow":
+            cap = slow_lane_max_tokens()
+            if gen_len > cap:
+                print(
+                    f"  [handler] slow-lane max_tokens clamped {gen_len} → {cap}",
+                    flush=True,
+                )
+                gen_len = cap
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         cmd_line = f"GENERATE_MULTIMODAL {img_path} {text_path} {gen_len}\n"
 
-        print(f"  [vision] multimodal request img={img_path.name}", flush=True)
+        print(
+            f"  [vision] multimodal request img={img_path.name} lane={lane}",
+            flush=True,
+        )
 
         def _cleanup():
             for p in (img_path, text_path):
@@ -1883,22 +2016,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 except Exception:
                     pass
 
-        # Vision turns do not use the text KV cache yet. They are nevertheless
-        # interactive work, so give them scoped admission priority even for
-        # OpenAI-compatible clients that do not send a conversation header.
-        scoped = True
-        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
+        # Fast-lane vision is interactive — scoped priority even without a
+        # conversation header. Slow lane (/v1e) always yields to scoped chat.
+        scoped = lane != "slow"
+        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped, lane=lane)
+        vision_label = "chat-vision-slow" if lane == "slow" else "chat-vision-stream"
 
         if req.stream:
             # Streaming vision response (SSE)
             admission = None
             try:
                 admission = await _enter_daemon_admission(
-                    "chat-vision-stream",
+                    vision_label,
                     max_wait=lock_wait,
                     scoped=scoped,
+                    lane=lane,
                 )
-            except DaemonBusyError:
+            except (DaemonBusyError, SlowLanePreempted):
                 _cleanup()
                 return _busy_response(retry_after_sec=lock_wait)
 
@@ -1983,7 +2117,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         # Non-streaming vision response
         try:
             async with _daemon_request_lock(
-                "chat-vision", max_wait=lock_wait, scoped=scoped,
+                "chat-vision-slow" if lane == "slow" else "chat-vision",
+                max_wait=lock_wait,
+                scoped=scoped,
+                lane=lane,
             ):
                 await _restart_daemon_if_dead()
                 drain_pipe_residual(r_pipe)
@@ -2013,7 +2150,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     if i != -1:
                         text = text[:i]
                 text, _reasoning = parse_reasoning(text, thinking_enabled=False)
-        except DaemonBusyError:
+        except (DaemonBusyError, SlowLanePreempted):
             _cleanup()
             return _busy_response(retry_after_sec=lock_wait)
         finally:
@@ -2034,15 +2171,20 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             },
         })
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatRequest, request: Request):
+    async def _chat_completions_impl(
+        req: ChatRequest,
+        request: Request,
+        *,
+        lane: str = "fast",
+    ):
+        lane = "slow" if lane == "slow" else "fast"
         # ── Vision fast-path ────────────────────────────────────────────────
         # If any message contains image_url content, route to the multimodal
         # daemon command.  Vision turns are ephemeral (no KV caching v1) so
         # the rest of the prefix-cache / tool-split logic is skipped entirely.
         vision = _extract_vision_from_request(req)
         if vision is not None:
-            return await _handle_vision_request(req, request, vision)
+            return await _handle_vision_request(req, request, vision, lane=lane)
 
         prompt_bin, started_in_thinking = _tokenize_prompt(req)
         prompt_len = prompt_bin.stat().st_size // 4
@@ -2057,7 +2199,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         request_headers = {k: v for k, v in request.headers.items()}
 
         tool_ctx: ToolRequestContext | None = None
-        conv_id = extract_conversation_id(request_headers)
+        # Slow lane never pins tool/conversation KV — always ephemeral scope.
+        conv_id = None if lane == "slow" else extract_conversation_id(request_headers)
         protect_pin = bool(conv_id)
         allow_evict_protected = (not tool_pin_protect_enabled()) or protect_pin
         if tool_split and req.tools:
@@ -2076,11 +2219,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     flush=True,
                 )
 
-        cache_scope = _request_cache_scope(request_headers, prompt_ids, tool_ctx)
-        if cache_scope.startswith("ephemeral:"):
-            print(f"  [pc] cache scope ephemeral (no X-Conversation-Id)", flush=True)
+        if lane == "slow":
+            cache_scope = resolve_cache_scope(
+                conversation_id=None,
+                prompt_ids=prompt_ids,
+                tools_fingerprint=tool_ctx.fingerprint if tool_ctx else None,
+            )
+            print(f"  [pc] cache scope ephemeral (slow lane /v1e)", flush=True)
         else:
-            print(f"  [pc] cache scope={cache_scope!r}", flush=True)
+            cache_scope = _request_cache_scope(request_headers, prompt_ids, tool_ctx)
+            if cache_scope.startswith("ephemeral:"):
+                print(f"  [pc] cache scope ephemeral (no X-Conversation-Id)", flush=True)
+            else:
+                print(f"  [pc] cache scope={cache_scope!r}", flush=True)
 
         full_hit = None
         full_snap_prep = None
@@ -2093,6 +2244,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             prefill_cfg is not None
             and prefill_cfg.enabled
             and (not req.tools or tool_split is not None)
+            and lane != "slow"
         )
         if allow_full_cache:
             full_hit = prefix_cache.lookup_full(prompt_ids, scope=cache_scope)
@@ -2105,7 +2257,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             started_in_thinking = False  # cached result: no think prefill
 
         gen_len = _clamp_gen_len(
-            req, prompt_len, ephemeral=is_ephemeral_cache_scope(cache_scope),
+            req,
+            prompt_len,
+            ephemeral=is_ephemeral_cache_scope(cache_scope),
+            lane=lane,
         )
         if gen_len <= 0:
             _abort_full_snap_if_needed(full_snap_prep)
@@ -2135,15 +2290,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 cur_ids=cur_ids,
                 tool_ctx=tool_ctx,
                 cache_scope=cache_scope,
+                lane=lane,
             )
 
         # Non-streaming: collect, parse, return.
-        scoped = not is_ephemeral_cache_scope(cache_scope)
-        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
+        scoped = lane != "slow" and not is_ephemeral_cache_scope(cache_scope)
+        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped, lane=lane)
+        chat_label = "chat-slow" if lane == "slow" else "chat"
         deferred_job: _DeferredConvSnapJob | None = None
         try:
-            async with _daemon_request_lock("chat", max_wait=lock_wait, scoped=scoped,
-                                           affinity_key=cache_scope):
+            async with _daemon_request_lock(
+                chat_label,
+                max_wait=lock_wait,
+                scoped=scoped,
+                affinity_key=cache_scope,
+                lane=lane,
+            ):
                 await _restart_daemon_if_dead()
                 (
                     cur_bin,
@@ -2162,7 +2324,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cache_scope,
                 )
                 gen_len = _clamp_gen_len(
-                    req, prompt_len, ephemeral=is_ephemeral_cache_scope(cache_scope),
+                    req,
+                    prompt_len,
+                    ephemeral=is_ephemeral_cache_scope(cache_scope),
+                    lane=lane,
                 )
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     cur_bin, gen_len, prompt_ids,
@@ -2224,7 +2389,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     tools=req.tools,
                 )
                 await _commit_tool_snap_if_needed(tool_ctx, tools=req.tools)
-        except DaemonBusyError:
+        except (DaemonBusyError, SlowLanePreempted):
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
                 try:
@@ -2293,6 +2458,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 prompt_len, len(tokens), conv_prefix_len=conv_prefix_len),
         })
 
+    @app.post("/v1/chat/completions")
+    async def chat_completions(req: ChatRequest, request: Request):
+        return await _chat_completions_impl(req, request, lane="fast")
+
+    @app.post("/v1e/chat/completions")
+    async def chat_completions_slow(req: ChatRequest, request: Request):
+        """Slow / ephemeral lane — title-gen, extractors, probes.
+
+        Same daemon as ``/v1`` but never sticky/scoped; cannot take the last
+        reserved fast slot when ``DFLASH_TARGET_CACHE_SLOTS >= 2``.
+        """
+        return await _chat_completions_impl(req, request, lane="slow")
+
     async def _stream_response(
         req,
         request: Request,
@@ -2308,25 +2486,29 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         cur_ids=None,
         tool_ctx: ToolRequestContext | None = None,
         cache_scope: str = "global",
+        lane: str = "fast",
     ):
         # prompt_bin may be cur_bin (the compressed bin) when coming from the
         # compression or full-cache-hit path; prompt_len is derived from it.
+        lane = "slow" if lane == "slow" else "fast"
         prompt_len = prompt_bin.stat().st_size // 4 if full_hit is None else (
             full_hit[2]  # cached_cur_ids_len
         )
         include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
         wall_timeout_sec = request_wall_timeout_seconds()
-        scoped = not is_ephemeral_cache_scope(cache_scope)
-        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped)
+        scoped = lane != "slow" and not is_ephemeral_cache_scope(cache_scope)
+        lock_wait = chat_stream_lock_wait_seconds(scoped=scoped, lane=lane)
+        stream_label = "chat-stream-slow" if lane == "slow" else "chat-stream"
         admission = None
         try:
             admission = await _enter_daemon_admission(
-                "chat-stream",
+                stream_label,
                 max_wait=lock_wait,
                 scoped=scoped,
                 affinity_key=cache_scope,
+                lane=lane,
             )
-        except DaemonBusyError:
+        except (DaemonBusyError, SlowLanePreempted):
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
                 try:
@@ -2397,7 +2579,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     cache_scope,
                 )
                 gen_len = _clamp_gen_len(
-                    req, prompt_len, ephemeral=is_ephemeral_cache_scope(cache_scope),
+                    req,
+                    prompt_len,
+                    ephemeral=is_ephemeral_cache_scope(cache_scope),
+                    lane=lane,
                 )
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     prompt_bin, gen_len, prompt_ids,

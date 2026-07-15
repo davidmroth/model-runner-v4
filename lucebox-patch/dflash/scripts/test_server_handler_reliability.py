@@ -7,6 +7,7 @@ from unittest.mock import patch
 from handler_reliability import (
     DaemonBusyError,
     PriorityDaemonLock,
+    SlowLaneBumpRegistry,
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
     ephemeral_lock_wait_seconds,
@@ -17,6 +18,8 @@ from handler_reliability import (
     scoped_lock_priority_enabled,
     scoped_lock_wait_cap_seconds,
     should_log_ephemeral_busy,
+    slow_lane_lock_wait_seconds,
+    slow_lane_max_tokens,
     tool_inline_snap_pin_enabled,
     tool_snapshot_max_kv_tokens,
 )
@@ -167,6 +170,20 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "0"}):
             self.assertEqual(chat_stream_lock_wait_seconds(scoped=False), 5.0)
 
+    def test_slow_lane_lock_wait_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(slow_lane_lock_wait_seconds(), 30.0)
+            self.assertEqual(
+                chat_stream_lock_wait_seconds(scoped=False, lane="slow"),
+                30.0,
+            )
+
+    def test_slow_lane_max_tokens_defaults_to_ephemeral(self):
+        with patch.dict(os.environ, {"DFLASH_EPHEMERAL_MAX_TOKENS": "512"}, clear=True):
+            self.assertEqual(slow_lane_max_tokens(), 512)
+        with patch.dict(os.environ, {"DFLASH_SLOW_LANE_MAX_TOKENS": "256"}):
+            self.assertEqual(slow_lane_max_tokens(), 256)
+
     def test_scoped_lock_wait_respects_explicit_cap(self):
         with patch.dict(os.environ, {
             "DFLASH_DAEMON_LOCK_WAIT_SEC": "120",
@@ -221,7 +238,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("bench", order)
 
     async def test_ephemeral_waits_then_times_out_when_scoped_queued(self):
-        """Ephemeral joins _low and waits; does not instant-503 while scoped is queued."""
+        """Ephemeral joins _mid and waits; does not instant-503 while scoped is queued."""
         lock = PriorityDaemonLock()
         lock._held = True
 
@@ -245,7 +262,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         await t_user
 
     async def test_ephemeral_cancelled_when_scoped_enqueues_while_waiting(self):
-        """_drain_low_waiters cancels an in-flight ephemeral wait well before max_wait."""
+        """scoped drain cancels an in-flight ephemeral wait well before max_wait."""
         lock = PriorityDaemonLock()
         lock._held = True
         cancelled = asyncio.Event()
@@ -264,7 +281,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
 
         t_bench = asyncio.create_task(ephemeral_waiter())
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._low), 1)
+        self.assertEqual(len(lock._mid), 1)
 
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -272,7 +289,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(cancelled.wait(), timeout=1.0)
         elapsed = loop.time() - started
         self.assertLess(elapsed, 1.0)
-        self.assertEqual(len(lock._low), 0)
+        self.assertEqual(len(lock._mid), 0)
 
         lock.release()
         with self.assertRaises(asyncio.CancelledError):
@@ -317,7 +334,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_scoped_drains_queued_ephemeral_waiters(self):
-        """Ephemerals already in _low must be cancelled when a scoped request enqueues."""
+        """Ephemerals already in _mid must be cancelled when a scoped request enqueues."""
         lock = PriorityDaemonLock()
         lock._held = True
         cancelled: list[str] = []
@@ -337,12 +354,12 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         t_e1 = asyncio.create_task(ephemeral_waiter("e1"))
         t_e2 = asyncio.create_task(ephemeral_waiter("e2"))
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._low), 2)
+        self.assertEqual(len(lock._mid), 2)
 
         # Scoped arrives — should drain both ephemeral waiters immediately.
         t_s = asyncio.create_task(scoped_waiter())
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._low), 0, "ephemeral waiters not drained")
+        self.assertEqual(len(lock._mid), 0, "ephemeral waiters not drained")
 
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_e1, t_e2, t_s), timeout=2.0)
@@ -375,7 +392,7 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.01)
 
         # Drain should have cancelled the bench waiter.
-        self.assertEqual(len(lock._low), 0)
+        self.assertEqual(len(lock._mid), 0)
 
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_bench, t_user), timeout=2.0)
@@ -388,6 +405,47 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"DFLASH_EPHEMERAL_LOCK_WAIT_SEC": "5"}):
             wait_sec = ephemeral_lock_wait_seconds()
             self.assertEqual(str(max(1, int(wait_sec))), "5")
+
+
+class SlowLaneBumpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fast_v1_drains_waiting_v1e(self):
+        lock = PriorityDaemonLock()
+        lock._held = True
+        cancelled = asyncio.Event()
+
+        async def slow_waiter():
+            try:
+                await lock.acquire(scoped=False, max_wait=10.0, lane="slow")
+                lock.release()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        t_slow = asyncio.create_task(slow_waiter())
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(lock._low), 1)
+
+        # Unscoped /v1 (mid) must drain /v1e waiters.
+        t_fast = asyncio.create_task(
+            lock.acquire(scoped=False, max_wait=5.0, lane="fast")
+        )
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+        self.assertEqual(len(lock._low), 0)
+        lock.release()
+        with self.assertRaises(asyncio.CancelledError):
+            await t_slow
+        await t_fast
+        lock.release()
+
+    async def test_bump_registry_notifies_inflight(self):
+        reg = SlowLaneBumpRegistry()
+        eid, ev = reg.register()
+        self.assertEqual(reg.inflight, 1)
+        self.assertFalse(ev.is_set())
+        self.assertEqual(reg.bump_all(), 1)
+        self.assertTrue(ev.is_set())
+        reg.unregister(eid)
+        self.assertEqual(reg.inflight, 0)
 
 
 if __name__ == "__main__":

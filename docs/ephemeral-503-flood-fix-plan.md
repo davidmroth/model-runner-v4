@@ -322,11 +322,33 @@ wired into `scoped_lock_priority_enabled()` in `handler_reliability.py`.
 
 ---
 
+## Slow lane: `/v1e` (follow-on)
+
+Explicit background path on the **same daemon** as `/v1`:
+
+| Path | Lane | Admission |
+|------|------|-----------|
+| `/v1/chat/completions` | fast | scoped sticky; long hold; may use all live slots |
+| `/v1e/chat/completions` | slow | always ephemeral; short/medium wait; **cannot take reserved fast slot** |
+
+Knobs:
+
+- `DFLASH_RESERVED_FAST_SLOTS` — auto `1` when `N>=2`, else `0`
+- `DFLASH_SLOW_LANE_LOCK_WAIT_SEC` — default `30`
+- `DFLASH_SLOW_LANE_MAX_TOKENS` — defaults to `DFLASH_EPHEMERAL_MAX_TOKENS`
+
+Point Hermes aux (e.g. `auxiliary.title_generation.base_url`) at the host with
+path prefix `/v1e` (OpenAI client appends `/chat/completions`). Proxy
+`MODEL_PATHS` includes `/v1e/chat/completions` so alias rewrite still applies.
+
+---
+
 ## Files to Change
 
 ```
-lucebox-patch/dflash/scripts/handler_reliability.py   (Changes 1, 4)
-lucebox-patch/dflash/scripts/server_tools.py          (Change 2)
-services/proxy/alias_proxy.py                         (Change 3)
+lucebox-patch/dflash/scripts/handler_reliability.py   (Changes 1, 4 + /v1e waits)
+lucebox-patch/dflash/scripts/server_tools.py          (Change 2 + /v1e routes)
+lucebox-patch/dflash/scripts/target_cache_admission.py (reserved fast slots)
+services/proxy/alias_proxy.py                         (Change 3 + /v1e path)
 tests/test_server_handler_reliability.py              (new test cases)
 ```

@@ -6,10 +6,11 @@ import logging
 import os
 import time
 from collections import deque
+from typing import Callable
 
 
 # Uvicorn access-log paths suppressed when ``DFLASH_QUIET_ACCESS_LOGS=1`` (default).
-_QUIET_ACCESS_LOG_PATHS = ("/health", "/v1/models")
+_QUIET_ACCESS_LOG_PATHS = ("/health", "/v1/models", "/v1e/models")
 
 _EPHEMERAL_LOG_DEBOUNCE_DEFAULT = 5.0
 _last_ephemeral_log: float = 0.0
@@ -71,18 +72,33 @@ class DaemonBusyError(Exception):
 
 
 class PriorityDaemonLock:
-    """Single-flight lock with scoped (conversation) priority over ephemeral traffic.
+    """Single-flight lock with three-tier priority.
 
-    Scoped requests jump ahead of ephemeral waiters when the lock is free.
-    Ephemeral waiters join ``_low`` and wait up to ``max_wait``; they are
-    cancelled when a scoped request enqueues, and ``release()`` always drains
-    ``_high`` before ``_low``.
+    Queues (release order: high → mid → low):
+
+    - **high** — scoped ``/v1`` (conversation id)
+    - **mid** — unscoped ``/v1`` (no conversation id)
+    - **low** — slow lane ``/v1e``
+
+    Enqueue rules:
+
+    - high drains mid + low waiters (scoped still bumps accidental ``/v1`` ephemeral)
+    - mid drains low waiters (any ``/v1`` bumps ``/v1e``)
+    - when a fast waiter enqueues while the holder is slow, ``bump_holder()`` runs
+      so in-flight ``/v1e`` can CANCEL and release
     """
 
     def __init__(self) -> None:
         self._held = False
+        self._holder_lane: str = "fast"
         self._high: deque[asyncio.Future[None]] = deque()
+        self._mid: deque[asyncio.Future[None]] = deque()
         self._low: deque[asyncio.Future[None]] = deque()
+        self._bump_slow: Callable[[], None] | None = None
+
+    def set_bump_slow_callback(self, cb: Callable[[], None] | None) -> None:
+        """Called when a fast waiter needs the lock held by a slow request."""
+        self._bump_slow = cb
 
     def locked(self) -> bool:
         return self._held
@@ -91,6 +107,10 @@ class PriorityDaemonLock:
     def scoped_waiting(self) -> int:
         return len(self._high)
 
+    @property
+    def holder_lane(self) -> str:
+        return self._holder_lane if self._held else ""
+
     async def __aenter__(self) -> PriorityDaemonLock:
         await self.acquire(scoped=True, max_wait=float("inf"))
         return self
@@ -98,30 +118,83 @@ class PriorityDaemonLock:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self.release()
 
-    async def acquire(self, *, scoped: bool, max_wait: float) -> None:
+    @staticmethod
+    def _tier(*, scoped: bool, lane: str) -> str:
+        if lane == "slow":
+            return "low"
+        if scoped:
+            return "high"
+        return "mid"
+
+    def _queue_for(self, tier: str) -> deque[asyncio.Future[None]]:
+        if tier == "high":
+            return self._high
+        if tier == "mid":
+            return self._mid
+        return self._low
+
+    def _drain_queue(self, queue: deque[asyncio.Future[None]], *, reason: str) -> int:
+        drained = 0
+        while queue:
+            fut = queue.popleft()
+            if not fut.done():
+                fut.cancel()
+                drained += 1
+        if drained:
+            print(
+                f"  [lock] drained {drained} waiter(s) — {reason}",
+                flush=True,
+            )
+        return drained
+
+    def _maybe_bump_slow_holder(self, *, waiter_lane: str) -> None:
+        if waiter_lane == "slow":
+            return
+        if self._held and self._holder_lane == "slow" and self._bump_slow is not None:
+            self._bump_slow()
+
+    async def acquire(
+        self,
+        *,
+        scoped: bool,
+        max_wait: float,
+        lane: str = "fast",
+    ) -> None:
+        lane = "slow" if lane == "slow" else "fast"
+        tier = self._tier(scoped=scoped, lane=lane)
         if not self._held:
             self._held = True
+            self._holder_lane = lane
             return
+
+        # Fail-fast: slow lane never queues behind any /v1 waiter.
+        if tier == "low" and (self._high or self._mid):
+            raise asyncio.TimeoutError()
 
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[None] = loop.create_future()
-        (self._high if scoped else self._low).append(fut)
-        if scoped:
-            self._drain_low_waiters()
+        self._queue_for(tier).append(fut)
+        if tier == "high":
+            self._drain_queue(self._mid, reason="scoped enqueued")
+            self._drain_queue(self._low, reason="scoped enqueued")
+            self._maybe_bump_slow_holder(waiter_lane=lane)
+        elif tier == "mid":
+            self._drain_queue(self._low, reason="fast /v1 enqueued")
+            self._maybe_bump_slow_holder(waiter_lane=lane)
         try:
             if max_wait == float("inf"):
                 await fut
             else:
                 await asyncio.wait_for(fut, timeout=max_wait)
         except asyncio.TimeoutError:
-            self._drop_waiter(fut, scoped=scoped)
+            self._drop_waiter(fut, tier=tier)
             raise
         except asyncio.CancelledError:
-            self._drop_waiter(fut, scoped=scoped)
+            self._drop_waiter(fut, tier=tier)
             raise
 
-    def _drop_waiter(self, fut: asyncio.Future[None], *, scoped: bool) -> None:
-        queue = self._high if scoped else self._low
+    def _drop_waiter(self, fut: asyncio.Future[None], *, tier: str) -> None:
+        queue = self._queue_for(tier)
         try:
             queue.remove(fut)
         except ValueError:
@@ -129,45 +202,63 @@ class PriorityDaemonLock:
         if not fut.done():
             fut.cancel()
 
-    def _drain_low_waiters(self) -> None:
-        """Cancel queued ephemeral waiters when a scoped request enqueues.
-
-        Fires when a new scoped request joins ``_high``. Combined with
-        ``release()`` draining ``_high`` before ``_low``, this keeps
-        ephemerals from running while any scoped waiter exists. The current
-        lock *holder* (if any) is not affected — only queued-but-not-running
-        ephemerals are cancelled.
-        """
-        drained = 0
-        while self._low:
-            fut = self._low.popleft()
-            if not fut.done():
-                fut.cancel()
-                drained += 1
-        if drained:
-            print(
-                f"  [lock] drained {drained} ephemeral waiter(s) — scoped enqueued",
-                flush=True,
-            )
-
     def release(self) -> None:
         if not self._held:
             raise RuntimeError("release on unlocked PriorityDaemonLock")
         self._held = False
-        while self._high:
-            fut = self._high.popleft()
-            if fut.cancelled():
-                continue
-            self._held = True
-            fut.set_result(None)
-            return
-        while self._low:
-            fut = self._low.popleft()
-            if fut.cancelled():
-                continue
-            self._held = True
-            fut.set_result(None)
-            return
+        self._holder_lane = "fast"
+        for tier, queue in (
+            ("high", self._high),
+            ("mid", self._mid),
+            ("low", self._low),
+        ):
+            while queue:
+                fut = queue.popleft()
+                if fut.cancelled():
+                    continue
+                self._held = True
+                self._holder_lane = "slow" if tier == "low" else "fast"
+                fut.set_result(None)
+                return
+
+
+class SlowLaneBumpRegistry:
+    """Tracks in-flight ``/v1e`` work so ``/v1`` can preempt it.
+
+    Each slow admission registers an ``asyncio.Event``; ``bump_all`` sets
+    every active event. Generators watch the event and CANCEL + abort.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[int, asyncio.Event] = {}
+        self._next_id = 1
+
+    def register(self) -> tuple[int, asyncio.Event]:
+        eid = self._next_id
+        self._next_id += 1
+        ev = asyncio.Event()
+        self._events[eid] = ev
+        return eid, ev
+
+    def unregister(self, eid: int) -> None:
+        self._events.pop(eid, None)
+
+    def bump_all(self) -> int:
+        n = 0
+        for ev in list(self._events.values()):
+            if not ev.is_set():
+                ev.set()
+                n += 1
+        if n:
+            print(
+                f"  [lock] bumping {n} in-flight slow-lane (/v1e) request(s)",
+                flush=True,
+            )
+        return n
+
+    @property
+    def inflight(self) -> int:
+        return len(self._events)
 
 
 def scoped_lock_priority_enabled() -> bool:
@@ -221,6 +312,20 @@ def ephemeral_lock_wait_seconds() -> float:
         return 5.0
 
 
+def slow_lane_lock_wait_seconds() -> float:
+    """Max lock/slot wait for explicit slow-lane traffic (``/v1e``).
+
+    Defaults to 30s (longer than accidental ``/v1`` ephemeral) so title-gen and
+    extractors can ride brief fast-lane occupancy without hammering. Override
+    with ``DFLASH_SLOW_LANE_LOCK_WAIT_SEC``.
+    """
+    raw = os.environ.get("DFLASH_SLOW_LANE_LOCK_WAIT_SEC", "30")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
 def ephemeral_max_tokens() -> int:
     """Hard cap on completion tokens for ephemeral (no conversation id) traffic.
 
@@ -234,13 +339,26 @@ def ephemeral_max_tokens() -> int:
         return 2048
 
 
-def chat_stream_lock_wait_seconds(*, scoped: bool) -> float:
+def slow_lane_max_tokens() -> int:
+    """Hard cap for ``/v1e`` completions. Defaults to ephemeral max tokens."""
+    raw = os.environ.get("DFLASH_SLOW_LANE_MAX_TOKENS", "").strip()
+    if not raw:
+        return ephemeral_max_tokens()
+    try:
+        return max(16, min(int(raw), 65536))
+    except ValueError:
+        return ephemeral_max_tokens()
+
+
+def chat_stream_lock_wait_seconds(*, scoped: bool, lane: str = "fast") -> float:
     """Lock wait for chat/chat-stream before 503.
 
-    Ephemeral/benchmark traffic gets a short cap so user conversations are not
-    stuck behind multi-minute cold prefills. Scoped traffic uses
+    Slow lane (``/v1e``) uses ``DFLASH_SLOW_LANE_LOCK_WAIT_SEC``. Accidental
+    ephemeral on ``/v1`` uses the short ephemeral cap. Scoped traffic uses
     ``DFLASH_SCOPED_LOCK_WAIT_SEC`` when ``DFLASH_DAEMON_LOCK_WAIT_SEC=0``.
     """
+    if lane == "slow":
+        return slow_lane_lock_wait_seconds()
     if not scoped:
         return ephemeral_lock_wait_seconds()
     base = daemon_lock_wait_seconds()
