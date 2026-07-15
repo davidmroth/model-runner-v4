@@ -43,8 +43,8 @@ An agent prompt is not one blob. Conceptually:
 
 | Segment | Stability | Typical Hermes size | Cache role |
 |---------|-----------|---------------------|------------|
-| System prompt | Stable per profile / persona | ~2–4k tokens | Same-prefix share candidate |
-| Tool schemas / parameters | Stable per toolset fingerprint | ~15–20k tokens (measured pin depth ~20.5k) | Dominant share candidate |
+| System prompt | Often stable; **can be dynamic** (clock, session facts) | ~2–4k tokens | Inside thin pin today; see §2.1.1 |
+| Tool schemas / parameters | Stable per toolset fingerprint | ~15–20k tokens (measured pin depth ~20.5k) | Dominant share candidate; **lookup key today** |
 | Conversation + turn | Per session / request | grows | Always private |
 
 “Tools parameters” here means the serialized tool definitions the model sees
@@ -64,6 +64,10 @@ it on later turns via `RESTORE_CHAIN`. Goals:
 - Keep thick conversation snapshots separate from thin tool pins.
 - Allow multiple prompt families without thrashing a single monolithic cache.
 
+On the Qwen adapter path, the pinned segment is **everything before the first
+user turn** — system header **and** tool schemas (`tool_prefix_ids`). The
+conversation / user / tool-result suffix is not in the thin pin.
+
 Properties:
 
 - Storage is primarily **host RAM / disk-backed snapshot backends**.
@@ -71,6 +75,40 @@ Properties:
   slot**.
 - This is a **time** optimization (TTFT / prefill), not a **multiplicity**
   optimization for concurrent live slots.
+
+#### 2.1.1 Correctness hazard: tools-only fingerprint, system-inclusive pin
+
+**Pinned KV contents ≠ cache key.**
+
+| | What is included |
+|--|------------------|
+| Thin pin (`tool_prefix_ids`) | System prompt + tool schemas |
+| Lookup / fingerprint today | **Tools JSON only** (`tools_fingerprint`) |
+
+If the system prompt is **dynamic** while the toolset is unchanged — for
+example injecting wall-clock time, “today’s date,” or per-request session
+facts into the system message — a warm `RESTORE_CHAIN` can hit the thin pin
+for the **same tools fingerprint** and restore **stale system KV** (old time,
+old rules). The model then attends as if that outdated system text were still
+in context.
+
+This is not merely a cache-efficiency miss: it can **quietly degrade response
+quality and factual freshness** for anything that lives only in the system
+prompt.
+
+Mitigations (product / engine):
+
+1. **Fingerprint the full pin** — key thin slots by a hash of
+   `tool_prefix_ids` (or system+tools), so any system change forces a new pin.
+2. **Keep volatiles out of the pin** — put clock / session facts in the
+   conversation suffix (after the first-user-turn boundary), not in the system
+   header that gets pinned.
+3. **Split system from tools** (future) — separate snapshot/page keys if system
+   churn must coexist with a long-lived tools pin.
+
+Until (1) or (2) is enforced, treat “dynamic system + warm tool-split” as a
+known correctness risk. Live shared FA pages (§2.3) have the same requirement:
+the share key must cover every token in the shared head, not tools alone.
 
 ### 2.2 Live target-cache slots (shipped at N≥2)
 
@@ -239,16 +277,19 @@ on dflash / layer-split / tool-split unless the engine is replaced.
    head** on Hermes agent traffic (~15–20k tokens; ~0.25 GiB TQ3 FA on this
    model).
 2. **Cross-turn** caching of that head is already a first-class feature
-   (tool-split pins + restore).
+   (tool-split pins + restore). The pin includes **system + tools**, but today’s
+   lookup key is **tools-only** — dynamic system text (e.g. injected time) can
+   restore stale system KV and hurt quality (§2.1.1).
 3. **Cross-request live** caching of that head is the missing multiplier for
    multi-slot VRAM: reference-counted FA pages, not float dedup, not one shared
-   writable notebook.
+   writable notebook. Share keys must cover the full shared head.
 4. At **N=4** same toolset, expected live-VRAM savings are about
    **0.7–0.9 GiB** of duplicated cover FA KV — enough to matter for stretch
    concurrency, not enough to treat as unlimited free slots at 131k.
 
 Together, snapshot pins (time) and shared prefix pages (multiplicity) are the
-complete “tools + system prompt cache” story for this hardware.
+complete “tools + system prompt cache” story for this hardware — provided the
+cache key matches everything that was pinned or shared.
 
 ---
 
