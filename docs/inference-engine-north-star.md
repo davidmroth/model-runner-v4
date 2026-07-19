@@ -10,6 +10,8 @@ Tactical gates and deploy steps live in
 lives in [agent-inference-program.md](./agent-inference-program.md). Multi-request
 admission + shared KV pages (next-gen concurrency) live in
 [nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md).
+Warm TTFT via smaller restore suffixes (p50/p90 roadmap) lives in
+[prefill-suffix-first-plan.md](./prefill-suffix-first-plan.md).
 
 ---
 

@@ -95,7 +95,7 @@ Omitting `<quantum>` keeps legacy blocking full generate (prod N=1).
 | ContextVar reset in SSE teardown | Slot lease leak → 503 slot wait (fixed) |
 | EOS first quantum + huge `max_tokens` | `remaining` kept alive → phantom `SCHED_DRAIN` ~32k steps; demux already stopped → 8–16 tok answers (fixed: early-stop clears remaining; skip SCHED when remaining=0) |
 | HTTP returns after first quantum under N=2 | Live (`b9d8c6a0-…`): `gen=8` then `completion_tokens≈10–16` while `SCHED_DRAIN` may continue after inline-snap — **fixed**: demux suspends idle after CONTINUE; CANCEL after collect (repro `scripts/phase3_http_quantum_truncation_smoke.py`) |
-| Background `max_tokens=64000` storm | Hindsight/extractors (ephemeral) fill both slots → scoped chat 503 — **fixed**: `DFLASH_EPHEMERAL_MAX_TOKENS` clamp (default 2048) + ephemeral fail-fast when scoped waiters exist (repro `scripts/phase3_http_background_storm_smoke.py`) |
+| Background `max_tokens=64000` storm | Hindsight/extractors can fill slots → scoped chat 503 — **fixed** via `/v1` preemption of `/v1e` (waiters drained + in-flight bump). No permanent traffic-class `max_tokens` clamp; prompts run as requested within context (repro `scripts/phase3_http_background_storm_smoke.py`) |
 
 ---
 

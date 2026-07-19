@@ -5,7 +5,8 @@
 
 Related: [inference-engine-north-star.md](./inference-engine-north-star.md),
 [anonymous-feedback-loop-sop.md](./anonymous-feedback-loop-sop.md),
-[nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md).
+[nextgen-multi-request-shared-kv-plan.md](./nextgen-multi-request-shared-kv-plan.md),
+[prefill-suffix-first-plan.md](./prefill-suffix-first-plan.md) (suffix-first TTFT roadmap + p50/p90 targets).
 
 ---
 

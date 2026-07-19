@@ -339,8 +339,10 @@ Explicit background path on the **same daemon** as `/v1`:
 Knobs:
 
 - `DFLASH_RESERVED_FAST_SLOTS` — auto `1` when `N>=2`, else `0`
-- `DFLASH_SLOW_LANE_LOCK_WAIT_SEC` — default `30`
-- `DFLASH_SLOW_LANE_MAX_TOKENS` — defaults to `DFLASH_EPHEMERAL_MAX_TOKENS`
+- `DFLASH_SLOW_LANE_LOCK_WAIT_SEC` — default `120`
+
+Completion length is **not** traffic-clamped: client `max_tokens` is honored up to
+context capacity. Priority is enforced by admission (``/v1`` preempts ``/v1e``).
 
 Point Hermes aux (e.g. `auxiliary.title_generation.base_url`) at the host with
 path prefix `/v1e` (OpenAI client appends `/chat/completions`). Proxy

@@ -1,0 +1,4 @@
+[submodule "lucebox-hub-src"]
+	path = lucebox-hub-src
+	url = https://github.com/davidmroth/lucebox-hub.git
+	branch = feat/native-mmproj-multi-request
