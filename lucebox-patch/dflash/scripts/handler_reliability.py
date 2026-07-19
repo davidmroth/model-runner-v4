@@ -384,3 +384,24 @@ def request_wall_timeout_seconds() -> float:
         return max(30.0, float(raw))
     except ValueError:
         return 600.0
+
+
+def request_hard_ceiling_seconds() -> float | None:
+    """Absolute safety cap for a whole request, independent of token progress.
+
+    The token collectors enforce a *progress-aware* wall (cancel only after
+    ``DFLASH_REQUEST_WALL_TIMEOUT_SEC`` with no new token), so healthy long
+    generations are never guillotined by elapsed time. This hard ceiling is a
+    belt-and-suspenders backstop for a truly wedged coroutine that somehow
+    never yields and never stalls.
+
+    Default ``0`` disables it (returns ``None``) — the collectors already
+    guarantee termination. Set ``DFLASH_REQUEST_HARD_CEILING_SEC`` to a large
+    value (e.g. ``3600``) to re-enable an absolute cap.
+    """
+    raw = os.environ.get("DFLASH_REQUEST_HARD_CEILING_SEC", "0")
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if val > 0 else None

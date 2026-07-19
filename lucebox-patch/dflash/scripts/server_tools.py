@@ -109,6 +109,7 @@ from handler_reliability import (
     install_quiet_access_log_filter,
     is_ephemeral_cache_scope,
     quiet_access_logs_enabled,
+    request_hard_ceiling_seconds,
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
     should_log_ephemeral_busy,
@@ -2704,7 +2705,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             quantum=quantum,
                             cache_scope=cache_scope,
                         ),
-                        timeout=wall_timeout_sec,
+                        # Progress-aware: _generate_via_daemon's collector cancels
+                        # on a token-stall of wall_timeout_sec, so no absolute cap
+                        # is needed here. Hard ceiling (disabled by default) is a
+                        # backstop for a truly wedged coroutine only.
+                        timeout=request_hard_ceiling_seconds(),
                     )
                 )
                 yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
@@ -2740,16 +2745,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 detok = IncrementalDetokenizer(
                     tokenizer, skip_special_tokens=False)
 
+                # Emission stall guard: tokens are already collected, so bound the
+                # gap between *emitted* tokens (reset per token) rather than total
+                # time — otherwise a healthy generation that ran longer than
+                # wall_timeout would be truncated during detok/emit.
+                deadline = loop.time() + wall_timeout_sec
                 try:
                     for tok_id in token_ids:
                         if loop.time() >= deadline:
                             print(
-                                f"  [handler] request wall timeout after "
+                                f"  [handler] detok/emit stalled >"
                                 f"{wall_timeout_sec:.0f}s (chat-stream)",
                                 flush=True,
                             )
                             aborted = True
                             break
+                        deadline = loop.time() + wall_timeout_sec
                         if await request.is_disconnected():
                             print(
                                 "  [handler] client disconnected — aborting stream",

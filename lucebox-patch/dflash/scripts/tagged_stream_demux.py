@@ -200,6 +200,13 @@ class TaggedStreamDemux:
     ) -> AsyncIterator[int]:
         """Yield vocab tokens for ``req_id`` until DONE, stop, n_gen, or timeout.
 
+        ``wall_timeout`` is a *progress-aware* bound: it caps the gap between
+        real tokens, not total request time. Each yielded token pushes the
+        deadline forward, so an arbitrarily long but healthy generation runs to
+        completion; only a stream that produces no real token for
+        ``wall_timeout`` seconds (even one emitting CONTINUE heartbeats) is
+        cancelled.
+
         CONTINUE frames mean more quanta are scheduled — the normal
         ``post_token_idle`` is replaced by the longer ``continue_idle`` so a
         slow SCHED kick cannot truncate the HTTP stream after the first
@@ -267,6 +274,12 @@ class TaggedStreamDemux:
                 awaiting_continue = False
                 continue_deadline = None
                 last_token_at = loop.time()
+                # Progress-aware wall: reset the deadline on each *real* token so
+                # a healthy (even slow) stream is never guillotined by an absolute
+                # cap. CONTINUE heartbeats do NOT reset it, so a scheduled-but-
+                # starved stream is still cancelled ``wall_timeout`` after its last
+                # real token — guaranteeing termination and freeing the slot.
+                deadline = last_token_at + wall_timeout
                 yield tok
         finally:
             if own_reg:

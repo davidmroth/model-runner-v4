@@ -83,7 +83,13 @@ services:
       DFLASH_SLOW_LANE_LOCK_WAIT_SEC: ${DFLASH_SLOW_LANE_LOCK_WAIT_SEC:-120}
       DFLASH_RESERVED_FAST_SLOTS: ${DFLASH_RESERVED_FAST_SLOTS:-}
       DFLASH_SCOPED_LOCK_PRIORITY: ${DFLASH_SCOPED_LOCK_PRIORITY:-1}
+      # Progress-aware wall: max seconds with NO new token (resets on each real
+      # token), not total request time — a healthy long generation runs to
+      # completion; a stalled/starved stream is cancelled after this gap.
       DFLASH_REQUEST_WALL_TIMEOUT_SEC: ${DFLASH_REQUEST_WALL_TIMEOUT_SEC:-600}
+      # Absolute per-request ceiling regardless of progress. 0 = disabled
+      # (collectors already guarantee termination); set to e.g. 3600 to re-enable.
+      DFLASH_REQUEST_HARD_CEILING_SEC: ${DFLASH_REQUEST_HARD_CEILING_SEC:-0}
       # SSE comment keepalives during overlap quantum gaps (0 disables).
       DFLASH_SSE_KEEPALIVE_SEC: ${DFLASH_SSE_KEEPALIVE_SEC:-15}
       DFLASH_TOOL_SNAPSHOT_MAX_KV: ${DFLASH_TOOL_SNAPSHOT_MAX_KV:-16384}

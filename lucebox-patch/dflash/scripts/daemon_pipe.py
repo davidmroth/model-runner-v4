@@ -83,7 +83,11 @@ def iter_pipe_tokens(
     use_select = select is not None and sys.platform != "win32"
 
     while generated < n_gen:
-        if time.monotonic() - started > wall_timeout:
+        # Progress-aware wall: measure the gap since the last real token (or
+        # start, before the first token) rather than total elapsed, so a healthy
+        # long generation is never guillotined by an absolute cap.
+        wall_ref = last_token_at if last_token_at is not None else started
+        if time.monotonic() - wall_ref > wall_timeout:
             break
         reported = _daemon_reported_completion(bus)
         if reported is not None and generated >= reported:
@@ -97,7 +101,7 @@ def iter_pipe_tokens(
             else:
                 wait = min(
                     post_token_idle - (time.monotonic() - last_token_at),
-                    wall_timeout - (time.monotonic() - started),
+                    wall_timeout - (time.monotonic() - last_token_at),
                 )
             if wait <= 0:
                 break
@@ -135,7 +139,9 @@ async def async_iter_pipe_tokens(
     started = time.monotonic()
     last_token_at: float | None = None
     while generated < n_gen:
-        if time.monotonic() - started > wall_timeout:
+        # Progress-aware wall: gap since last real token (or start), not total.
+        wall_ref = last_token_at if last_token_at is not None else started
+        if time.monotonic() - wall_ref > wall_timeout:
             break
         reported = _daemon_reported_completion(bus)
         if reported is not None and generated >= reported:

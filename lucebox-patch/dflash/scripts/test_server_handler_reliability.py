@@ -14,6 +14,7 @@ from handler_reliability import (
     is_ephemeral_cache_scope,
     install_quiet_access_log_filter,
     quiet_access_logs_enabled,
+    request_hard_ceiling_seconds,
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
     scoped_lock_wait_cap_seconds,
@@ -54,6 +55,22 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
     def test_request_wall_timeout_env_override(self):
         with patch.dict(os.environ, {"DFLASH_REQUEST_WALL_TIMEOUT_SEC": "180"}):
             self.assertEqual(request_wall_timeout_seconds(), 180.0)
+
+    def test_request_hard_ceiling_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(request_hard_ceiling_seconds())
+
+    def test_request_hard_ceiling_zero_disables(self):
+        with patch.dict(os.environ, {"DFLASH_REQUEST_HARD_CEILING_SEC": "0"}):
+            self.assertIsNone(request_hard_ceiling_seconds())
+
+    def test_request_hard_ceiling_env_override(self):
+        with patch.dict(os.environ, {"DFLASH_REQUEST_HARD_CEILING_SEC": "3600"}):
+            self.assertEqual(request_hard_ceiling_seconds(), 3600.0)
+
+    def test_request_hard_ceiling_invalid_disables(self):
+        with patch.dict(os.environ, {"DFLASH_REQUEST_HARD_CEILING_SEC": "nope"}):
+            self.assertIsNone(request_hard_ceiling_seconds())
 
     def test_tool_snapshot_max_kv_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -185,10 +202,10 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
 
     def test_slow_lane_lock_wait_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(slow_lane_lock_wait_seconds(), 120.0)
+            self.assertEqual(slow_lane_lock_wait_seconds(), 30.0)
             self.assertEqual(
                 chat_stream_lock_wait_seconds(scoped=False, lane="slow"),
-                120.0,
+                30.0,
             )
 
     def test_scoped_lock_wait_respects_explicit_cap(self):
