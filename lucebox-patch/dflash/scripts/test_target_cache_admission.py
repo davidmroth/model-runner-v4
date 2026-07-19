@@ -10,9 +10,13 @@ from target_cache_admission import (
     TargetCacheSlotPool,
     append_restore_chain_quantum,
     format_slot_command,
+    is_cold_generate_command,
+    is_start_command,
     multi_slot_drop_exclusive,
     parse_restore_chain_admit_remaining,
+    parse_sched_admit_remaining,
     pump_sched_steps,
+    rewrite_cold_generate_to_start,
     sched_driver,
     schedule_quantum,
     schedule_quantum_for,
@@ -163,6 +167,42 @@ class SchedStepPumpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreaterEqual(n, 1)
         self.assertLessEqual(writes, 3)
+
+
+class ColdGenerateStartRewriteTests(unittest.TestCase):
+    def test_detect_cold_and_rewrite(self) -> None:
+        cold = "SLOT 0 /tmp/p.bin 6000\n"
+        self.assertTrue(is_cold_generate_command(cold))
+        self.assertFalse(is_start_command(cold))
+        out = rewrite_cold_generate_to_start(cold, quantum=128)
+        self.assertEqual(out, "SLOT 0 START /tmp/p.bin 6000 128\n")
+        self.assertTrue(is_start_command(out))
+        self.assertFalse(is_cold_generate_command(out))
+
+    def test_snap_trailer_not_rewritten(self) -> None:
+        line = "/tmp/p.bin 64 snap=10:0\n"
+        self.assertTrue(is_cold_generate_command(line))
+        self.assertEqual(rewrite_cold_generate_to_start(line, quantum=8), line)
+
+    def test_restore_chain_not_cold(self) -> None:
+        line = "SLOT 1 RESTORE_CHAIN -1 4 /tmp/p.bin 12 4\n"
+        self.assertFalse(is_cold_generate_command(line))
+        self.assertEqual(rewrite_cold_generate_to_start(line, quantum=8), line)
+
+    def test_parse_start_admit_remaining(self) -> None:
+        self.assertEqual(
+            parse_sched_admit_remaining(
+                "ok START req=4 slot=0 emitted=128 remaining=3872"
+            ),
+            3872,
+        )
+        self.assertEqual(
+            parse_sched_admit_remaining(
+                "ok RESTORE_CHAIN_ADMIT req=1 slot=0 emitted=8 remaining=0 "
+                "total_gen=64000 quantum=8"
+            ),
+            0,
+        )
 
 
 class FormatSlotCommandTests(unittest.TestCase):

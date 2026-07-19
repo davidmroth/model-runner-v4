@@ -120,12 +120,15 @@ from target_cache_admission import (
     active_live_slot,
     append_restore_chain_quantum,
     format_slot_command,
+    is_cold_generate_command,
     is_restore_chain_command,
+    is_start_command,
     multi_slot_drop_exclusive,
     overlap_mode_enabled,
-    parse_restore_chain_admit_remaining,
+    parse_sched_admit_remaining,
     pump_sched_steps,
     reset_active_live_slot,
+    rewrite_cold_generate_to_start,
     sched_driver,
     schedule_quantum_for,
     set_active_live_slot,
@@ -879,13 +882,18 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     ) -> list[int]:
         """Register (if tagged), write command, collect tokens.
 
-        When overlap mode is on (N>1 + tagged + drop-exclusive) and the command
-        is ``RESTORE_CHAIN``, append a schedule quantum and kick the scheduler
-        after ``ok RESTORE_CHAIN_ADMIT`` only when ``remaining>0`` so decode can
-        time-slice with peers. Early-stop admits (EOS in first quantum) must
-        not kick a phantom drain of leftover ``max_tokens``.
+        When overlap mode is on (N>1 + tagged + drop-exclusive), schedulable
+        commands are admitted with a quantum and advanced by the scheduler
+        driver (``DFLASH_SCHED_DRIVER``):
 
-        Driver (``DFLASH_SCHED_DRIVER``):
+        - ``RESTORE_CHAIN`` — append quantum; await ``ok RESTORE_CHAIN_ADMIT``
+        - bare cold ``<path> <n_gen>`` — rewrite to ``START … <quantum>``;
+          await ``ok START`` (same blocking-stdin problem as DRAIN otherwise)
+
+        Early-stop admits (EOS in first quantum, ``remaining=0``) skip the
+        scheduler kick so we do not phantom-drain leftover ``max_tokens``.
+
+        Driver:
         - ``drain`` — one ``SCHED_DRAIN`` (legacy; holds daemon stdin until all
           live remaining is exhausted, so peer admits wait).
         - ``step`` — loop ``SCHED_STEP`` so the daemon returns to stdin between
@@ -895,13 +903,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         queue = None
         cmd = cmd_line
         slot = active_live_slot()
-        use_admit = (
+        overlap = (
             overlap_mode_enabled()
             and multi_slot_drop_exclusive()
             and tagged_demux is not None
-            and is_restore_chain_command(cmd)
         )
-        if use_admit:
+        if overlap and is_cold_generate_command(cmd):
+            cmd = rewrite_cold_generate_to_start(cmd, quantum=quantum)
+        use_admit = overlap and (
+            is_restore_chain_command(cmd) or is_start_command(cmd)
+        )
+        if use_admit and is_restore_chain_command(cmd):
             cmd = append_restore_chain_quantum(cmd, quantum=quantum)
         if tagged_demux is not None:
             req_id = tagged_demux.alloc_req_id()
@@ -926,15 +938,18 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             await _write_daemon_cmd_async(cmd, req_id=req_id)
             if use_admit:
                 driver = sched_driver()
+                admit_prefix = (
+                    "ok START" if is_start_command(cmd) else "ok RESTORE_CHAIN_ADMIT"
+                )
 
                 async def _kick_sched() -> None:
                     try:
                         admit = await bus.await_reply(
-                            "ok RESTORE_CHAIN_ADMIT", timeout=wall_timeout,
+                            admit_prefix, timeout=wall_timeout,
                         )
                     except Exception as exc:
                         print(
-                            f"  [handler] RESTORE_CHAIN_ADMIT wait failed: {exc!r}",
+                            f"  [handler] {admit_prefix} wait failed: {exc!r}",
                             flush=True,
                         )
                         log_corr(
@@ -943,9 +958,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             slot=slot,
                             req_id=req_id,
                             err=repr(exc),
+                            admit_prefix=admit_prefix,
                         )
                         return
-                    rem = parse_restore_chain_admit_remaining(admit)
+                    rem = parse_sched_admit_remaining(admit)
                     log_corr(
                         "admit_ok",
                         scope=cache_scope,

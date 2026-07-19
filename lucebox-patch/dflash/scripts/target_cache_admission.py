@@ -232,9 +232,76 @@ def append_restore_chain_quantum(line: str, quantum: int | None = None) -> str:
     return f"{prefix}{rest}" + ("\n" if nl else "")
 
 
-def parse_restore_chain_admit_remaining(line: str) -> int | None:
-    """Parse ``remaining=N`` from an ``ok RESTORE_CHAIN_ADMIT …`` reply."""
-    if "RESTORE_CHAIN_ADMIT" not in line:
+def is_cold_generate_command(line: str) -> bool:
+    """True for bare ``<prompt.bin> <n_gen>`` (optional ``snap=``) cold generates.
+
+    These block the daemon stdin loop for the whole generation — the cold-path
+    cousin of ``SCHED_DRAIN`` monopolization. Under overlap they should be
+    rewritten to ``START … <quantum>`` so ``SCHED_STEP`` can interleave.
+    """
+    body = line[:-1] if line.endswith("\n") else line
+    _, rest = _peel_req_slot_prefixes(body.strip())
+    if not rest:
+        return False
+    upper = rest.upper()
+    for verb in (
+        "RESTORE_CHAIN ",
+        "RESTORE ",
+        "START ",
+        "CONTINUE",
+        "CONT ",
+        "SCHED_",
+        "CANCEL ",
+        "SNAPSHOT",
+        "REQ ",
+        "SLOT ",
+    ):
+        if upper.startswith(verb):
+            return False
+    # strip optional snap= trailer
+    core = rest.split(" snap=", 1)[0].strip()
+    parts = core.split()
+    if len(parts) != 2:
+        return False
+    try:
+        int(parts[1])
+    except ValueError:
+        return False
+    return True
+
+
+def rewrite_cold_generate_to_start(line: str, quantum: int | None = None) -> str:
+    """Rewrite bare ``<path> <n_gen>`` to ``START <path> <n_gen> <quantum>``.
+
+    Leaves non-cold lines and lines that already carry ``snap=`` unchanged
+    (inline snap is not supported on the START verb today).
+    """
+    q = schedule_quantum() if quantum is None else max(1, int(quantum))
+    nl = line.endswith("\n")
+    body = line[:-1] if nl else line
+    body = body.strip()
+    prefix, rest = _peel_req_slot_prefixes(body)
+    if " snap=" in rest:
+        return line
+    if not is_cold_generate_command(line):
+        return line
+    parts = rest.split()
+    if len(parts) != 2:
+        return line
+    path, n_gen = parts[0], parts[1]
+    return f"{prefix}START {path} {n_gen} {q}" + ("\n" if nl else "")
+
+
+def is_start_command(line: str) -> bool:
+    """True when the command is START after optional REQ/SLOT prefixes."""
+    body = line[:-1] if line.endswith("\n") else line
+    _, rest = _peel_req_slot_prefixes(body.strip())
+    return rest.upper().startswith("START ")
+
+
+def parse_sched_admit_remaining(line: str) -> int | None:
+    """Parse ``remaining=N`` from ``ok RESTORE_CHAIN_ADMIT`` or ``ok START``."""
+    if "RESTORE_CHAIN_ADMIT" not in line and not line.startswith("ok START"):
         return None
     for part in line.split():
         if part.startswith("remaining="):
@@ -244,6 +311,12 @@ def parse_restore_chain_admit_remaining(line: str) -> int | None:
                 return None
     return None
 
+
+def parse_restore_chain_admit_remaining(line: str) -> int | None:
+    """Parse ``remaining=N`` from an ``ok RESTORE_CHAIN_ADMIT …`` reply."""
+    if "RESTORE_CHAIN_ADMIT" not in line:
+        return None
+    return parse_sched_admit_remaining(line)
 
 def format_req_prefix_needed() -> bool:
     """Commands should carry ``REQ <id>`` when the daemon uses tagged emit."""
