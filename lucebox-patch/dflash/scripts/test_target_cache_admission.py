@@ -12,6 +12,9 @@ from target_cache_admission import (
     format_slot_command,
     multi_slot_drop_exclusive,
     parse_restore_chain_admit_remaining,
+    schedule_quantum,
+    schedule_quantum_for,
+    schedule_quantum_interactive,
     set_active_live_slot,
     stream_tagged_enabled,
     target_cache_slots,
@@ -66,6 +69,37 @@ class ConfigHelpersTests(unittest.TestCase):
             from target_cache_admission import overlap_mode_enabled
 
             self.assertTrue(overlap_mode_enabled())
+
+    def test_interactive_quantum_under_overlap(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DFLASH_TARGET_CACHE_SLOTS": "2",
+                "DFLASH_SCHED_QUANTUM": "512",
+                "DFLASH_SCHED_QUANTUM_INTERACTIVE": "128",
+            },
+        ):
+            self.assertEqual(schedule_quantum(), 512)
+            self.assertEqual(schedule_quantum_interactive(), 128)
+            self.assertEqual(
+                schedule_quantum_for(lane="priority", scoped=True),
+                128,
+            )
+            self.assertEqual(
+                schedule_quantum_for(lane="slow", scoped=False),
+                512,
+            )
+
+    def test_interactive_quantum_clamped_to_bulk(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DFLASH_TARGET_CACHE_SLOTS": "2",
+                "DFLASH_SCHED_QUANTUM": "64",
+                "DFLASH_SCHED_QUANTUM_INTERACTIVE": "256",
+            },
+        ):
+            self.assertEqual(schedule_quantum_interactive(), 64)
 
 
 class FormatSlotCommandTests(unittest.TestCase):
@@ -236,17 +270,14 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
         pool.release(slow)
         pool.release(remaining_fast)
 
-    async def test_fast_v1_drains_waiting_slow_slot_waiter(self) -> None:
+    async def test_fast_v1_leaves_waiting_slow_slot_waiter(self) -> None:
         pool = TargetCacheSlotPool(1)
         held = await pool.acquire("conv:a", scoped=True, lane="priority")
-        cancelled = asyncio.Event()
 
         async def slow_waiter():
-            try:
-                await pool.acquire("ephemeral:s", scoped=False, max_wait=5.0, lane="slow")
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+            return await pool.acquire(
+                "ephemeral:s", scoped=False, max_wait=5.0, lane="slow",
+            )
 
         t_slow = asyncio.create_task(slow_waiter())
         await asyncio.sleep(0.01)
@@ -254,13 +285,13 @@ class SlotPoolTests(unittest.IsolatedAsyncioTestCase):
         t_fast = asyncio.create_task(
             pool.acquire("ephemeral:f", scoped=False, max_wait=5.0, lane="priority")
         )
-        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
-        self.assertEqual(len(pool._low), 0)
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(pool._low), 1)
         pool.release(held)
         lease = await asyncio.wait_for(t_fast, timeout=1.0)
         pool.release(lease)
-        with self.assertRaises(asyncio.CancelledError):
-            await t_slow
+        slow_lease = await asyncio.wait_for(t_slow, timeout=1.0)
+        pool.release(slow_lease)
 
     async def test_lease_context_sets_active_slot(self) -> None:
         pool = TargetCacheSlotPool(2)

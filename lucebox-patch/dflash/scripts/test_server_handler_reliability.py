@@ -19,7 +19,6 @@ from handler_reliability import (
     scoped_lock_wait_cap_seconds,
     should_log_ephemeral_busy,
     slow_lane_lock_wait_seconds,
-    slow_lane_max_tokens,
     tool_inline_snap_pin_enabled,
     tool_snapshot_max_kv_tokens,
 )
@@ -144,17 +143,6 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(ephemeral_lock_wait_seconds(), 5.0)
 
-    def test_ephemeral_max_tokens_defaults_and_clamp(self):
-        from handler_reliability import ephemeral_max_tokens
-
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("DFLASH_EPHEMERAL_MAX_TOKENS", None)
-            self.assertEqual(ephemeral_max_tokens(), 2048)
-        with patch.dict(os.environ, {"DFLASH_EPHEMERAL_MAX_TOKENS": "512"}):
-            self.assertEqual(ephemeral_max_tokens(), 512)
-        with patch.dict(os.environ, {"DFLASH_EPHEMERAL_MAX_TOKENS": "999999"}):
-            self.assertEqual(ephemeral_max_tokens(), 65536)
-
     def test_scoped_lock_wait_cap_when_unbounded(self):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "0"}):
             self.assertEqual(
@@ -164,7 +152,32 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
 
     def test_scoped_lock_wait_cap_default(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(scoped_lock_wait_cap_seconds(), 180.0)
+            self.assertEqual(
+                scoped_lock_wait_cap_seconds(),
+                request_wall_timeout_seconds(),
+            )
+
+    def test_scoped_lock_wait_cap_zero_means_wall(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DFLASH_SCOPED_LOCK_WAIT_SEC": "0",
+                "DFLASH_REQUEST_WALL_TIMEOUT_SEC": "600",
+            },
+        ):
+            self.assertEqual(scoped_lock_wait_cap_seconds(), 600.0)
+
+    def test_sse_keepalive_default(self):
+        from handler_reliability import sse_keepalive_seconds
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(sse_keepalive_seconds(), 15.0)
+
+    def test_sse_keepalive_zero_disables(self):
+        from handler_reliability import sse_keepalive_seconds
+
+        with patch.dict(os.environ, {"DFLASH_SSE_KEEPALIVE_SEC": "0"}):
+            self.assertEqual(sse_keepalive_seconds(), 0.0)
 
     def test_ephemeral_lock_wait_short_when_unbounded(self):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "0"}):
@@ -172,17 +185,11 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
 
     def test_slow_lane_lock_wait_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(slow_lane_lock_wait_seconds(), 30.0)
+            self.assertEqual(slow_lane_lock_wait_seconds(), 120.0)
             self.assertEqual(
                 chat_stream_lock_wait_seconds(scoped=False, lane="slow"),
-                30.0,
+                120.0,
             )
-
-    def test_slow_lane_max_tokens_defaults_to_ephemeral(self):
-        with patch.dict(os.environ, {"DFLASH_EPHEMERAL_MAX_TOKENS": "512"}, clear=True):
-            self.assertEqual(slow_lane_max_tokens(), 512)
-        with patch.dict(os.environ, {"DFLASH_SLOW_LANE_MAX_TOKENS": "256"}):
-            self.assertEqual(slow_lane_max_tokens(), 256)
 
     def test_scoped_lock_wait_respects_explicit_cap(self):
         with patch.dict(os.environ, {
@@ -207,18 +214,15 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
 
 
 class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fast_v1_cancels_waiting_v1e(self):
-        """Any /v1 cancels queued /v1e, not merely deferring it."""
+    async def test_fast_v1_runs_before_queued_v1e(self):
+        """L0: /v1 runs first; /v1e stays queued (no cancel → no Hermes 503)."""
         lock = PriorityDaemonLock()
         order: list[str] = []
 
         async def slow_waiter():
-            try:
-                await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
-                order.append("slow")
-                lock.release()
-            except (asyncio.CancelledError, DaemonBusyError):
-                order.append("slow-cancelled")
+            await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
+            order.append("slow")
+            lock.release()
 
         async def fast_waiter():
             await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
@@ -227,14 +231,15 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
 
         lock._held = True
         t_slow = asyncio.create_task(slow_waiter())
+        await asyncio.sleep(0.02)
         t_fast = asyncio.create_task(fast_waiter())
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
         self.assertEqual(lock.scoped_waiting, 1)
+        self.assertEqual(len(lock._low), 1)
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
-        self.assertIn("priority", order)
-        self.assertIn("slow-cancelled", order)
-        self.assertNotIn("slow", order)
+        self.assertEqual(order[0], "priority")
+        self.assertIn("slow", order)
 
     async def test_unscoped_v1_waits_with_scoped_on_high(self):
         """Unscoped /v1 also joins high and can wait (no instant fail vs scoped)."""
@@ -260,18 +265,13 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         lock.release()
         await t_user
 
-    async def test_v1e_cancelled_when_any_v1_enqueues_while_waiting(self):
+    async def test_v1e_stays_queued_when_v1_enqueues(self):
         lock = PriorityDaemonLock()
         lock._held = True
-        cancelled = asyncio.Event()
 
         async def slow_waiter():
-            try:
-                await lock.acquire(scoped=False, max_wait=10.0, lane="slow")
-                lock.release()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+            await lock.acquire(scoped=False, max_wait=10.0, lane="slow")
+            lock.release()
 
         async def fast_waiter():
             await lock.acquire(scoped=False, max_wait=5.0, lane="priority")
@@ -282,13 +282,11 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(lock._low), 1)
 
         t_fast = asyncio.create_task(fast_waiter())
-        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
-        self.assertEqual(len(lock._low), 0)
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(lock._low), 1, "slow waiter must remain queued")
 
         lock.release()
-        with self.assertRaises(asyncio.CancelledError):
-            await t_slow
-        await t_fast
+        await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
 
     async def test_scoped_runs_before_later_unscoped_after_release(self):
         """After release, earlier high waiters are granted FIFO."""
@@ -327,18 +325,14 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
             ["scoped-acquired", "scoped-releasing", "unscoped-acquired"],
         )
 
-    async def test_fast_drains_queued_v1e_waiters(self):
-        """/v1e already in _low must be cancelled when any /v1 enqueues."""
+    async def test_fast_does_not_drain_queued_v1e_waiters(self):
+        """Queued /v1e stay queued when /v1 arrives (release order still prefers /v1)."""
         lock = PriorityDaemonLock()
         lock._held = True
-        cancelled: list[str] = []
 
         async def slow_waiter(name: str):
-            try:
-                await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
-                lock.release()
-            except (asyncio.CancelledError, DaemonBusyError):
-                cancelled.append(name)
+            await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
+            lock.release()
 
         async def fast_waiter():
             await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
@@ -351,12 +345,10 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
 
         t_s = asyncio.create_task(fast_waiter())
         await asyncio.sleep(0.01)
-        self.assertEqual(len(lock._low), 0, "slow waiters not drained")
+        self.assertEqual(len(lock._low), 2, "slow waiters must not be drained")
 
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_e1, t_e2, t_s), timeout=2.0)
-        self.assertIn("e1", cancelled)
-        self.assertIn("e2", cancelled)
 
     async def test_fast_not_blocked_by_queued_v1e(self):
         """/v1 must acquire before any previously-queued /v1e can run."""
@@ -365,12 +357,9 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         lock._held = True
 
         async def slow_waiter():
-            try:
-                await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
-                order.append("slow")
-                lock.release()
-            except (asyncio.CancelledError, DaemonBusyError):
-                order.append("slow-cancelled")
+            await lock.acquire(scoped=False, max_wait=5.0, lane="slow")
+            order.append("slow")
+            lock.release()
 
         async def fast_waiter():
             await lock.acquire(scoped=True, max_wait=5.0, lane="priority")
@@ -382,12 +371,12 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
         t_fast = asyncio.create_task(fast_waiter())
         await asyncio.sleep(0.01)
 
-        self.assertEqual(len(lock._low), 0)
+        self.assertEqual(len(lock._low), 1)
 
         lock.release()
         await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
-        self.assertIn("priority", order)
-        self.assertNotIn("slow", order)
+        self.assertEqual(order[0], "priority")
+        self.assertIn("slow", order)
 
     def test_busy_retry_after_matches_ephemeral_wait(self):
         """_busy_response uses int(wait_sec) for Retry-After on ephemeral 503s."""
@@ -397,34 +386,27 @@ class PriorityDaemonLockTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SlowLaneBumpTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fast_v1_drains_waiting_v1e(self):
+    async def test_fast_v1_leaves_waiting_v1e_queued(self):
         lock = PriorityDaemonLock()
         lock._held = True
-        cancelled = asyncio.Event()
 
         async def slow_waiter():
-            try:
-                await lock.acquire(scoped=False, max_wait=10.0, lane="slow")
-                lock.release()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+            await lock.acquire(scoped=False, max_wait=10.0, lane="slow")
+            lock.release()
+
+        async def fast_waiter():
+            await lock.acquire(scoped=False, max_wait=5.0, lane="priority")
+            lock.release()
 
         t_slow = asyncio.create_task(slow_waiter())
         await asyncio.sleep(0.01)
         self.assertEqual(len(lock._low), 1)
 
-        # Unscoped /v1 (also high) must drain /v1e waiters.
-        t_fast = asyncio.create_task(
-            lock.acquire(scoped=False, max_wait=5.0, lane="priority")
-        )
-        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
-        self.assertEqual(len(lock._low), 0)
+        t_fast = asyncio.create_task(fast_waiter())
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(lock._low), 1)
         lock.release()
-        with self.assertRaises(asyncio.CancelledError):
-            await t_slow
-        await t_fast
-        lock.release()
+        await asyncio.wait_for(asyncio.gather(t_slow, t_fast), timeout=2.0)
 
     async def test_bump_registry_notifies_inflight(self):
         reg = SlowLaneBumpRegistry()

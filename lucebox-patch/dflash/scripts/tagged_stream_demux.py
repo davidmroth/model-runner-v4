@@ -19,6 +19,8 @@ import threading
 from dataclasses import dataclass
 from typing import AsyncIterator, Iterator
 
+from request_correlation import OrphanFrameMeter
+
 STREAM_TAG_MARKER = -2
 STREAM_DONE_SENTINEL = -1
 STREAM_CONTINUE_SENTINEL = -4
@@ -100,6 +102,8 @@ class TaggedStreamDemux:
         self._closed = False
         self._next_req_id = 1
         self._req_lock = threading.Lock()
+        # Frames for unregistered req_ids (orphan decode after CANCEL / mix).
+        self._orphan_meter = OrphanFrameMeter()
 
     def alloc_req_id(self) -> int:
         with self._req_lock:
@@ -151,6 +155,10 @@ class TaggedStreamDemux:
         rid = frame.req_id if frame.req_id is not None else 0
         q = self._queues.get(rid)
         if q is None:
+            # Untagged legacy frames use req_id=None → rid=0; ignore those
+            # when exclusive path has no subscriber. Tagged orphans matter.
+            if frame.req_id is not None:
+                self._orphan_meter.note(int(frame.req_id), frame.kind)
             return
         try:
             q.put_nowait(frame)
@@ -186,14 +194,17 @@ class TaggedStreamDemux:
         stop_ids: set[int] | frozenset[int] | None = None,
         *,
         wall_timeout: float = 600.0,
-        post_token_idle: float = 3.0,
+        post_token_idle: float = 30.0,
+        continue_idle: float = 60.0,
         queue: asyncio.Queue[StreamFrame | None] | None = None,
     ) -> AsyncIterator[int]:
         """Yield vocab tokens for ``req_id`` until DONE, stop, n_gen, or timeout.
 
-        CONTINUE frames mean more quanta are scheduled — idle timeout is
-        suspended until the next vocab token (or DONE) so a slow SCHED kick
-        cannot truncate the HTTP stream after the first quantum.
+        CONTINUE frames mean more quanta are scheduled — the normal
+        ``post_token_idle`` is replaced by the longer ``continue_idle`` so a
+        slow SCHED kick cannot truncate the HTTP stream after the first
+        quantum, without hanging until ``wall_timeout`` if SCHED never
+        delivers more tokens/DONE.
 
         Stop ids end the stream (same as a soft EOS) — do not ``continue`` past
         them or we hang waiting for DONE when the engine already finished.
@@ -210,16 +221,21 @@ class TaggedStreamDemux:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wall_timeout
         last_token_at: float | None = None
-        # After CONTINUE, wait on wall timeout only until more tokens/DONE.
-        suspend_idle = False
+        # After CONTINUE, wait up to continue_idle (not wall) for next burst.
+        awaiting_continue = False
+        continue_deadline: float | None = None
         try:
             while generated < n_gen:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
-                if (
-                    not suspend_idle
-                    and last_token_at is not None
+                if awaiting_continue and continue_deadline is not None:
+                    cont_left = continue_deadline - loop.time()
+                    if cont_left <= 0:
+                        break
+                    remaining = min(remaining, cont_left)
+                elif (
+                    last_token_at is not None
                     and post_token_idle > 0
                 ):
                     idle_left = post_token_idle - (loop.time() - last_token_at)
@@ -233,8 +249,11 @@ class TaggedStreamDemux:
                 if item is None:
                     break
                 if item.kind == "cont":
-                    # More decode is scheduled — do not idle-cut between quanta.
-                    suspend_idle = True
+                    # More decode is scheduled — allow a longer gap than the
+                    # normal post-token idle, but never hang until wall_timeout.
+                    awaiting_continue = True
+                    cont_budget = continue_idle if continue_idle > 0 else post_token_idle
+                    continue_deadline = loop.time() + max(cont_budget, post_token_idle)
                     last_token_at = None
                     continue
                 if item.kind == "done":
@@ -245,7 +264,8 @@ class TaggedStreamDemux:
                 if tok in stops:
                     break
                 generated += 1
-                suspend_idle = False
+                awaiting_continue = False
+                continue_deadline = None
                 last_token_at = loop.time()
                 yield tok
         finally:

@@ -77,13 +77,15 @@ services:
       DFLASH_TOOL_WARMUP_PATH: ${DFLASH_TOOL_WARMUP_PATH:-/opt/lucebox-hub/server/models/.dflash/tool-warmup.json}
       DFLASH_TOOL_PIN_PROTECT: ${DFLASH_TOOL_PIN_PROTECT:-1}
       DFLASH_DAEMON_LOCK_WAIT_SEC: ${DFLASH_DAEMON_LOCK_WAIT_SEC:-0}
-      DFLASH_SCOPED_LOCK_WAIT_SEC: ${DFLASH_SCOPED_LOCK_WAIT_SEC:-180}
+      # 0 → wait up to REQUEST_WALL (prefer queue over early Hermes 503).
+      DFLASH_SCOPED_LOCK_WAIT_SEC: ${DFLASH_SCOPED_LOCK_WAIT_SEC:-0}
       DFLASH_EPHEMERAL_LOCK_WAIT_SEC: ${DFLASH_EPHEMERAL_LOCK_WAIT_SEC:-5}
-      DFLASH_SLOW_LANE_LOCK_WAIT_SEC: ${DFLASH_SLOW_LANE_LOCK_WAIT_SEC:-30}
-      DFLASH_EPHEMERAL_MAX_TOKENS: ${DFLASH_EPHEMERAL_MAX_TOKENS:-2048}
+      DFLASH_SLOW_LANE_LOCK_WAIT_SEC: ${DFLASH_SLOW_LANE_LOCK_WAIT_SEC:-120}
       DFLASH_RESERVED_FAST_SLOTS: ${DFLASH_RESERVED_FAST_SLOTS:-}
       DFLASH_SCOPED_LOCK_PRIORITY: ${DFLASH_SCOPED_LOCK_PRIORITY:-1}
       DFLASH_REQUEST_WALL_TIMEOUT_SEC: ${DFLASH_REQUEST_WALL_TIMEOUT_SEC:-600}
+      # SSE comment keepalives during overlap quantum gaps (0 disables).
+      DFLASH_SSE_KEEPALIVE_SEC: ${DFLASH_SSE_KEEPALIVE_SEC:-15}
       DFLASH_TOOL_SNAPSHOT_MAX_KV: ${DFLASH_TOOL_SNAPSHOT_MAX_KV:-16384}
       DFLASH_QUIET_ACCESS_LOGS: ${DFLASH_QUIET_ACCESS_LOGS:-1}
       # Live admit slots. N>1 auto-enables tagged demux + drop-exclusive;
@@ -91,6 +93,13 @@ services:
       DFLASH_TARGET_CACHE_SLOTS: ${DFLASH_TARGET_CACHE_SLOTS:-1}
       DFLASH_STREAM_TAGGED: ${DFLASH_STREAM_TAGGED:-}
       DFLASH_MULTI_SLOT_DROP_EXCLUSIVE: ${DFLASH_MULTI_SLOT_DROP_EXCLUSIVE:-}
+      # Decode quantum for RESTORE_CHAIN admit / START (default 8 truncates
+      # tool-call XML mid-tag under overlap — keep 512 for bulk).
+      DFLASH_SCHED_QUANTUM: ${DFLASH_SCHED_QUANTUM:-512}
+      # Interactive /v1 under N>1: shorter quanta so peer silence is smaller.
+      DFLASH_SCHED_QUANTUM_INTERACTIVE: ${DFLASH_SCHED_QUANTUM_INTERACTIVE:-128}
+      # Multi-slot forensics: scope↔slot↔req↔first_tokens (0 disables).
+      DFLASH_CORR_LOG: ${DFLASH_CORR_LOG:-1}
       # CUDA graphs reset on every spec-decode step (variable batch sizes in verify+replay).
       # Per-step timing probe: verify=150ms, replay=144ms at 1.5K ctx (12x over bandwidth bound).
       # Disabling graphs eliminates the ~134ms/phase recompile overhead → expected 6x decode speedup.

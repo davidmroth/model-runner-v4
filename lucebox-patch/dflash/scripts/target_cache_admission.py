@@ -69,6 +69,36 @@ def schedule_quantum() -> int:
     return max(1, min(n, 4096))
 
 
+def schedule_quantum_interactive() -> int:
+    """Shorter quantum for interactive ``/v1`` under overlap (default 128).
+
+    Keeps peer wait gaps smaller than the bulk ``DFLASH_SCHED_QUANTUM``
+    without going so low that a single quantum routinely truncates tool XML
+    when CONTINUE/SCHED is healthy.
+    """
+    raw = os.environ.get("DFLASH_SCHED_QUANTUM_INTERACTIVE", "128").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 128
+    return max(1, min(n, schedule_quantum()))
+
+
+def schedule_quantum_for(*, lane: str = "priority", scoped: bool = True) -> int:
+    """Pick a decode quantum for this admit.
+
+    Under multi-slot overlap, scoped ``/v1`` uses the interactive quantum so
+    peer sessions resume sooner. Slow / ephemeral traffic keeps the bulk
+    quantum (fewer CONTINUE round-trips for background jobs).
+    """
+    bulk = schedule_quantum()
+    if not overlap_mode_enabled():
+        return bulk
+    if lane == "slow" or not scoped:
+        return bulk
+    return schedule_quantum_interactive()
+
+
 def _peel_req_slot_prefixes(body: str) -> tuple[str, str]:
     """Split leading ``REQ`` / ``SLOT`` tokens from a daemon command body.
 
@@ -413,19 +443,14 @@ class TargetCacheSlotPool:
             return lease
 
         tier = self._tier(scoped=scoped, lane=lane)
-        # Fail-fast: slow lane never queues behind any /v1 waiter.
-        if tier == "low" and (self._high or self._mid):
-            raise asyncio.TimeoutError()
+        # L0 (harness): queue /v1e instead of fail-fast or cancelling waiters.
+        # Release still drains high → mid → low, so /v1 always runs first.
+        # Only bump *in-flight* slow holders so interactive work can proceed.
 
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[SlotLease] = loop.create_future()
         self._queue_for(tier).append((fut, key, scoped, lane))
-        if tier == "high":
-            self._drain_queue(self._mid)
-            self._drain_queue(self._low)
-            self._maybe_bump_slow(waiter_lane=lane)
-        elif tier == "mid":
-            self._drain_queue(self._low)
+        if tier in ("high", "mid"):
             self._maybe_bump_slow(waiter_lane=lane)
         if not self._free:
             self._maybe_bump_slow(waiter_lane=lane)

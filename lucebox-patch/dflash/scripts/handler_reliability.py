@@ -162,20 +162,12 @@ class PriorityDaemonLock:
             self._holder_lane = lane
             return
 
-        # Fail-fast: slow lane never queues behind any /v1 waiter.
-        if tier == "low" and (self._high or self._mid):
-            raise asyncio.TimeoutError()
-
+        # L0 (harness): keep /v1e queued (no fail-fast / no cancel-on-/v1).
+        # release() still wakes high before low. Only bump in-flight slow work.
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[None] = loop.create_future()
         self._queue_for(tier).append(fut)
-        if tier == "high":
-            # Prefer draining leftover mid waiters (legacy) plus all /v1e.
-            self._drain_queue(self._mid, reason="priority /v1 enqueued")
-            self._drain_queue(self._low, reason="priority /v1 enqueued")
-            self._maybe_bump_slow_holder(waiter_lane=lane)
-        elif tier == "mid":
-            self._drain_queue(self._low, reason="priority /v1 enqueued")
+        if tier in ("high", "mid"):
             self._maybe_bump_slow_holder(waiter_lane=lane)
         try:
             if max_wait == float("inf"):
@@ -288,15 +280,33 @@ def is_ephemeral_cache_scope(cache_scope: str) -> bool:
 def scoped_lock_wait_cap_seconds() -> float:
     """Cap lock wait for scoped (conversation-id) chat when global wait is unbounded.
 
-    Default 180s: cold prefill of 20K+ tokens takes ~90s without PFlash, so
-    the cap must exceed the longest expected inference to avoid a scoped request
-    timing out before it can acquire the lock.
+    Default ``0`` → use ``DFLASH_REQUEST_WALL_TIMEOUT_SEC`` so Hermes-facing
+    ``/v1`` traffic queues through a peer turn instead of 503'ing early.
+    Set a positive value to force a shorter cap (legacy 180s behavior).
     """
-    raw = os.environ.get("DFLASH_SCOPED_LOCK_WAIT_SEC", "180")
+    raw = os.environ.get("DFLASH_SCOPED_LOCK_WAIT_SEC", "0")
     try:
-        return max(5.0, float(raw))
+        val = float(raw)
     except ValueError:
-        return 180.0
+        return request_wall_timeout_seconds()
+    if val <= 0:
+        return request_wall_timeout_seconds()
+    return max(5.0, val)
+
+
+def sse_keepalive_seconds() -> float:
+    """SSE comment interval while waiting on daemon generate (0 disables).
+
+    Keeps Hermes / proxies from treating long quantum gaps as a dead stream.
+    """
+    raw = os.environ.get("DFLASH_SSE_KEEPALIVE_SEC", "15").strip()
+    try:
+        val = float(raw)
+    except ValueError:
+        return 15.0
+    if val <= 0:
+        return 0.0
+    return max(1.0, val)
 
 
 def ephemeral_lock_wait_seconds() -> float:
@@ -320,30 +330,6 @@ def slow_lane_lock_wait_seconds() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return 30.0
-
-
-def ephemeral_max_tokens() -> int:
-    """Hard cap on completion tokens for ephemeral (no conversation id) traffic.
-
-    Background extractors often send ``max_tokens=64000`` which can hold a live
-    slot for minutes and starve scoped chat under N=2. Default 2048.
-    """
-    raw = os.environ.get("DFLASH_EPHEMERAL_MAX_TOKENS", "2048")
-    try:
-        return max(16, min(int(raw), 65536))
-    except ValueError:
-        return 2048
-
-
-def slow_lane_max_tokens() -> int:
-    """Hard cap for ``/v1e`` completions. Defaults to ephemeral max tokens."""
-    raw = os.environ.get("DFLASH_SLOW_LANE_MAX_TOKENS", "").strip()
-    if not raw:
-        return ephemeral_max_tokens()
-    try:
-        return max(16, min(int(raw), 65536))
-    except ValueError:
-        return ephemeral_max_tokens()
 
 
 def chat_stream_lock_wait_seconds(*, scoped: bool, lane: str = "priority") -> float:

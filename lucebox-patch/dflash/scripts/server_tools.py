@@ -106,17 +106,17 @@ from handler_reliability import (
     chat_stream_lock_wait_seconds,
     daemon_lock_wait_seconds,
     deferred_conv_snap_max_tail,
-    ephemeral_max_tokens,
     install_quiet_access_log_filter,
     is_ephemeral_cache_scope,
     quiet_access_logs_enabled,
     request_wall_timeout_seconds,
     scoped_lock_priority_enabled,
     should_log_ephemeral_busy,
-    slow_lane_max_tokens,
+    sse_keepalive_seconds,
 )
 from target_cache_admission import (
     TargetCacheSlotPool,
+    active_live_slot,
     append_restore_chain_quantum,
     format_slot_command,
     is_restore_chain_command,
@@ -124,11 +124,17 @@ from target_cache_admission import (
     overlap_mode_enabled,
     parse_restore_chain_admit_remaining,
     reset_active_live_slot,
+    schedule_quantum_for,
     set_active_live_slot,
     stream_tagged_enabled,
     target_cache_slots,
 )
 from tagged_stream_demux import TaggedStreamDemux, format_req_command
+from request_correlation import (
+    cmd_kind as corr_cmd_kind,
+    log_corr,
+    summarize_first_tokens,
+)
 
 # Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "add_generation_prompt", "tools"})
@@ -450,13 +456,23 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict,
     except (ValueError, SyntaxError, TypeError): return param_value
 
 
+_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
 def _parse_function_block(fn_text: str, tools=None) -> dict | None:
-    """Parse one `<function=NAME>...parameters...` body into an OpenAI tool_call."""
+    """Parse one `<function=NAME>...parameters...` body into an OpenAI tool_call.
+
+    Rejects incomplete / truncated XML where the closing ``>`` after the
+    function name is missing (common when decode stops mid-tag). Without
+    this guard the next ``>`` from ``<parameter=…>`` is mistaken for the
+    name terminator and Hermes sees tool names like
+    ``browser_navigate\\n<parameter=url``.
+    """
     end_idx = fn_text.find(">")
     if end_idx == -1:
         return None
     function_name = fn_text[:end_idx].strip()
-    if not function_name:
+    if not function_name or not _FUNCTION_NAME_RE.match(function_name):
         return None
     params_region = fn_text[end_idx + 1:]
     param_config = _find_tool_properties(tools, function_name)
@@ -466,6 +482,8 @@ def _parse_function_block(fn_text: str, tools=None) -> dict | None:
         if eq_idx == -1:
             continue
         k = match_text[:eq_idx].strip()
+        if not k or not _FUNCTION_NAME_RE.match(k):
+            continue
         v = match_text[eq_idx + 1:]
         if v.startswith("\n"):
             v = v[1:]
@@ -504,12 +522,18 @@ def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
         cursor = m.end()
         body = m.group(1)
         fn_match = TOOL_CALL_FUNCTION_RE.search(body)
-        if not fn_match:
-            continue
-        fn_text = fn_match.group(1) or fn_match.group(2) or ""
-        parsed = _parse_function_block(fn_text, tools=tools)
+        parsed = None
+        if fn_match:
+            fn_text = fn_match.group(1) or fn_match.group(2) or ""
+            parsed = _parse_function_block(fn_text, tools=tools)
         if parsed:
             tool_calls.append(parsed)
+        else:
+            # Malformed/truncated block (e.g. `<function=NAME` with the closing
+            # `>` missing, so the name can't be trusted): keep the raw block as
+            # content instead of silently dropping it — otherwise the turn's text
+            # vanishes entirely and the client sees an empty reply.
+            cleaned_parts.append(m.group(0))
     remainder = text[cursor:]
     # Bare `<function=...>` without `<tool_call>` wrapper (production Flock-camera symptom).
     bare_cursor = 0
@@ -523,7 +547,15 @@ def parse_tool_calls(text: str, tools=None) -> tuple[str, list[dict]]:
             tool_calls.append(parsed)
     bare_cleaned.append(remainder[bare_cursor:])
     cleaned_parts.append("".join(bare_cleaned))
-    return "".join(cleaned_parts).strip(), tool_calls
+    cleaned = "".join(cleaned_parts)
+    if tool_calls:
+        # A call was recovered from an unclosed/partial block (e.g. decode stopped
+        # after `<function=…></function>` but before `</tool_call>`). The complete-
+        # block path already consumes matched `<tool_call>…</tool_call>` pairs, so
+        # any opener/closer left here is an orphan structural tag — strip it so it
+        # does not leak into assistant content as literal `<tool_call>` text.
+        cleaned = cleaned.replace(TOOL_OPEN_TAG, "").replace("</tool_call>", "")
+    return cleaned.strip(), tool_calls
 
 
 # ─── app ───────────────────────────────────────────────────────────
@@ -745,6 +777,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             f"  [handler] CANCEL req={req_id} — bumped by /v1",
                             flush=True,
                         )
+                        log_corr(
+                            "cancel",
+                            slot=active_live_slot(),
+                            req_id=req_id,
+                            reason="slow_bumped",
+                        )
                     except Exception as exc:
                         print(
                             f"  [handler] CANCEL req={req_id} on bump failed: "
@@ -833,6 +871,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         *,
         wall_timeout: float,
         use_stops: bool = True,
+        quantum: int | None = None,
+        cache_scope: str | None = None,
     ) -> list[int]:
         """Register (if tagged), write command, collect tokens.
 
@@ -845,6 +885,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         req_id: int | None = None
         queue = None
         cmd = cmd_line
+        slot = active_live_slot()
         use_admit = (
             overlap_mode_enabled()
             and multi_slot_drop_exclusive()
@@ -852,11 +893,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             and is_restore_chain_command(cmd)
         )
         if use_admit:
-            cmd = append_restore_chain_quantum(cmd)
+            cmd = append_restore_chain_quantum(cmd, quantum=quantum)
         if tagged_demux is not None:
             req_id = tagged_demux.alloc_req_id()
             queue = await tagged_demux.register(req_id)
+        log_corr(
+            "gen_start",
+            scope=cache_scope,
+            slot=slot,
+            req_id=req_id,
+            cmd=corr_cmd_kind(cmd),
+            gen_len=gen_len,
+            quantum=quantum if use_admit else None,
+            admit=1 if use_admit else 0,
+        )
         sched_task: asyncio.Task[None] | None = None
+        t0 = time.monotonic()
         try:
             if tagged_demux is None:
                 drain_pipe_residual(r_pipe)
@@ -873,17 +925,46 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             f"  [handler] RESTORE_CHAIN_ADMIT wait failed: {exc!r}",
                             flush=True,
                         )
+                        log_corr(
+                            "admit_fail",
+                            scope=cache_scope,
+                            slot=slot,
+                            req_id=req_id,
+                            err=repr(exc),
+                        )
                         return
                     rem = parse_restore_chain_admit_remaining(admit)
+                    log_corr(
+                        "admit_ok",
+                        scope=cache_scope,
+                        slot=slot,
+                        req_id=req_id,
+                        remaining=rem,
+                        reply=admit.strip()[:120],
+                    )
                     if rem is not None and rem <= 0:
                         print(
                             f"  [handler] skip SCHED_DRAIN (admit remaining={rem})",
                             flush=True,
                         )
+                        log_corr(
+                            "sched_skip",
+                            scope=cache_scope,
+                            slot=slot,
+                            req_id=req_id,
+                            remaining=rem,
+                        )
                         return
                     async with daemon_stdin_lock:
                         daemon_proc.stdin.write(b"SCHED_DRAIN\n")
                         daemon_proc.stdin.flush()
+                    log_corr(
+                        "sched_drain",
+                        scope=cache_scope,
+                        slot=slot,
+                        req_id=req_id,
+                        remaining=rem,
+                    )
 
                 sched_task = asyncio.create_task(_kick_sched())
 
@@ -904,11 +985,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     gen_len, req_id=None, wall_timeout=wall_timeout, use_stops=use_stops,
                 )
 
-            return await _await_or_bump(
+            tokens = await _await_or_bump(
                 _collect(),
                 _active_slow_bump.get(),
                 req_id=req_id,
             )
+            summary = summarize_first_tokens(tokens, tokenizer=tokenizer)
+            log_corr(
+                "gen_first",
+                scope=cache_scope,
+                slot=slot,
+                req_id=req_id,
+                elapsed_s=time.monotonic() - t0,
+                n_tok=summary["n_tok"],
+                first_ids=summary["first_ids"],
+                first_text=summary.get("first_text"),
+            )
+            return tokens
         finally:
             if sched_task is not None:
                 # Kick task only waits for ADMIT + writes SCHED; do not hold the
@@ -929,10 +1022,25 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         f"  [handler] CANCEL req={req_id} after generate collect",
                         flush=True,
                     )
+                    log_corr(
+                        "cancel",
+                        scope=cache_scope,
+                        slot=slot,
+                        req_id=req_id,
+                        reason="after_collect",
+                        elapsed_s=time.monotonic() - t0,
+                    )
                 except Exception as exc:
                     print(
                         f"  [handler] CANCEL req={req_id} failed: {exc!r}",
                         flush=True,
+                    )
+                    log_corr(
+                        "cancel_fail",
+                        scope=cache_scope,
+                        slot=slot,
+                        req_id=req_id,
+                        err=repr(exc),
                     )
             if tagged_demux is not None and req_id is not None:
                 await tagged_demux.unregister(req_id)
@@ -1791,25 +1899,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             full_snap_prep,
         )
 
-    def _clamp_gen_len(
-        req: ChatRequest,
-        prompt_len: int,
-        *,
-        ephemeral: bool = False,
-        lane: str = "priority",
-    ) -> int:
+    def _clamp_gen_len(req: ChatRequest, prompt_len: int) -> int:
+        """Cap generation to remaining context window only.
+
+        Do not rewrite client ``max_tokens`` by traffic class (ephemeral / slow
+        lane). Priority is enforced by admission (``/v1`` preempts ``/v1e``);
+        prompts run as requested within KV capacity.
+        """
         available_gen = max_ctx - prompt_len - 20
-        gen = min(_max_gen_tokens(req), available_gen)
-        if lane == "slow" or ephemeral:
-            cap = slow_lane_max_tokens() if lane == "slow" else ephemeral_max_tokens()
-            label = "slow-lane" if lane == "slow" else "ephemeral"
-            if gen > cap:
-                print(
-                    f"  [handler] {label} max_tokens clamped {gen} → {cap}",
-                    flush=True,
-                )
-                gen = cap
-        return gen
+        return min(_max_gen_tokens(req), available_gen)
 
     def _tokenize_prompt(req: ChatRequest) -> tuple[Path, bool]:
         """Returns (prompt_bin_path, started_in_thinking). started_in_thinking
@@ -1991,15 +2089,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         """
         lane = "slow" if lane == "slow" else "priority"
         img_path, text_path = vision
+        # Context-only bound: multimodal path has no prompt_len KV estimate here
+        # beyond what the client asked for; do not apply traffic-class caps.
         gen_len = _max_gen_tokens(req)
-        if lane == "slow":
-            cap = slow_lane_max_tokens()
-            if gen_len > cap:
-                print(
-                    f"  [handler] slow-lane max_tokens clamped {gen_len} → {cap}",
-                    flush=True,
-                )
-                gen_len = cap
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         cmd_line = f"GENERATE_MULTIMODAL {img_path} {text_path} {gen_len}\n"
@@ -2256,12 +2348,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             prompt_len = cached_cur_ids_len
             started_in_thinking = False  # cached result: no think prefill
 
-        gen_len = _clamp_gen_len(
-            req,
-            prompt_len,
-            ephemeral=is_ephemeral_cache_scope(cache_scope),
-            lane=lane,
-        )
+        gen_len = _clamp_gen_len(req, prompt_len)
         if gen_len <= 0:
             _abort_full_snap_if_needed(full_snap_prep)
             if full_hit is None:
@@ -2323,12 +2410,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     prompt_ids,
                     cache_scope,
                 )
-                gen_len = _clamp_gen_len(
-                    req,
-                    prompt_len,
-                    ephemeral=is_ephemeral_cache_scope(cache_scope),
-                    lane=lane,
-                )
+                gen_len = _clamp_gen_len(req, prompt_len)
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     cur_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
@@ -2345,6 +2427,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         cmd_line,
                         gen_len,
                         wall_timeout=wall_timeout_sec,
+                        quantum=schedule_quantum_for(lane=lane, scoped=scoped),
+                        cache_scope=cache_scope,
                     )
                     await bus.drain_timings()
                     snap_ok = True
@@ -2578,12 +2662,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     prompt_ids,
                     cache_scope,
                 )
-                gen_len = _clamp_gen_len(
-                    req,
-                    prompt_len,
-                    ephemeral=is_ephemeral_cache_scope(cache_scope),
-                    lane=lane,
-                )
+                gen_len = _clamp_gen_len(req, prompt_len)
                 cmd_line, snap_prep, conv_prefix_len, tool_snap_prep = _compose_daemon_cmd(
                     prompt_bin, gen_len, prompt_ids,
                     full_hit=full_hit,
@@ -2611,18 +2690,35 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         return None
                     return f"data: {json.dumps(chunk({kind: text}))}\n\n"
 
-                # Collect daemon tokens before yielding SSE (same pattern as
-                # non-stream). StreamingResponse + yield-before-read deadlocks
-                # under uvicorn even with a background pump task.
-                try:
-                    token_ids = await asyncio.wait_for(
+                # Generate in a background task so we can emit SSE keepalives
+                # while the daemon is quiet between overlap quanta. Token
+                # detok still happens after the collect completes (avoids the
+                # historical yield-while-reading-pipe deadlock).
+                quantum = schedule_quantum_for(lane=lane, scoped=scoped)
+                gen_task = asyncio.create_task(
+                    asyncio.wait_for(
                         _generate_via_daemon(
                             cmd_line,
                             gen_len,
                             wall_timeout=wall_timeout_sec,
+                            quantum=quantum,
+                            cache_scope=cache_scope,
                         ),
                         timeout=wall_timeout_sec,
                     )
+                )
+                yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
+                role_sent = True
+                hb = sse_keepalive_seconds()
+                while not gen_task.done():
+                    if hb <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(asyncio.shield(gen_task), timeout=hb)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                try:
+                    token_ids = await gen_task
                 except asyncio.TimeoutError:
                     print(
                         f"  [handler] pipe read timed out after "
@@ -2641,8 +2737,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     yield "data: [DONE]\n\n"
                     return
 
-                yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
-                role_sent = True
                 detok = IncrementalDetokenizer(
                     tokenizer, skip_special_tokens=False)
 
@@ -3284,6 +3378,32 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
     return app
 
 
+def reclaim_prefill_slots_when_pflash_off(
+    *,
+    pflash_enabled: bool,
+    prefix_slots: int,
+    prefill_slots: int,
+) -> tuple[int, int, int]:
+    """Fold unused full-cache slots into thick prefix capacity when PFlash is off.
+
+    ``--prefill-cache-slots`` only backs Option-3 full-compress snapshots. With
+    ``DFLASH_PREFILL_MODE=off`` those slots are never initialized, but they still
+    count against the shared daemon budget (max 8) alongside prefix + tool pins.
+    Leaving them reserved with only 2 thick slots causes LRU thrash across chat
+    and cron scopes (lookup miss after a prior commit → ``thick=-1``).
+
+    This is a **runtime** fold only. Keep ``DFLASH_PREFILL_CACHE_SLOTS≥2`` in
+    compose/.env so enabling PFlash later is a mode flip + canary, not a second
+    capacity redesign. When ``pflash_enabled`` is true, this is a no-op and the
+    configured prefill slots are used as-is.
+
+    Returns ``(prefix_slots, prefill_slots, reclaimed)``.
+    """
+    if pflash_enabled or prefill_slots <= 0:
+        return prefix_slots, prefill_slots, 0
+    return prefix_slots + prefill_slots, 0, prefill_slots
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
@@ -3436,6 +3556,21 @@ def main():
     if prefill_cfg.enabled:
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
+
+    args.prefix_cache_slots, args.prefill_cache_slots, _reclaimed = (
+        reclaim_prefill_slots_when_pflash_off(
+            pflash_enabled=bool(prefill_cfg.enabled),
+            prefix_slots=int(args.prefix_cache_slots),
+            prefill_slots=int(args.prefill_cache_slots),
+        )
+    )
+    if _reclaimed:
+        print(
+            f"  [cfg] pflash off: reclaimed {_reclaimed} prefill slot(s) → "
+            f"prefix_cache_slots={args.prefix_cache_slots} "
+            f"prefill_cache_slots={args.prefill_cache_slots}",
+            flush=True,
+        )
 
     tool_split_orchestrator = None
     if tool_split_cfg.enabled:
