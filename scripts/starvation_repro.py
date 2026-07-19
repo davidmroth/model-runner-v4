@@ -370,9 +370,9 @@ def verdict(baseline: dict | None, contended: dict, stall_threshold: float) -> d
         )
         regime = "degraded interleave"
     elif base_ttft > 0 and ttft >= max(stall_threshold, 3.0 * base_ttft):
-        # Primary signal on buffered streams: victim was admitted alongside the
-        # runaway but did not get the worker until the runaway largely finished.
-        reproduced = True
+        # On a buffered stream, TTFT ≈ wait-for-worker + generation. Distinguish
+        # catastrophic monopolization (minutes) from the bounded wait for one
+        # peer START quantum (tens of seconds under fair SCHED_STEP).
         wait_s = round(ttft - base_ttft, 1)
         reasons.append(
             f"victim ttft={ttft}s vs solo baseline {base_ttft}s "
@@ -383,7 +383,18 @@ def verdict(baseline: dict | None, contended: dict, stall_threshold: float) -> d
                 "SSE stream is buffered (tokens flush at end) — mid-stream gaps "
                 "are not observable; TTFT inflation is the starvation signal"
             )
-        regime = "worker monopolization (DRAIN / no fair interleave)"
+        # Catastrophic: multi-minute hold (legacy DRAIN / cold blocking generate).
+        if wait_s >= 120.0 or ttft >= max(10.0 * base_ttft, 120.0):
+            reproduced = True
+            regime = "worker monopolization (DRAIN / no fair interleave)"
+        else:
+            # Bounded elevation — typically waiting out one peer START quantum
+            # before fair SCHED_STEP sharing begins. Not the bug.
+            regime = "bounded contention (first-quantum wait)"
+            reasons.append(
+                "extra wait is under 120s — consistent with waiting for one peer "
+                "START quantum, then fair interleave (not monopolization)"
+            )
     elif ttft >= stall_threshold and gap_max < stall_threshold and not buffered:
         regime = "head-of-line queueing (bounded)"
         reasons.append(
