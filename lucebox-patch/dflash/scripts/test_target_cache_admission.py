@@ -12,6 +12,8 @@ from target_cache_admission import (
     format_slot_command,
     multi_slot_drop_exclusive,
     parse_restore_chain_admit_remaining,
+    pump_sched_steps,
+    sched_driver,
     schedule_quantum,
     schedule_quantum_for,
     schedule_quantum_interactive,
@@ -100,6 +102,67 @@ class ConfigHelpersTests(unittest.TestCase):
             },
         ):
             self.assertEqual(schedule_quantum_interactive(), 64)
+
+    def test_sched_driver_defaults_to_drain(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DFLASH_SCHED_DRIVER", None)
+            self.assertEqual(sched_driver(), "drain")
+
+    def test_sched_driver_step_aliases(self) -> None:
+        for val in ("step", "STEP", "sched_step", "step_pump"):
+            with patch.dict(os.environ, {"DFLASH_SCHED_DRIVER": val}):
+                self.assertEqual(sched_driver(), "step", val)
+        with patch.dict(os.environ, {"DFLASH_SCHED_DRIVER": "drain"}):
+            self.assertEqual(sched_driver(), "drain")
+
+
+class SchedStepPumpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pump_counts_non_idle_steps_then_stops(self) -> None:
+        replies = ["ok SCHED_STEP", "ok SCHED_STEP", "ok SCHED_STEP idle"]
+        writes: list[str] = []
+        stop = asyncio.Event()
+
+        async def write_step() -> None:
+            writes.append("STEP")
+
+        async def await_reply(prefix: str, timeout: float = 10.0) -> str:
+            self.assertTrue("SCHED_STEP" in prefix)
+            if not replies:
+                stop.set()
+                return "ok SCHED_STEP idle"
+            return replies.pop(0)
+
+        n = await pump_sched_steps(
+            write_step=write_step,
+            await_reply=await_reply,
+            stop_event=stop,
+            wall_timeout=1.0,
+            idle_sleep=0.001,
+        )
+        self.assertEqual(n, 2)
+        self.assertGreaterEqual(len(writes), 3)
+
+    async def test_pump_stops_promptly_on_stop_event(self) -> None:
+        stop = asyncio.Event()
+        writes = 0
+
+        async def write_step() -> None:
+            nonlocal writes
+            writes += 1
+            if writes >= 2:
+                stop.set()
+
+        async def await_reply(prefix: str, timeout: float = 10.0) -> str:
+            return "ok SCHED_STEP"
+
+        n = await pump_sched_steps(
+            write_step=write_step,
+            await_reply=await_reply,
+            stop_event=stop,
+            wall_timeout=1.0,
+        )
+        self.assertGreaterEqual(n, 1)
+        self.assertLessEqual(writes, 3)
 
 
 class FormatSlotCommandTests(unittest.TestCase):

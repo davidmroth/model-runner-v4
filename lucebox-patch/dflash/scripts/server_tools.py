@@ -124,7 +124,9 @@ from target_cache_admission import (
     multi_slot_drop_exclusive,
     overlap_mode_enabled,
     parse_restore_chain_admit_remaining,
+    pump_sched_steps,
     reset_active_live_slot,
+    sched_driver,
     schedule_quantum_for,
     set_active_live_slot,
     stream_tagged_enabled,
@@ -878,10 +880,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         """Register (if tagged), write command, collect tokens.
 
         When overlap mode is on (N>1 + tagged + drop-exclusive) and the command
-        is ``RESTORE_CHAIN``, append a schedule quantum and kick ``SCHED_DRAIN``
+        is ``RESTORE_CHAIN``, append a schedule quantum and kick the scheduler
         after ``ok RESTORE_CHAIN_ADMIT`` only when ``remaining>0`` so decode can
         time-slice with peers. Early-stop admits (EOS in first quantum) must
         not kick a phantom drain of leftover ``max_tokens``.
+
+        Driver (``DFLASH_SCHED_DRIVER``):
+        - ``drain`` — one ``SCHED_DRAIN`` (legacy; holds daemon stdin until all
+          live remaining is exhausted, so peer admits wait).
+        - ``step`` — loop ``SCHED_STEP`` so the daemon returns to stdin between
+          quanta and peers can be admitted / interleaved.
         """
         req_id: int | None = None
         queue = None
@@ -909,6 +917,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             admit=1 if use_admit else 0,
         )
         sched_task: asyncio.Task[None] | None = None
+        sched_stop = asyncio.Event()
         t0 = time.monotonic()
         try:
             if tagged_demux is None:
@@ -916,6 +925,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             bus.begin_request()
             await _write_daemon_cmd_async(cmd, req_id=req_id)
             if use_admit:
+                driver = sched_driver()
+
                 async def _kick_sched() -> None:
                     try:
                         admit = await bus.await_reply(
@@ -945,7 +956,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     )
                     if rem is not None and rem <= 0:
                         print(
-                            f"  [handler] skip SCHED_DRAIN (admit remaining={rem})",
+                            f"  [handler] skip SCHED ({driver}; admit remaining={rem})",
                             flush=True,
                         )
                         log_corr(
@@ -954,8 +965,55 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             slot=slot,
                             req_id=req_id,
                             remaining=rem,
+                            driver=driver,
                         )
                         return
+                    if driver == "step":
+                        async def _write_step() -> None:
+                            async with daemon_stdin_lock:
+                                daemon_proc.stdin.write(b"SCHED_STEP\n")
+                                daemon_proc.stdin.flush()
+
+                        log_corr(
+                            "sched_step_start",
+                            scope=cache_scope,
+                            slot=slot,
+                            req_id=req_id,
+                            remaining=rem,
+                        )
+                        try:
+                            n_steps = await pump_sched_steps(
+                                write_step=_write_step,
+                                await_reply=bus.await_reply,
+                                stop_event=sched_stop,
+                                wall_timeout=wall_timeout,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            if sched_stop.is_set():
+                                return
+                            print(
+                                f"  [handler] SCHED_STEP pump failed: {exc!r}",
+                                flush=True,
+                            )
+                            log_corr(
+                                "sched_step_fail",
+                                scope=cache_scope,
+                                slot=slot,
+                                req_id=req_id,
+                                err=repr(exc),
+                            )
+                            return
+                        log_corr(
+                            "sched_step_done",
+                            scope=cache_scope,
+                            slot=slot,
+                            req_id=req_id,
+                            steps=n_steps,
+                        )
+                        return
+
                     async with daemon_stdin_lock:
                         daemon_proc.stdin.write(b"SCHED_DRAIN\n")
                         daemon_proc.stdin.flush()
@@ -1004,16 +1062,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             )
             return tokens
         finally:
+            # Stop the step pump (or finish the drain kick) before CANCEL so we
+            # do not race a SCHED_* write against teardown.
+            sched_stop.set()
             if sched_task is not None:
-                # Kick task only waits for ADMIT + writes SCHED; do not hold the
-                # HTTP lock for the whole drain (demux already finished).
-                try:
-                    await asyncio.wait_for(sched_task, timeout=5.0)
-                except Exception:
+                if not sched_task.done():
                     sched_task.cancel()
+                try:
+                    await sched_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
             # Always cancel the live scheduler request after the HTTP collect
             # ends — if demux stopped early (stop id / idle), leftover remaining
-            # must not keep SCHED_DRAIN orphan-decoding into an unsubscribed pipe.
+            # must not keep SCHED_* orphan-decoding into an unsubscribed pipe.
             if use_admit and req_id is not None:
                 try:
                     async with daemon_stdin_lock:

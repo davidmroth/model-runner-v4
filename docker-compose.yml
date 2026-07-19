@@ -104,6 +104,12 @@ services:
       DFLASH_SCHED_QUANTUM: ${DFLASH_SCHED_QUANTUM:-512}
       # Interactive /v1 under N>1: shorter quanta so peer silence is smaller.
       DFLASH_SCHED_QUANTUM_INTERACTIVE: ${DFLASH_SCHED_QUANTUM_INTERACTIVE:-128}
+      # How the overlay advances live admits after RESTORE_CHAIN_ADMIT.
+      # drain = one SCHED_DRAIN (holds daemon stdin until all remaining done —
+      #   peer admits wait; the starvation we measured).
+      # step  = loop SCHED_STEP (daemon returns to stdin between quanta so
+      #   peers admit and interleave). Default step under multi-slot deploy.
+      DFLASH_SCHED_DRIVER: ${DFLASH_SCHED_DRIVER:-step}
       # Multi-slot forensics: scope↔slot↔req↔first_tokens (0 disables).
       DFLASH_CORR_LOG: ${DFLASH_CORR_LOG:-1}
       # CUDA graphs reset on every spec-decode step (variable batch sizes in verify+replay).

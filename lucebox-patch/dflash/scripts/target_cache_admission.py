@@ -11,7 +11,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 
 _active_live_slot: ContextVar[int | None] = ContextVar(
@@ -97,6 +97,65 @@ def schedule_quantum_for(*, lane: str = "priority", scoped: bool = True) -> int:
     if lane == "slow" or not scoped:
         return bulk
     return schedule_quantum_interactive()
+
+
+def sched_driver() -> str:
+    """How the overlay advances live admits after ``RESTORE_CHAIN_ADMIT``.
+
+    ``drain`` (default): write one ``SCHED_DRAIN``. The daemon's stdin loop
+    stays inside that drain until *all* live remaining is exhausted, so a peer
+    ``RESTORE_CHAIN`` sitting in the pipe cannot be admitted until the drain
+    ends — the monopolization we measured with ``starvation_repro.py``.
+
+    ``step``: loop ``SCHED_STEP`` (one fair quantum each). Between steps the
+    daemon returns to stdin and can admit peers, so concurrent requests
+    interleave instead of serializing behind one long drain.
+    """
+    raw = os.environ.get("DFLASH_SCHED_DRIVER", "drain").strip().lower()
+    if raw in ("step", "sched_step", "step_pump"):
+        return "step"
+    return "drain"
+
+
+async def pump_sched_steps(
+    *,
+    write_step: Callable[[], Awaitable[None]],
+    await_reply: Callable[..., Awaitable[str]],
+    stop_event: asyncio.Event,
+    wall_timeout: float,
+    idle_sleep: float = 0.01,
+) -> int:
+    """Drive fair quanta via ``SCHED_STEP`` until ``stop_event`` is set.
+
+    Returns the number of non-idle steps completed. ``write_step`` must send
+    ``SCHED_STEP\\n`` under the caller's stdin lock; ``await_reply`` must match
+    lines starting with ``ok SCHED_STEP`` (covers both ``ok SCHED_STEP`` and
+    ``ok SCHED_STEP idle``).
+    """
+    steps = 0
+    while not stop_event.is_set():
+        await write_step()
+        try:
+            reply = await await_reply("ok SCHED_STEP", timeout=wall_timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if stop_event.is_set():
+                return steps
+            raise
+        if stop_event.is_set():
+            return steps
+        # "ok SCHED_STEP idle" also startswith "ok SCHED_STEP".
+        if "idle" in reply:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=idle_sleep)
+                return steps
+            except asyncio.TimeoutError:
+                continue
+        steps += 1
+        # Yield so a peer's RESTORE_CHAIN write / kick can run between quanta.
+        await asyncio.sleep(0)
+    return steps
 
 
 def _peel_req_slot_prefixes(body: str) -> tuple[str, str]:
