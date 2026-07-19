@@ -92,6 +92,7 @@ def stream_request(
     *,
     label: str,
     stop_event: threading.Event | None = None,
+    admitted_event: threading.Event | None = None,
     first_token_event: threading.Event | None = None,
 ) -> dict:
     """Stream a chat-completions request, recording a timestamp per token.
@@ -99,6 +100,11 @@ def stream_request(
     Returns a metrics dict; never raises on a backend error (captures it). If
     ``stop_event`` is set, the read loop breaks and closes the connection, which
     the engine sees as a client disconnect (bounded teardown of the runaway).
+
+    ``admitted_event`` fires when the HTTP response is open (request accepted /
+    slot held). That matters on this engine because the SSE stream is often
+    *buffered* — all tokens arrive in one burst at the end — so waiting on the
+    first client-visible token is waiting on the whole generation.
     """
     url = endpoint.rstrip("/")
     if not url.endswith("/chat/completions"):
@@ -127,10 +133,12 @@ def stream_request(
         "backend_error": None,
         "finish_reason": None,
         "t0": None,
+        "t_admitted": None,
         "t_first_token": None,
         "t_end": None,
         "token_times": [],  # monotonic timestamp per emitted token
         "stopped_early": False,
+        "buffered_stream": False,
     }
 
     t0 = time.monotonic()
@@ -148,6 +156,10 @@ def stream_request(
     except (urllib.error.URLError, TimeoutError) as exc:
         metrics["http_error"] = f"connection: {exc}"
         return metrics
+
+    metrics["t_admitted"] = time.monotonic()
+    if admitted_event is not None:
+        admitted_event.set()
 
     try:
         for raw_line in resp:
@@ -211,9 +223,17 @@ def gap_stats(metrics: dict, stall_threshold: float) -> dict:
     stalls = [g for g in gaps if g >= stall_threshold]
 
     decode_s = (times[-1] - t_first) if (t_first and len(times) >= 2) else None
-    tok_per_s = (
-        round((len(times) - 1) / decode_s, 2) if decode_s and decode_s > 0 else None
+    # Buffered stream: engine withholds tokens until the generation finishes,
+    # then flushes them in a tiny window. Client-side inter-token gaps are then
+    # meaningless; TTFT ≈ total generation (+ wait) time is the real signal.
+    buffered = bool(
+        len(times) > 50 and decode_s is not None and decode_s < 1.0
     )
+    tok_per_s = None
+    if not buffered and decode_s and decode_s > 0:
+        tok_per_s = round((len(times) - 1) / decode_s, 2)
+    elif buffered and t0 and t_end and (t_end - t0) > 0:
+        tok_per_s = round(len(times) / (t_end - t0), 2)
 
     return {
         "label": metrics.get("label"),
@@ -221,10 +241,16 @@ def gap_stats(metrics: dict, stall_threshold: float) -> dict:
         "backend_error": metrics.get("backend_error"),
         "finish_reason": metrics.get("finish_reason"),
         "stopped_early": metrics.get("stopped_early"),
+        "buffered_stream": buffered,
         "tokens": len(times),
         "ttft_s": round(t_first - t0, 2) if (t0 and t_first) else None,
+        "admit_s": (
+            round(metrics["t_admitted"] - t0, 3)
+            if (t0 and metrics.get("t_admitted"))
+            else None
+        ),
         "total_s": round(t_end - t0, 1) if (t0 and t_end) else None,
-        "decode_s": round(decode_s, 1) if decode_s else None,
+        "decode_s": round(decode_s, 1) if decode_s is not None else None,
         "tok_per_s": tok_per_s,
         "gap_max_s": round(max(gaps), 2) if gaps else None,
         "gap_p50_s": round(_pct(gaps_sorted, 0.50), 3) if gaps else None,
@@ -254,7 +280,7 @@ def run_baseline(args) -> dict:
 
 def run_contended(args) -> tuple[dict, dict]:
     stop_event = threading.Event()
-    runaway_started = threading.Event()
+    runaway_admitted = threading.Event()
     runaway_metrics: dict = {}
 
     def _runaway() -> None:
@@ -270,18 +296,19 @@ def run_contended(args) -> tuple[dict, dict]:
             args.client_timeout,
             label="runaway",
             stop_event=stop_event,
-            first_token_event=runaway_started,
+            admitted_event=runaway_admitted,
         )
         runaway_metrics.update(m)
 
     t = threading.Thread(target=_runaway, daemon=True)
     t.start()
 
-    # Only start the victim once the runaway is confirmed *decoding*, so the two
-    # genuinely overlap on the worker (this is what engages the multi-slot path).
-    if not runaway_started.wait(timeout=args.warmup_timeout):
+    # Wait until the runaway is *admitted* (HTTP response open / slot held), not
+    # until its first client-visible token. On this engine the SSE stream is
+    # often buffered to completion, so "first token" ≈ "whole generation done".
+    if not runaway_admitted.wait(timeout=args.warmup_timeout):
         print(
-            "warning: runaway produced no token within "
+            "warning: runaway not admitted within "
             f"{args.warmup_timeout:.0f}s; starting victim anyway",
             file=sys.stderr,
         )
@@ -302,7 +329,16 @@ def run_contended(args) -> tuple[dict, dict]:
 
 
 def verdict(baseline: dict | None, contended: dict, stall_threshold: float) -> dict:
-    """Decide whether the started-then-dropped stall reproduced."""
+    """Decide whether worker monopolization / starvation reproduced.
+
+    Two signals, because this engine often *buffers* the SSE stream (all tokens
+    arrive in one end-of-generation burst):
+
+    1. Mid-stream inter-token gaps — only meaningful on a live incremental stream.
+    2. Contended TTFT vs solo baseline — on a buffered stream, TTFT ≈ wait-for-
+       worker + generation. A victim that sits admitted while a runaway holds the
+       single worker shows up as a huge TTFT inflation (not as mid-stream gaps).
+    """
     reasons: list[str] = []
     reproduced = False
 
@@ -316,7 +352,9 @@ def verdict(baseline: dict | None, contended: dict, stall_threshold: float) -> d
     gap_max = contended.get("gap_max_s") or 0.0
     stalls = contended.get("stall_count") or 0
     ttft = contended.get("ttft_s") or 0.0
+    base_ttft = (baseline or {}).get("ttft_s") or 0.0
     base_gap = (baseline or {}).get("gap_max_s") or 0.0
+    buffered = bool(contended.get("buffered_stream") or (baseline or {}).get("buffered_stream"))
 
     if stalls > 0 or gap_max >= stall_threshold:
         reproduced = True
@@ -325,14 +363,29 @@ def verdict(baseline: dict | None, contended: dict, stall_threshold: float) -> d
             f"with {stalls} stall(s) totaling {contended.get('stall_total_s')}s"
         )
         regime = "resume-stall (started-then-dropped)"
-    elif base_gap and gap_max >= max(5.0 * base_gap, 1.0):
+    elif base_gap and gap_max >= max(5.0 * base_gap, 1.0) and not buffered:
         reproduced = True
         reasons.append(
             f"victim gap_max={gap_max}s is >=5x the solo baseline ({base_gap}s)"
         )
         regime = "degraded interleave"
-    elif ttft >= stall_threshold and gap_max < stall_threshold:
-        regime = "head-of-line queueing (bounded, not the bug)"
+    elif base_ttft > 0 and ttft >= max(stall_threshold, 3.0 * base_ttft):
+        # Primary signal on buffered streams: victim was admitted alongside the
+        # runaway but did not get the worker until the runaway largely finished.
+        reproduced = True
+        wait_s = round(ttft - base_ttft, 1)
+        reasons.append(
+            f"victim ttft={ttft}s vs solo baseline {base_ttft}s "
+            f"(~{wait_s}s extra wait while a concurrent request held the worker)"
+        )
+        if buffered:
+            reasons.append(
+                "SSE stream is buffered (tokens flush at end) — mid-stream gaps "
+                "are not observable; TTFT inflation is the starvation signal"
+            )
+        regime = "worker monopolization (DRAIN / no fair interleave)"
+    elif ttft >= stall_threshold and gap_max < stall_threshold and not buffered:
+        regime = "head-of-line queueing (bounded)"
         reasons.append(
             f"victim ttft={ttft}s delayed but mid-stream gaps small "
             f"(gap_max={gap_max}s) — waited its turn, then ran steadily"
@@ -343,7 +396,12 @@ def verdict(baseline: dict | None, contended: dict, stall_threshold: float) -> d
             f"victim gap_max={gap_max}s, ttft={ttft}s — no starvation observed"
         )
 
-    return {"reproduced": reproduced, "regime": regime, "reasons": reasons}
+    return {
+        "reproduced": reproduced,
+        "regime": regime,
+        "reasons": reasons,
+        "buffered_stream": buffered,
+    }
 
 
 def print_human(baseline: dict | None, contended: dict, runaway: dict, v: dict) -> None:
@@ -353,9 +411,10 @@ def print_human(baseline: dict | None, contended: dict, runaway: dict, v: dict) 
         if card.get("http_error") or card.get("backend_error"):
             print(f"    ERROR    : {card.get('http_error') or card.get('backend_error')}")
             return
+        buf = "  [buffered SSE]" if card.get("buffered_stream") else ""
         print(
             f"    tokens={card.get('tokens')}  ttft={card.get('ttft_s')}s  "
-            f"total={card.get('total_s')}s  tok/s={card.get('tok_per_s')}"
+            f"total={card.get('total_s')}s  tok/s={card.get('tok_per_s')}{buf}"
         )
         print(
             f"    gaps: max={card.get('gap_max_s')}s  p50={card.get('gap_p50_s')}s  "
