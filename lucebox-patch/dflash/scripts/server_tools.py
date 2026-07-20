@@ -114,6 +114,7 @@ from handler_reliability import (
     scoped_lock_priority_enabled,
     should_log_ephemeral_busy,
     sse_keepalive_seconds,
+    sse_live_emit_enabled,
 )
 from target_cache_admission import (
     TargetCacheSlotPool,
@@ -871,7 +872,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             ),
         )
 
-    async def _generate_via_daemon(
+    async def _aiter_via_daemon(
         cmd_line: str,
         gen_len: int,
         *,
@@ -879,8 +880,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         use_stops: bool = True,
         quantum: int | None = None,
         cache_scope: str | None = None,
-    ) -> list[int]:
-        """Register (if tagged), write command, collect tokens.
+    ) -> AsyncIterator[int]:
+        """Register (if tagged), write command, yield tokens as they arrive.
 
         When overlap mode is on (N>1 + tagged + drop-exclusive), schedulable
         commands are admitted with a quantum and advanced by the scheduler
@@ -931,6 +932,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         sched_task: asyncio.Task[None] | None = None
         sched_stop = asyncio.Event()
         t0 = time.monotonic()
+        tokens_seen = 0
+        first_ids: list[int] = []
         try:
             if tagged_demux is None:
                 drain_pipe_residual(r_pipe)
@@ -1043,29 +1046,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
                 sched_task = asyncio.create_task(_kick_sched())
 
-            async def _collect() -> list[int]:
-                if tagged_demux is not None and req_id is not None and queue is not None:
-                    stops = stop_ids if use_stops else frozenset()
-                    return [
-                        t
-                        async for t in tagged_demux.iter_tokens(
-                            req_id,
-                            gen_len,
-                            stops,
-                            wall_timeout=wall_timeout,
-                            queue=queue,
-                        )
-                    ]
-                return await _collect_gen_tokens(
-                    gen_len, req_id=None, wall_timeout=wall_timeout, use_stops=use_stops,
-                )
-
-            tokens = await _await_or_bump(
-                _collect(),
-                _active_slow_bump.get(),
-                req_id=req_id,
-            )
-            summary = summarize_first_tokens(tokens, tokenizer=tokenizer)
+            if tagged_demux is not None and req_id is not None and queue is not None:
+                stops = stop_ids if use_stops else frozenset()
+                async for t in tagged_demux.iter_tokens(
+                    req_id,
+                    gen_len,
+                    stops,
+                    wall_timeout=wall_timeout,
+                    queue=queue,
+                ):
+                    if tokens_seen < 12:
+                        first_ids.append(t)
+                    tokens_seen += 1
+                    yield t
+            else:
+                for t in await _collect_gen_tokens(
+                    gen_len,
+                    req_id=None,
+                    wall_timeout=wall_timeout,
+                    use_stops=use_stops,
+                ):
+                    if tokens_seen < 12:
+                        first_ids.append(t)
+                    tokens_seen += 1
+                    yield t
+            summary = summarize_first_tokens(first_ids, tokenizer=tokenizer)
+            # Prefer live count over the first-ids sample size.
+            summary["n_tok"] = tokens_seen
             log_corr(
                 "gen_first",
                 scope=cache_scope,
@@ -1076,7 +1083,6 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 first_ids=summary["first_ids"],
                 first_text=summary.get("first_text"),
             )
-            return tokens
         finally:
             # Stop the step pump (or finish the drain kick) before CANCEL so we
             # do not race a SCHED_* write against teardown.
@@ -1124,6 +1130,35 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     )
             if tagged_demux is not None and req_id is not None:
                 await tagged_demux.unregister(req_id)
+
+    async def _generate_via_daemon(
+        cmd_line: str,
+        gen_len: int,
+        *,
+        wall_timeout: float,
+        use_stops: bool = True,
+        quantum: int | None = None,
+        cache_scope: str | None = None,
+    ) -> list[int]:
+        """Collect all tokens from ``_aiter_via_daemon`` (non-live / buffered path)."""
+        async def _collect() -> list[int]:
+            return [
+                t
+                async for t in _aiter_via_daemon(
+                    cmd_line,
+                    gen_len,
+                    wall_timeout=wall_timeout,
+                    use_stops=use_stops,
+                    quantum=quantum,
+                    cache_scope=cache_scope,
+                )
+            ]
+
+        return await _await_or_bump(
+            _collect(),
+            _active_slow_bump.get(),
+            req_id=None,
+        )
 
     @asynccontextmanager
     async def _daemon_request_lock(
@@ -2770,153 +2805,203 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         return None
                     return f"data: {json.dumps(chunk({kind: text}))}\n\n"
 
-                # Generate in a background task so we can emit SSE keepalives
-                # while the daemon is quiet between overlap quanta. Token
-                # detok still happens after the collect completes (avoids the
-                # historical yield-while-reading-pipe deadlock).
                 quantum = schedule_quantum_for(lane=lane, scoped=scoped)
-                gen_task = asyncio.create_task(
-                    asyncio.wait_for(
-                        _generate_via_daemon(
-                            cmd_line,
-                            gen_len,
-                            wall_timeout=wall_timeout_sec,
-                            quantum=quantum,
-                            cache_scope=cache_scope,
-                        ),
-                        # Progress-aware: _generate_via_daemon's collector cancels
-                        # on a token-stall of wall_timeout_sec, so no absolute cap
-                        # is needed here. Hard ceiling (disabled by default) is a
-                        # backstop for a truly wedged coroutine only.
-                        timeout=request_hard_ceiling_seconds(),
-                    )
-                )
+                live_emit = sse_live_emit_enabled()
+                detok = IncrementalDetokenizer(
+                    tokenizer, skip_special_tokens=False)
                 yield f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n"
                 role_sent = True
                 hb = sse_keepalive_seconds()
-                while not gen_task.done():
-                    if hb <= 0:
-                        break
-                    try:
-                        await asyncio.wait_for(asyncio.shield(gen_task), timeout=hb)
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
-                try:
-                    token_ids = await gen_task
-                except asyncio.TimeoutError:
-                    print(
-                        f"  [handler] pipe read timed out after "
-                        f"{wall_timeout_sec:.0f}s (chat-stream)",
-                        flush=True,
-                    )
-                    await _complete_request(success=False)
-                    err = {
-                        "error": {
-                            "message": "Inference engine timed out",
-                            "type": "server_error",
-                            "code": "engine_timeout",
-                        }
-                    }
-                    yield f"data: {json.dumps(err)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+                _pending_out: list[str] = []
 
-                detok = IncrementalDetokenizer(
-                    tokenizer, skip_special_tokens=False)
+                async def _process_tok(tok_id: int) -> bool:
+                    """Detok + emit one token. Returns False if stream should stop."""
+                    nonlocal mode, window, tool_buffer, completion_tokens
+                    nonlocal stop_hit, aborted, deadline
+                    if loop.time() >= deadline:
+                        print(
+                            f"  [handler] detok/emit stalled >"
+                            f"{wall_timeout_sec:.0f}s (chat-stream)",
+                            flush=True,
+                        )
+                        aborted = True
+                        return False
+                    deadline = loop.time() + wall_timeout_sec
+                    if await request.is_disconnected():
+                        print(
+                            "  [handler] client disconnected — aborting stream",
+                            flush=True,
+                        )
+                        aborted = True
+                        return False
 
-                # Emission stall guard: tokens are already collected, so bound the
-                # gap between *emitted* tokens (reset per token) rather than total
-                # time — otherwise a healthy generation that ran longer than
-                # wall_timeout would be truncated during detok/emit.
-                deadline = loop.time() + wall_timeout_sec
-                try:
-                    for tok_id in token_ids:
-                        if loop.time() >= deadline:
-                            print(
-                                f"  [handler] detok/emit stalled >"
-                                f"{wall_timeout_sec:.0f}s (chat-stream)",
-                                flush=True,
+                    completion_tokens += 1
+                    piece = detok.push(tok_id)
+                    if not piece:
+                        return True
+                    window += piece
+
+                    if stops and mode != "tool_buffer":
+                        si = first_stop_match(window, stops)
+                        if si != -1:
+                            window = window[:si]
+                            stop_hit = True
+                            kind = (
+                                "reasoning_content"
+                                if mode == "reasoning"
+                                else "content"
                             )
-                            aborted = True
-                            break
-                        deadline = loop.time() + wall_timeout_sec
-                        if await request.is_disconnected():
-                            print(
-                                "  [handler] client disconnected — aborting stream",
-                                flush=True,
-                            )
-                            aborted = True
+                            out = emit_delta(window, kind)
+                            if out:
+                                # Nested sse() cannot yield from helper — stash.
+                                _pending_out.append(out)
+                            window = ""
+                            return False
+
+                    while True:
+                        if mode == "tool_buffer":
+                            tool_buffer += window
+                            window = ""
                             break
 
-                        completion_tokens += 1
-                        piece = detok.push(tok_id)
-                        if not piece:
-                            continue
-                        window += piece
-
-                        if stops and mode != "tool_buffer":
-                            si = first_stop_match(window, stops)
-                            if si != -1:
-                                window = window[:si]
-                                stop_hit = True
-                                kind = "reasoning_content" if mode == "reasoning" else "content"
-                                out = emit_delta(window, kind)
-                                if out:
-                                    yield out
-                                window = ""
-                                break
-
-                        while True:
-                            if mode == "tool_buffer":
-                                tool_buffer += window
-                                window = ""
-                                break
-
-                            if mode == "reasoning":
-                                idx = window.find(THINK_CLOSE_TAG)
-                                if idx != -1:
-                                    pre = window[:idx]
-                                    out = emit_delta(pre, "reasoning_content")
-                                    if out:
-                                        yield out
-                                    window = window[idx + len(THINK_CLOSE_TAG):]
-                                    mode = "content"
-                                    continue
-                                if len(window) > HOLDBACK:
-                                    safe = window[:-HOLDBACK]
-                                    out = emit_delta(safe, "reasoning_content")
-                                    if out:
-                                        yield out
-                                    window = window[-HOLDBACK:]
-                                break
-
-                            think_idx = window.find(THINK_OPEN_TAG)
-                            tool_idx = window.find(TOOL_OPEN_TAG)
-                            hits = [(i, t) for i, t in
-                                    ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
-                            if hits:
-                                hits.sort()
-                                idx, which = hits[0]
+                        if mode == "reasoning":
+                            idx = window.find(THINK_CLOSE_TAG)
+                            if idx != -1:
                                 pre = window[:idx]
-                                out = emit_delta(pre, "content")
+                                out = emit_delta(pre, "reasoning_content")
                                 if out:
-                                    yield out
-                                if which == "think":
-                                    window = window[idx + len(THINK_OPEN_TAG):]
-                                    mode = "reasoning"
-                                else:
-                                    tool_buffer = window[idx:]
-                                    window = ""
-                                    mode = "tool_buffer"
+                                    _pending_out.append(out)
+                                window = window[idx + len(THINK_CLOSE_TAG):]
+                                mode = "content"
                                 continue
                             if len(window) > HOLDBACK:
                                 safe = window[:-HOLDBACK]
-                                out = emit_delta(safe, "content")
+                                out = emit_delta(safe, "reasoning_content")
                                 if out:
-                                    yield out
+                                    _pending_out.append(out)
                                 window = window[-HOLDBACK:]
                             break
 
+                        think_idx = window.find(THINK_OPEN_TAG)
+                        tool_idx = window.find(TOOL_OPEN_TAG)
+                        hits = [
+                            (i, t)
+                            for i, t in (
+                                (think_idx, "think"),
+                                (tool_idx, "tool"),
+                            )
+                            if i != -1
+                        ]
+                        if hits:
+                            hits.sort()
+                            idx, which = hits[0]
+                            pre = window[:idx]
+                            out = emit_delta(pre, "content")
+                            if out:
+                                _pending_out.append(out)
+                            if which == "think":
+                                window = window[idx + len(THINK_OPEN_TAG):]
+                                mode = "reasoning"
+                            else:
+                                tool_buffer = window[idx:]
+                                window = ""
+                                mode = "tool_buffer"
+                            continue
+                        if len(window) > HOLDBACK:
+                            safe = window[:-HOLDBACK]
+                            out = emit_delta(safe, "content")
+                            if out:
+                                _pending_out.append(out)
+                            window = window[-HOLDBACK:]
+                        break
+                    return True
+
+                if live_emit:
+                    # Live path: detok/emit as demux yields tokens so clients that
+                    # reset idle on content deltas see progress during long gens.
+                    token_aiter = _aiter_via_daemon(
+                        cmd_line,
+                        gen_len,
+                        wall_timeout=wall_timeout_sec,
+                        quantum=quantum,
+                        cache_scope=cache_scope,
+                    ).__aiter__()
+                    try:
+                        while True:
+                            try:
+                                if hb > 0:
+                                    tok_id = await asyncio.wait_for(
+                                        token_aiter.__anext__(), timeout=hb,
+                                    )
+                                else:
+                                    tok_id = await token_aiter.__anext__()
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                if await request.is_disconnected():
+                                    aborted = True
+                                    break
+                                yield ": keepalive\n\n"
+                                continue
+                            _pending_out.clear()
+                            cont = await _process_tok(tok_id)
+                            for out in _pending_out:
+                                yield out
+                            if not cont:
+                                break
+                    finally:
+                        await token_aiter.aclose()
+                else:
+                    # Legacy: collect-all then burst-emit (keepalives only while waiting).
+                    gen_task = asyncio.create_task(
+                        asyncio.wait_for(
+                            _generate_via_daemon(
+                                cmd_line,
+                                gen_len,
+                                wall_timeout=wall_timeout_sec,
+                                quantum=quantum,
+                                cache_scope=cache_scope,
+                            ),
+                            timeout=request_hard_ceiling_seconds(),
+                        )
+                    )
+                    while not gen_task.done():
+                        if hb <= 0:
+                            break
+                        try:
+                            await asyncio.wait_for(asyncio.shield(gen_task), timeout=hb)
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                    try:
+                        token_ids = await gen_task
+                    except asyncio.TimeoutError:
+                        print(
+                            f"  [handler] pipe read timed out after "
+                            f"{wall_timeout_sec:.0f}s (chat-stream)",
+                            flush=True,
+                        )
+                        await _complete_request(success=False)
+                        err = {
+                            "error": {
+                                "message": "Inference engine timed out",
+                                "type": "server_error",
+                                "code": "engine_timeout",
+                            }
+                        }
+                        yield f"data: {json.dumps(err)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    deadline = loop.time() + wall_timeout_sec
+                    for tok_id in token_ids:
+                        _pending_out.clear()
+                        cont = await _process_tok(tok_id)
+                        for out in _pending_out:
+                            yield out
+                        if not cont:
+                            break
+
+                try:
                     if not stop_hit:
                         # Flush held U+FFFD / incomplete emoji (skip on stop trim).
                         tail = detok.finish()

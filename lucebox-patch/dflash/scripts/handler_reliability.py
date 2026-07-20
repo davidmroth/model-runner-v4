@@ -309,6 +309,20 @@ def sse_keepalive_seconds() -> float:
     return max(1.0, val)
 
 
+def sse_live_emit_enabled() -> bool:
+    """Emit OpenAI chat SSE content deltas as tokens arrive (not one end burst).
+
+    Default on. When enabled, the chat-stream path detokenizes and yields
+    ``delta.content`` per token so clients that track activity on real stream
+    chunks (e.g. Hermes cron idle watchdog) see progress during long generates.
+    SSE ``: keepalive`` comments alone are not enough for those clients.
+
+    Set ``DFLASH_SSE_LIVE_EMIT=0`` to restore collect-all-then-burst.
+    """
+    raw = os.environ.get("DFLASH_SSE_LIVE_EMIT", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def ephemeral_lock_wait_seconds() -> float:
     """Max lock wait for ephemeral traffic before returning 503 when the lock is busy."""
     raw = os.environ.get("DFLASH_EPHEMERAL_LOCK_WAIT_SEC", "5")

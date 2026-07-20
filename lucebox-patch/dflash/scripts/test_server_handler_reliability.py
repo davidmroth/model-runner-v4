@@ -196,6 +196,20 @@ class HandlerReliabilityConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {"DFLASH_SSE_KEEPALIVE_SEC": "0"}):
             self.assertEqual(sse_keepalive_seconds(), 0.0)
 
+    def test_sse_live_emit_defaults_on(self):
+        from handler_reliability import sse_live_emit_enabled
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DFLASH_SSE_LIVE_EMIT", None)
+            self.assertTrue(sse_live_emit_enabled())
+
+    def test_sse_live_emit_can_disable(self):
+        from handler_reliability import sse_live_emit_enabled
+
+        for val in ("0", "false", "off", "no"):
+            with patch.dict(os.environ, {"DFLASH_SSE_LIVE_EMIT": val}):
+                self.assertFalse(sse_live_emit_enabled(), val)
+
     def test_ephemeral_lock_wait_short_when_unbounded(self):
         with patch.dict(os.environ, {"DFLASH_DAEMON_LOCK_WAIT_SEC": "0"}):
             self.assertEqual(chat_stream_lock_wait_seconds(scoped=False), 5.0)

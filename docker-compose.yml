@@ -110,6 +110,10 @@ services:
       # step  = loop SCHED_STEP (daemon returns to stdin between quanta so
       #   peers admit and interleave). Default step under multi-slot deploy.
       DFLASH_SCHED_DRIVER: ${DFLASH_SCHED_DRIVER:-step}
+      # Emit chat SSE content deltas as tokens arrive (not one end-of-gen burst).
+      # Needed so clients that reset idle on stream chunks see progress during
+      # long generates. 0 = legacy collect-all-then-burst.
+      DFLASH_SSE_LIVE_EMIT: ${DFLASH_SSE_LIVE_EMIT:-1}
       # Multi-slot forensics: scope↔slot↔req↔first_tokens (0 disables).
       DFLASH_CORR_LOG: ${DFLASH_CORR_LOG:-1}
       # CUDA graphs reset on every spec-decode step (variable batch sizes in verify+replay).
