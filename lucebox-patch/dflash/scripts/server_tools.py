@@ -2919,6 +2919,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 if live_emit:
                     # Live path: detok/emit as demux yields tokens so clients that
                     # reset idle on content deltas see progress during long gens.
+                    #
+                    # Keepalive must NOT cancel ``__anext__`` — ``asyncio.wait_for``
+                    # on an async-gen anext injects CancelledError into the
+                    # generator and tears down ``_aiter_via_daemon`` (CANCEL after
+                    # exactly DFLASH_SSE_KEEPALIVE_SEC). Long prefills (cron with
+                    # 10k+ tokens) then return empty streams. Mirror the legacy
+                    # path: ``asyncio.wait`` / ``shield`` so the fetch keeps running.
                     token_aiter = _aiter_via_daemon(
                         cmd_line,
                         gen_len,
@@ -2926,30 +2933,43 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         quantum=quantum,
                         cache_scope=cache_scope,
                     ).__aiter__()
+                    anext_task: asyncio.Task = asyncio.create_task(
+                        token_aiter.__anext__()
+                    )
                     try:
                         while True:
+                            if hb > 0 and not anext_task.done():
+                                done, _pending = await asyncio.wait(
+                                    {anext_task}, timeout=hb,
+                                )
+                                if not done:
+                                    if await request.is_disconnected():
+                                        aborted = True
+                                        break
+                                    yield ": keepalive\n\n"
+                                    continue
                             try:
-                                if hb > 0:
-                                    tok_id = await asyncio.wait_for(
-                                        token_aiter.__anext__(), timeout=hb,
-                                    )
-                                else:
-                                    tok_id = await token_aiter.__anext__()
+                                tok_id = await anext_task
                             except StopAsyncIteration:
                                 break
-                            except asyncio.TimeoutError:
-                                if await request.is_disconnected():
-                                    aborted = True
-                                    break
-                                yield ": keepalive\n\n"
-                                continue
                             _pending_out.clear()
                             cont = await _process_tok(tok_id)
                             for out in _pending_out:
                                 yield out
                             if not cont:
                                 break
+                            anext_task = asyncio.create_task(
+                                token_aiter.__anext__()
+                            )
                     finally:
+                        if not anext_task.done():
+                            anext_task.cancel()
+                            try:
+                                await anext_task
+                            except (asyncio.CancelledError, StopAsyncIteration):
+                                pass
+                            except Exception:
+                                pass
                         await token_aiter.aclose()
                 else:
                     # Legacy: collect-all then burst-emit (keepalives only while waiting).

@@ -450,5 +450,58 @@ class SlowLaneBumpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reg.inflight, 0)
 
 
+class LiveEmitKeepaliveAnextTests(unittest.IsolatedAsyncioTestCase):
+    """Keepalive must not cancel async-gen ``__anext__`` (cron empty-stream bug)."""
+
+    async def test_wait_for_anext_timeout_tears_down_generator(self):
+        """Document the footgun: wait_for cancels anext into the async gen."""
+
+        closed = {"yes": False}
+
+        async def delayed_tokens():
+            try:
+                await asyncio.sleep(0.25)
+                yield 1
+                yield 2
+            finally:
+                closed["yes"] = True
+
+        it = delayed_tokens().__aiter__()
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(it.__anext__(), timeout=0.05)
+        # Generator cleanup may be deferred until aclose / GC; force it.
+        await it.aclose()
+        self.assertTrue(closed["yes"])
+
+    async def test_asyncio_wait_keepalive_preserves_anext(self):
+        """Safe pattern used by live SSE: wait() timeout leaves anext running."""
+
+        closed = {"yes": False}
+
+        async def delayed_tokens():
+            try:
+                await asyncio.sleep(0.20)
+                yield 42
+            finally:
+                closed["yes"] = True
+
+        it = delayed_tokens().__aiter__()
+        anext_task = asyncio.create_task(it.__anext__())
+        keepalives = 0
+        try:
+            while not anext_task.done():
+                done, _ = await asyncio.wait({anext_task}, timeout=0.05)
+                if not done:
+                    keepalives += 1
+                    continue
+                break
+            tok = await anext_task
+            self.assertEqual(tok, 42)
+            self.assertGreaterEqual(keepalives, 2)
+        finally:
+            await it.aclose()
+        self.assertTrue(closed["yes"])
+
+
 if __name__ == "__main__":
     unittest.main()
