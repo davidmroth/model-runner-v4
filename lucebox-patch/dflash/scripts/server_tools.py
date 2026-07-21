@@ -11,9 +11,10 @@ Patched fork of scripts/server.py that:
 
 Streaming behavior:
   - Content tokens are streamed as `delta.content` until a `<tool_call>` opener
-    is detected; the rest of the response is then buffered, parsed at the end
-    of generation, and emitted as a single final `delta.tool_calls` chunk with
-    `finish_reason: "tool_calls"`.
+    is detected; while XML accumulates, OpenAI-style incremental
+    `delta.tool_calls` fragments are emitted (name once, then arguments
+    suffixes as parameters close). Final `parse_tool_calls` still runs at EOS
+    as a fallback when nothing was streamed.
   - If no tool call appears in the output, behavior is identical to the
     upstream server.
 
@@ -115,6 +116,11 @@ from handler_reliability import (
     should_log_ephemeral_busy,
     sse_keepalive_seconds,
     sse_live_emit_enabled,
+)
+from tool_stream_emit import (
+    ToolStreamState,
+    feed_tool_stream,
+    should_skip_final_tool_emit,
 )
 from target_cache_admission import (
     TargetCacheSlotPool,
@@ -2791,6 +2797,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 mode = "reasoning" if started_in_thinking else "content"
                 window = ""
                 tool_buffer = ""
+                tool_stream = ToolStreamState()
                 stops = normalize_stop(req.stop)
                 tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
                 stop_holdback = max((len(s) for s in stops), default=0)
@@ -2805,6 +2812,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         return None
                     return f"data: {json.dumps(chunk({kind: text}))}\n\n"
 
+                def emit_tool_delta(delta_obj: dict) -> str:
+                    return f"data: {json.dumps(chunk(delta_obj))}\n\n"
+
                 quantum = schedule_quantum_for(lane=lane, scoped=scoped)
                 live_emit = sse_live_emit_enabled()
                 detok = IncrementalDetokenizer(
@@ -2813,6 +2823,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 role_sent = True
                 hb = sse_keepalive_seconds()
                 _pending_out: list[str] = []
+
+                def flush_tool_stream_deltas() -> None:
+                    for delta_obj in feed_tool_stream(
+                        tool_buffer, tool_stream, tools=req.tools,
+                    ):
+                        _pending_out.append(emit_tool_delta(delta_obj))
 
                 async def _process_tok(tok_id: int) -> bool:
                     """Detok + emit one token. Returns False if stream should stop."""
@@ -2862,6 +2878,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         if mode == "tool_buffer":
                             tool_buffer += window
                             window = ""
+                            flush_tool_stream_deltas()
                             break
 
                         if mode == "reasoning":
@@ -2906,6 +2923,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                 tool_buffer = window[idx:]
                                 window = ""
                                 mode = "tool_buffer"
+                                flush_tool_stream_deltas()
                             continue
                         if len(window) > HOLDBACK:
                             safe = window[:-HOLDBACK]
@@ -3063,9 +3081,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
                     finish_reason = "stop"
                     if mode == "tool_buffer":
+                        # Flush any late closed params before deciding emit path.
+                        for delta_obj in feed_tool_stream(
+                            tool_buffer, tool_stream, tools=req.tools,
+                        ):
+                            yield emit_tool_delta(delta_obj)
                         cleaned_after, tool_calls = parse_tool_calls(
                             tool_buffer, tools=req.tools)
-                        if tool_calls:
+                        if should_skip_final_tool_emit(tool_stream):
+                            if cleaned_after:
+                                out = emit_delta(cleaned_after, "content")
+                                if out:
+                                    yield out
+                            finish_reason = "tool_calls" if (
+                                tool_calls or tool_stream.streamed_any
+                            ) else "stop"
+                        elif tool_calls:
                             if cleaned_after:
                                 out = emit_delta(cleaned_after, "content")
                                 if out:
