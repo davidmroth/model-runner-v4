@@ -547,6 +547,20 @@ def scope_skips_prefix_snap(scope: str) -> bool:
     return (scope or "").startswith("ephemeral:")
 
 
+def scope_protects_thick_pin(scope: str) -> bool:
+    """Interactive conversation scopes keep thick pins sticky vs cron/ephemeral.
+
+    Cron scopes use conversation ids prefixed with ``cron_`` and must not steal
+    protected interactive thick slots (``allow_evict_protected=False``).
+    """
+    s = scope or ""
+    if not s or s.startswith("ephemeral:"):
+        return False
+    if s.startswith("cron_"):
+        return False
+    return True
+
+
 def _conv_snap_cut_after_tool(
     prefix_cache: "PrefixCache",
     prompt_ids: list[int],
@@ -626,7 +640,9 @@ def deferred_conv_snap_after_cold_tool(
         return None
     conv_slot, _ = prep
     if conv_slot == tool_slot:
-        prefix_cache.abort_inline_snap(conv_slot, scope=cache_scope)
+        prefix_cache.abort_inline_snap(
+            conv_slot, scope=cache_scope, discard_pending_victim=False,
+        )
         return None
     return (conv_slot, conv_cut)
 
@@ -734,6 +750,9 @@ class PrefixCache:
         self.entries: OrderedDict[tuple[str, bytes], int] = OrderedDict()  # (scope, hash) → slot
         self._slot_prefix_len: dict[int, int] = {}  # slot → committed cut depth
         self._slot_scope: dict[int, str] = {}  # slot → owning cache scope
+        # Scopes confirmed with protect=True (interactive chats). Cron/ephemeral
+        # prepares use allow_evict_protected=False and cannot steal these.
+        self._protected: set[str] = set()
         self.next_slot = 0
         try:
             self.markers = _resolve_chat_markers(tokenizer)
@@ -754,6 +773,26 @@ class PrefixCache:
         self._pending_evict_key: tuple[str, bytes] | None = None
         # Slots known to hold KV in the daemon (inline snap ack or full snap).
         self._populated_slots: set[int] = set()
+
+    def is_protected(self, scope: str) -> bool:
+        return (scope or "global") in self._protected
+
+    def _scope_still_mapped(self, scope: str) -> bool:
+        return any(k[0] == scope for k in self.entries)
+
+    def _discard_protect_if_unmapped(self, scope: str) -> None:
+        if scope and not self._scope_still_mapped(scope):
+            self._protected.discard(scope)
+
+    def _lru_evict_candidate(
+        self, *, allow_evict_protected: bool
+    ) -> tuple[tuple[str, bytes], int] | None:
+        """Oldest entry that may be stolen for a new thick snap."""
+        for old_key, slot in self.entries.items():
+            old_scope = old_key[0]
+            if allow_evict_protected or old_scope not in self._protected:
+                return old_key, slot
+        return None
 
     # ------------------------------------------------------------------
     # Public API
@@ -835,9 +874,32 @@ class PrefixCache:
             print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
                   f"scope={cache_scope!r} (of {len(prompt_ids)} total)", flush=True)
         elif not scope_skips_prefix_snap(cache_scope) and candidates:
+            reason = self._classify_lookup_miss(cache_scope, candidates, prompt_ids)
             print(f"{self.log_prefix} lookup miss scope={cache_scope!r} "
-                  f"(of {len(prompt_ids)} total)", flush=True)
+                  f"reason={reason} (of {len(prompt_ids)} total)", flush=True)
         return best
+
+    def _classify_lookup_miss(
+        self,
+        cache_scope: str,
+        candidates: list[int],
+        prompt_ids: list[int],
+    ) -> str:
+        """Best-effort miss reason for triage (never_committed | evicted | …)."""
+        scope_keys = [k for k in self.entries if k[0] == cache_scope]
+        if scope_keys:
+            return "hash_mismatch"
+        owned = [
+            s for s, sc in self._slot_scope.items()
+            if sc == cache_scope
+        ]
+        if owned:
+            return "stale_cut"
+        if self.cap > 0 and len(self.entries) >= self.cap:
+            return "evicted"
+        if cache_scope in self._protected and not scope_keys:
+            return "evicted"
+        return "never_committed"
 
     def slot_populated(self, slot: int) -> bool:
         return slot in self._populated_slots
@@ -852,18 +914,30 @@ class PrefixCache:
         *,
         inline_slot: int | None,
         scope: str = "global",
+        protect: bool | None = None,
+        discard_pending_victim: bool = True,
     ) -> None:
         """Confirm or abort an inline snap reservation based on daemon ack."""
         if not snap_prep:
             return
         if scope_skips_prefix_snap(scope or "global"):
-            self.abort_inline_snap(snap_prep[0], scope=scope)
+            self.abort_inline_snap(
+                snap_prep[0],
+                scope=scope,
+                discard_pending_victim=discard_pending_victim,
+            )
             return
         slot, target_cut = snap_prep
         if inline_slot == slot:
-            self.confirm_inline_snap(slot, target_cut, prompt_ids, scope=scope)
+            self.confirm_inline_snap(
+                slot, target_cut, prompt_ids, scope=scope, protect=protect,
+            )
         else:
-            self.abort_inline_snap(slot, scope=scope)
+            self.abort_inline_snap(
+                slot,
+                scope=scope,
+                discard_pending_victim=discard_pending_victim,
+            )
 
     def prepare_inline_snap(
         self,
@@ -871,6 +945,7 @@ class PrefixCache:
         *,
         reuse_slot: int | None = None,
         scope: str = "global",
+        allow_evict_protected: bool | None = None,
     ) -> tuple[int, int] | None:
         """Pick a target boundary + slot for inline snapshot during the next
         request. Returns ``(slot_id, target_cut)`` or ``None`` if no
@@ -921,26 +996,54 @@ class PrefixCache:
             self.entries.move_to_end(entry_key)
             return None   # already cached
 
-        # Pick slot: when at cap, reserve the LRU slot WITHOUT evicting yet.
+        if allow_evict_protected is None:
+            # Interactive scopes may steal LRU (incl. other protected chats).
+            # Cron / ephemeral must not steal protected interactive thick pins.
+            allow_evict_protected = scope_protects_thick_pin(cache_scope)
+
+        # Prefer in-place deepen on a slot this scope already owns.
         if reuse_slot is not None and reuse_slot in self._populated_slots:
             slot = reuse_slot
             self._pending_evict_key = None
-        elif not self._populated_slots:
-            slot = 0
-            self._pending_evict_key = None
-        elif len(self.entries) >= self.cap:
-            old_key = next(iter(self.entries))
-            slot = self.entries[old_key]
-            self._pending_evict_key = old_key
         else:
-            slot = self.next_slot
-            self.next_slot = (self.next_slot + 1) % self.cap
-            self._pending_evict_key = None
+            own_slots = [
+                s for s, sc in self._slot_scope.items()
+                if sc == cache_scope and s in self._populated_slots
+            ]
+            if own_slots:
+                slot = own_slots[0]
+                self._pending_evict_key = None
+            elif not self._populated_slots and len(self.entries) == 0:
+                slot = 0
+                self._pending_evict_key = None
+            elif len(self.entries) >= self.cap:
+                cand = self._lru_evict_candidate(
+                    allow_evict_protected=allow_evict_protected,
+                )
+                if cand is None:
+                    print(
+                        f"{self.log_prefix} prepare_inline_snap blocked "
+                        f"scope={cache_scope!r} (protected slots full; "
+                        f"allow_evict_protected={allow_evict_protected})",
+                        flush=True,
+                    )
+                    return None
+                old_key, slot = cand
+                self._pending_evict_key = old_key
+            else:
+                used = set(self.entries.values()) | set(self._slot_scope.keys())
+                slot = next(
+                    (s for s in range(self.cap) if s not in used),
+                    self.next_slot % self.cap,
+                )
+                self.next_slot = (slot + 1) % self.cap
+                self._pending_evict_key = None
 
         return (slot, target_cut)
 
     def confirm_inline_snap(self, slot: int, target_cut: int,
-                             prompt_ids: list[int], *, scope: str = "global") -> None:
+                             prompt_ids: list[int], *, scope: str = "global",
+                             protect: bool | None = None) -> None:
         """Register an inline snapshot in the LRU after the daemon has
         successfully fired ``[snap] inline``. Called from the caller after
         the actual response stream completes.
@@ -957,8 +1060,10 @@ class PrefixCache:
                 self._pending_evict_key = None
             return
         if self._pending_evict_key is not None:
+            evicted_scope = self._pending_evict_key[0]
             self.entries.pop(self._pending_evict_key, None)
             self._pending_evict_key = None
+            self._discard_protect_if_unmapped(evicted_scope)
         key = hash_prefix(prompt_ids[:target_cut],
                           self.kv_k_type, self.fa_window, cache_scope)
         entry_key = self._scoped_key(cache_scope, key)
@@ -967,40 +1072,51 @@ class PrefixCache:
         for k in stale_keys:
             del self.entries[k]
         self.entries[entry_key] = slot
+        self.entries.move_to_end(entry_key)
         self._slot_prefix_len[slot] = target_cut
         self._slot_scope[slot] = cache_scope
         self._populated_slots.add(slot)
+        if protect is None:
+            protect = scope_protects_thick_pin(cache_scope)
+        if protect:
+            self._protected.add(cache_scope)
         print(f"{self.log_prefix} inline-snap committed slot={slot} "
-              f"prefix_len={target_cut} scope={cache_scope!r}", flush=True)
+              f"prefix_len={target_cut} scope={cache_scope!r} "
+              f"protect={int(bool(protect))}", flush=True)
 
-    def abort_inline_snap(self, slot: int, *, scope: str = "global") -> None:
+    def abort_inline_snap(
+        self,
+        slot: int,
+        *,
+        scope: str = "global",
+        discard_pending_victim: bool = True,
+    ) -> None:
         """Release the reservation made by prepare_inline_snap.
 
         At-cap case: prepare_inline_snap peeked at the LRU (old_key -> slot)
-        and stashed old_key in _pending_evict_key WITHOUT removing it. We
-        cannot tell from here whether the daemon already committed the
-        snapshot to ``slot`` before the failure was observed:
-          - If it didn't: old_key -> slot is still semantically valid and
-            we should keep it.
-          - If it did:    slot now holds the NEW prompt's KV, so old_key
-            -> slot is stale and a future lookup would return data that
-            doesn't match the key.
-        Without daemon-side query we conservatively assume the worst and
-        drop old_key from the LRU. We accept losing one valid cache entry
-        in exchange for never returning a wrong-KV restore. Callers that
-        know the daemon did NOT process the snap (e.g. early validation
-        failure before any send) should evict only the pending key — but
-        in practice, every failure path that calls this happens AFTER the
-        daemon command was issued, so the conservative drop is correct.
+        and stashed old_key in _pending_evict_key WITHOUT removing it.
+
+        When ``discard_pending_victim`` is False (daemon never ran / busy
+        before send), keep the victim entry — only clear the pending flag.
+        When True (daemon may have overwritten the slot), drop the victim
+        and purge slot metadata so we never restore wrong KV.
         """
         if self.disabled:
             return
         if self._pending_evict_key is not None:
-            self.entries.pop(self._pending_evict_key, None)
+            if discard_pending_victim:
+                evicted_scope = self._pending_evict_key[0]
+                self.entries.pop(self._pending_evict_key, None)
+                self._discard_protect_if_unmapped(evicted_scope)
             self._pending_evict_key = None
+        if not discard_pending_victim:
+            # Reservation cancelled before overwrite — leave peer pins intact.
+            return
         self._purge_slot_entries(slot)
         self._slot_prefix_len.pop(slot, None)
-        self._slot_scope.pop(slot, None)
+        prev_scope = self._slot_scope.pop(slot, None)
+        if prev_scope:
+            self._discard_protect_if_unmapped(prev_scope)
 
     # ------------------------------------------------------------------
     # Option 3: full-compress-result cache

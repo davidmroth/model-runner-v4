@@ -142,7 +142,7 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
     @patch("prefix_cache.find_all_boundaries_markers")
     def test_abort_inline_snap_purges_reuse_slot_mappings(self, mock_bounds):
         pc = self._make_cache()
-        ids = list(range(400))
+        ids = list(range(500))
         mock_bounds.return_value = [50, 376]
         scope = "sess-a"
 
@@ -152,9 +152,13 @@ class PrefixCacheSlotDepthTests(unittest.TestCase):
         pc._slot_prefix_len[0] = 376
         pc._slot_scope[0] = scope
 
+        # Deepen to a cut that is not yet cached; reuse the owned slot.
+        mock_bounds.return_value = [50, 100, 480]
         prep = pc.prepare_inline_snap(ids, reuse_slot=0, scope=scope)
         self.assertIsNotNone(prep)
-        slot, _ = prep
+        slot, cut = prep
+        self.assertEqual(slot, 0)
+        self.assertEqual(cut, 480)
         pc.abort_inline_snap(slot, scope=scope)
 
         self.assertNotIn(entry_key, pc.entries)
@@ -323,6 +327,162 @@ class CacheScopeTests(unittest.TestCase):
         a = resolve_cache_scope(conversation_id=None, prompt_ids=ids, tools_fingerprint="fp1")
         b = resolve_cache_scope(conversation_id=None, prompt_ids=ids, tools_fingerprint="fp1")
         self.assertEqual(a, b)
+
+
+class ThickPinProtectTests(unittest.TestCase):
+    def _make_cache(self, cap: int = 2) -> PrefixCache:
+        from prefix_cache import scope_protects_thick_pin  # noqa: F401 — exercised below
+        pc = PrefixCache(
+            daemon_stdin=MagicMock(),
+            await_reply=MagicMock(),
+            daemon_lock=MagicMock(),
+            tokenizer=_FakeTokenizer(),
+            kv_k_type="f16",
+            fa_window=0,
+            cap=cap,
+        )
+        self.assertFalse(pc.disabled)
+        return pc
+
+    def _scoped_entry(self, pc: PrefixCache, ids: list[int], cut: int, scope: str):
+        key = hash_prefix(ids[:cut], pc.kv_k_type, pc.fa_window, scope)
+        return (scope, key)
+
+    def test_scope_protects_interactive_not_cron(self):
+        from prefix_cache import scope_protects_thick_pin
+        self.assertTrue(scope_protects_thick_pin("4f9e2eff-e263:abcd"))
+        self.assertFalse(scope_protects_thick_pin("cron_abc:fp"))
+        self.assertFalse(scope_protects_thick_pin("ephemeral:deadbeef"))
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_cron_cannot_evict_protected_interactive(self, mock_bounds):
+        pc = self._make_cache(cap=2)
+        mock_bounds.return_value = [50, 376]
+        chat_ids = list(range(400))
+        cron_ids = list(range(400, 800))
+
+        chat_scope = "webchat-sess:fp1"
+        chat_key = self._scoped_entry(pc, chat_ids, 376, chat_scope)
+        pc.entries[chat_key] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 376
+        pc._slot_scope[0] = chat_scope
+        pc._protected.add(chat_scope)
+
+        # Fill second slot with another protected chat so cron has nowhere to go
+        other = "other-chat:fp1"
+        other_key = self._scoped_entry(pc, chat_ids, 50, other)
+        pc.entries[other_key] = 1
+        pc._populated_slots.add(1)
+        pc._slot_prefix_len[1] = 50
+        pc._slot_scope[1] = other
+        pc._protected.add(other)
+
+        cron_scope = "cron_job1:fp2"
+        prep = pc.prepare_inline_snap(cron_ids, scope=cron_scope)
+        self.assertIsNone(prep)
+        self.assertIn(chat_key, pc.entries)
+        self.assertTrue(pc.is_protected(chat_scope))
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_interactive_evicts_unprotected_cron_first(self, mock_bounds):
+        pc = self._make_cache(cap=2)
+        mock_bounds.return_value = [50, 376]
+        ids = list(range(400))
+
+        cron_scope = "cron_job1:fp2"
+        cron_key = self._scoped_entry(pc, ids, 376, cron_scope)
+        pc.entries[cron_key] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 376
+        pc._slot_scope[0] = cron_scope
+
+        chat_scope = "webchat-sess:fp1"
+        chat_key = self._scoped_entry(pc, ids, 50, chat_scope)
+        pc.entries[chat_key] = 1
+        pc._populated_slots.add(1)
+        pc._slot_prefix_len[1] = 50
+        pc._slot_scope[1] = chat_scope
+        pc._protected.add(chat_scope)
+
+        # New interactive deepen needs a slot — should pick cron (unprotected LRU)
+        new_ids = list(range(500))
+        mock_bounds.return_value = [50, 100, 480]
+        prep = pc.prepare_inline_snap(new_ids, scope="webchat-new:fp1")
+        self.assertIsNotNone(prep)
+        slot, _ = prep
+        self.assertEqual(slot, 0)
+        self.assertEqual(pc._pending_evict_key, cron_key)
+
+        pc.confirm_inline_snap(slot, 480, new_ids, scope="webchat-new:fp1")
+        self.assertNotIn(cron_key, pc.entries)
+        self.assertTrue(pc.is_protected("webchat-new:fp1"))
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_abort_without_discard_keeps_pending_victim(self, mock_bounds):
+        pc = self._make_cache(cap=1)
+        mock_bounds.return_value = [50, 376]
+        ids = list(range(400))
+        scope = "sess-a"
+        entry_key = self._scoped_entry(pc, ids, 376, scope)
+        pc.entries[entry_key] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 376
+        pc._slot_scope[0] = scope
+        pc._protected.add(scope)
+
+        new_ids = list(range(500))
+        mock_bounds.return_value = [50, 100, 480]
+        prep = pc.prepare_inline_snap(new_ids, scope="sess-b")
+        self.assertIsNotNone(prep)
+        slot, _ = prep
+        self.assertEqual(pc._pending_evict_key, entry_key)
+
+        pc.abort_inline_snap(slot, scope="sess-b", discard_pending_victim=False)
+        self.assertIn(entry_key, pc.entries)
+        self.assertTrue(pc.is_protected(scope))
+        self.assertIsNone(pc._pending_evict_key)
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_lookup_miss_reason_evicted(self, mock_bounds):
+        pc = self._make_cache(cap=1)
+        mock_bounds.return_value = [50, 376]
+        ids = list(range(400))
+        # Cap full with another scope — this scope never committed
+        other = self._scoped_entry(pc, ids, 376, "other")
+        pc.entries[other] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 376
+        pc._slot_scope[0] = "other"
+
+        self.assertIsNone(pc.lookup(ids, scope="missing-sess"))
+        # reason logged; function still returns None
+
+    @patch("prefix_cache.find_all_boundaries_markers")
+    def test_prepare_reuses_own_scope_slot(self, mock_bounds):
+        pc = self._make_cache(cap=2)
+        mock_bounds.return_value = [50, 376]
+        ids = list(range(400))
+        scope = "sess-a"
+        key = self._scoped_entry(pc, ids, 376, scope)
+        pc.entries[key] = 1
+        pc._populated_slots.add(1)
+        pc._slot_prefix_len[1] = 376
+        pc._slot_scope[1] = scope
+        pc._protected.add(scope)
+
+        # Deepen to a new cut — must reuse slot 1, not steal slot 0
+        other = self._scoped_entry(pc, ids, 50, "cron_x:fp")
+        pc.entries[other] = 0
+        pc._populated_slots.add(0)
+        pc._slot_prefix_len[0] = 50
+        pc._slot_scope[0] = "cron_x:fp"
+
+        new_ids = list(range(500))
+        mock_bounds.return_value = [50, 100, 480]
+        prep = pc.prepare_inline_snap(new_ids, scope=scope)
+        self.assertEqual(prep, (1, 480))
+        self.assertIsNone(pc._pending_evict_key)
 
 
 if __name__ == "__main__":

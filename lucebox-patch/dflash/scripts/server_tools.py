@@ -1380,21 +1380,42 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
     async def _run_deferred_conv_snap_background(job: _DeferredConvSnapJob) -> None:
         scoped = not is_ephemeral_cache_scope(job.cache_scope)
-        try:
-            async with _daemon_request_lock(
-                "deferred-conv-snap",
-                max_wait=request_wall_timeout_seconds(),
-                scoped=scoped,
-                affinity_key=job.cache_scope,
-            ):
-                await _restart_daemon_if_dead()
-                await _execute_deferred_conv_snap_job(job)
-        except (DaemonBusyError, SlowLanePreempted):
-            prefix_cache.abort_inline_snap(job.conv_slot, scope=job.cache_scope)
-            print(
-                "  [pc] deferred conv snap skipped — daemon busy",
-                flush=True,
-            )
+        # Busy daemon / slow-lane preempt: retry with backoff so cold tool
+        # turns still get a thick pin instead of leaving the next N agent
+        # iterations on thick=-1.
+        delays = (0.0, 2.0, 5.0, 10.0)
+        last_busy: Exception | None = None
+        for attempt, delay in enumerate(delays):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                async with _daemon_request_lock(
+                    "deferred-conv-snap",
+                    max_wait=request_wall_timeout_seconds(),
+                    scoped=scoped,
+                    affinity_key=job.cache_scope,
+                ):
+                    await _restart_daemon_if_dead()
+                    await _execute_deferred_conv_snap_job(job)
+                    return
+            except (DaemonBusyError, SlowLanePreempted) as exc:
+                last_busy = exc
+                print(
+                    f"  [pc] deferred conv snap busy attempt={attempt + 1}/"
+                    f"{len(delays)} scope={job.cache_scope!r}",
+                    flush=True,
+                )
+        # Daemon never ran the snap — keep any LRU victim intact.
+        prefix_cache.abort_inline_snap(
+            job.conv_slot,
+            scope=job.cache_scope,
+            discard_pending_victim=False,
+        )
+        print(
+            "  [pc] deferred conv snap skipped — daemon busy after retries"
+            + (f" ({last_busy})" if last_busy else ""),
+            flush=True,
+        )
 
     def _schedule_deferred_conv_snap_jobs(jobs: list[_DeferredConvSnapJob]) -> None:
         for job in jobs:

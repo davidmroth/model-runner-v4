@@ -33,7 +33,7 @@ ARGS=(
   --bin "${BIN}"
   --max-ctx "${MAX_CTX}"
   --budget "${DFLASH_DDTREE_BUDGET:-22}"
-  --prefix-cache-slots "${DFLASH_PREFIX_CACHE_SLOTS:-2}"
+  --prefix-cache-slots "${DFLASH_PREFIX_CACHE_SLOTS:-4}"
   --prefill-cache-slots "${DFLASH_PREFILL_CACHE_SLOTS:-2}"
   --tool-split auto
   --tool-split-profile "${DFLASH_TOOL_SPLIT_PROFILE:-auto}"
