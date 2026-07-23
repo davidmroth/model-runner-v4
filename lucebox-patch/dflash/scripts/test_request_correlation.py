@@ -88,6 +88,16 @@ class OrphanMeterTests(unittest.TestCase):
             self.assertEqual(mock_print.call_count, 1)
             self.assertIn("demux_orphan", mock_print.call_args[0][0])
 
+    def test_after_collect_window_logs_distinct_event(self) -> None:
+        meter = OrphanFrameMeter(debounce_sec=0.0)
+        with patch.dict(os.environ, {"DFLASH_CORR_LOG": "1"}), patch(
+            "request_correlation.print"
+        ) as mock_print:
+            meter.mark_after_collect(window_sec=5.0)
+            meter.note(9, "tag")
+            self.assertEqual(meter.after_collect_orphans, 1)
+            self.assertIn("demux_orphan_after_collect", mock_print.call_args[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -142,7 +142,11 @@ from target_cache_admission import (
     stream_tagged_enabled,
     target_cache_slots,
 )
-from tagged_stream_demux import TaggedStreamDemux, format_req_command
+from tagged_stream_demux import (
+    StreamCollectOutcome,
+    TaggedStreamDemux,
+    format_req_command,
+)
 from request_correlation import (
     cmd_kind as corr_cmd_kind,
     log_corr,
@@ -886,6 +890,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         use_stops: bool = True,
         quantum: int | None = None,
         cache_scope: str | None = None,
+        outcome: StreamCollectOutcome | None = None,
     ) -> AsyncIterator[int]:
         """Register (if tagged), write command, yield tokens as they arrive.
 
@@ -905,6 +910,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
           live remaining is exhausted, so peer admits wait).
         - ``step`` — loop ``SCHED_STEP`` so the daemon returns to stdin between
           quanta and peers can be admitted / interleaved.
+
+        When admitted, demux uses ``admit_hold`` so short continue/post-token
+        idles cannot end the HTTP collect while SCHED is still live. Pass
+        ``outcome`` to surface truncation (Phase A).
         """
         req_id: int | None = None
         queue = None
@@ -940,6 +949,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         t0 = time.monotonic()
         tokens_seen = 0
         first_ids: list[int] = []
+        collect = outcome if outcome is not None else StreamCollectOutcome()
         try:
             if tagged_demux is None:
                 drain_pipe_residual(r_pipe)
@@ -971,6 +981,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         )
                         return
                     rem = parse_sched_admit_remaining(admit)
+                    collect.admit_remaining = rem
                     log_corr(
                         "admit_ok",
                         scope=cache_scope,
@@ -1059,6 +1070,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     gen_len,
                     stops,
                     wall_timeout=wall_timeout,
+                    admit_hold=use_admit,
+                    outcome=collect,
                     queue=queue,
                 ):
                     if tokens_seen < 12:
@@ -1090,6 +1103,27 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 first_text=summary.get("first_text"),
             )
         finally:
+            # Prefer live count if gen_first never ran (aclose / cancel mid-stream).
+            if collect.generated == 0 and tokens_seen > 0:
+                collect.generated = tokens_seen
+            if collect.is_truncated:
+                print(
+                    f"  [handler] stream_truncation req={req_id} "
+                    f"generated={collect.generated} "
+                    f"remaining={collect.admit_remaining} "
+                    f"reason={collect.end_reason}",
+                    flush=True,
+                )
+                log_corr(
+                    "stream_truncation",
+                    scope=cache_scope,
+                    slot=slot,
+                    req_id=req_id,
+                    generated=collect.generated,
+                    remaining=collect.admit_remaining,
+                    reason=collect.end_reason,
+                    elapsed_s=time.monotonic() - t0,
+                )
             # Stop the step pump (or finish the drain kick) before CANCEL so we
             # do not race a SCHED_* write against teardown.
             sched_stop.set()
@@ -1106,21 +1140,30 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             # ends — if demux stopped early (stop id / idle), leftover remaining
             # must not keep SCHED_* orphan-decoding into an unsubscribed pipe.
             if use_admit and req_id is not None:
+                cancel_reason = (
+                    "after_collect_truncation"
+                    if collect.is_truncated
+                    else "after_collect"
+                )
                 try:
                     async with daemon_stdin_lock:
                         daemon_proc.stdin.write(f"CANCEL {int(req_id)}\n".encode())
                         daemon_proc.stdin.flush()
                     print(
-                        f"  [handler] CANCEL req={req_id} after generate collect",
+                        f"  [handler] CANCEL req={req_id} {cancel_reason}",
                         flush=True,
                     )
+                    if collect.is_truncated and tagged_demux is not None:
+                        tagged_demux.mark_after_collect_cancel()
                     log_corr(
                         "cancel",
                         scope=cache_scope,
                         slot=slot,
                         req_id=req_id,
-                        reason="after_collect",
+                        reason=cancel_reason,
                         elapsed_s=time.monotonic() - t0,
+                        generated=collect.generated,
+                        remaining=collect.admit_remaining,
                     )
                 except Exception as exc:
                     print(
@@ -1145,6 +1188,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         use_stops: bool = True,
         quantum: int | None = None,
         cache_scope: str | None = None,
+        outcome: StreamCollectOutcome | None = None,
     ) -> list[int]:
         """Collect all tokens from ``_aiter_via_daemon`` (non-live / buffered path)."""
         async def _collect() -> list[int]:
@@ -1157,6 +1201,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     use_stops=use_stops,
                     quantum=quantum,
                     cache_scope=cache_scope,
+                    outcome=outcome,
                 )
             ]
 
@@ -2527,6 +2572,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         lock_wait = chat_stream_lock_wait_seconds(scoped=scoped, lane=lane)
         chat_label = "chat-slow" if lane == "slow" else "chat"
         deferred_job: _DeferredConvSnapJob | None = None
+        collect_outcome = StreamCollectOutcome()
         try:
             async with _daemon_request_lock(
                 chat_label,
@@ -2571,9 +2617,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         wall_timeout=wall_timeout_sec,
                         quantum=schedule_quantum_for(lane=lane, scoped=scoped),
                         cache_scope=cache_scope,
+                        outcome=collect_outcome,
                     )
                     await bus.drain_timings()
-                    snap_ok = True
+                    snap_ok = not collect_outcome.is_truncated
                 except asyncio.CancelledError:
                     await _finalize_request_snaps(
                         full_snap_prep=full_snap_prep,
@@ -2658,6 +2705,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
         # the whole completion into reasoning-only.
         cleaned, reasoning = parse_reasoning(
             cleaned, thinking_enabled=started_in_thinking)
+
+        if collect_outcome.is_truncated:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": (
+                            "Generation truncated before DONE "
+                            f"(reason={collect_outcome.end_reason}, "
+                            f"generated={collect_outcome.generated}, "
+                            f"remaining={collect_outcome.admit_remaining})"
+                        ),
+                        "type": "server_error",
+                        "code": "stream_truncation",
+                    }
+                },
+                status_code=500,
+            )
 
         msg: dict = {"role": "assistant"}
         finish_reason = "stop"
@@ -2825,6 +2889,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 HOLDBACK = max(tag_holdback, stop_holdback)
                 stop_hit = False
                 aborted = False
+                stream_truncated = False
+                collect_outcome = StreamCollectOutcome()
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + wall_timeout_sec
 
@@ -2971,6 +3037,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                         wall_timeout=wall_timeout_sec,
                         quantum=quantum,
                         cache_scope=cache_scope,
+                        outcome=collect_outcome,
                     ).__aiter__()
                     anext_task: asyncio.Task = asyncio.create_task(
                         token_aiter.__anext__()
@@ -3020,6 +3087,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                                 wall_timeout=wall_timeout_sec,
                                 quantum=quantum,
                                 cache_scope=cache_scope,
+                                outcome=collect_outcome,
                             ),
                             timeout=request_hard_ceiling_seconds(),
                         )
@@ -3061,6 +3129,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             break
 
                 try:
+                    if (
+                        not aborted
+                        and not stop_hit
+                        and collect_outcome.is_truncated
+                    ):
+                        stream_truncated = True
+                        finish_reason = "error"
+
                     if not stop_hit:
                         # Flush held U+FFFD / incomplete emoji (skip on stop trim).
                         tail = detok.finish()
@@ -3086,6 +3162,35 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                             yield f"data: {json.dumps(usage_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
                         await _complete_request(success=not aborted)
+                        return
+
+                    if stream_truncated:
+                        # Visible non-success finish — never pretend a truncated
+                        # admit collect completed cleanly (Phase A).
+                        await _complete_request(success=False)
+                        if mode == "reasoning" and window:
+                            out = emit_delta(window, "reasoning_content")
+                            if out:
+                                yield out
+                        elif mode == "content" and window:
+                            out = emit_delta(window, "content")
+                            if out:
+                                yield out
+                        err = {
+                            "error": {
+                                "message": (
+                                    "Generation truncated before DONE "
+                                    f"(reason={collect_outcome.end_reason}, "
+                                    f"generated={collect_outcome.generated}, "
+                                    f"remaining={collect_outcome.admit_remaining})"
+                                ),
+                                "type": "server_error",
+                                "code": "stream_truncation",
+                            }
+                        }
+                        yield f"data: {json.dumps(err)}\n\n"
+                        yield f"data: {json.dumps(chunk({}, finish='error'))}\n\n"
+                        yield "data: [DONE]\n\n"
                         return
 
                     if mode == "reasoning" and window:

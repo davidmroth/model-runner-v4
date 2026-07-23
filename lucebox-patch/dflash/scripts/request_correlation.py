@@ -133,21 +133,33 @@ class OrphanFrameMeter:
         self._dropped = 0
         self._last_req: int | None = None
         self._last_kind: str | None = None
+        # Phase A: orphans that arrive shortly after CANCEL after_collect.
+        self._after_collect_until = 0.0
+        self.after_collect_orphans = 0
+
+    def mark_after_collect(self, *, window_sec: float = 5.0) -> None:
+        """Arm a short window where orphan drops count as after-collect."""
+        self._after_collect_until = time.monotonic() + max(0.0, float(window_sec))
 
     def note(self, req_id: int, kind: str) -> None:
         self._dropped += 1
         self._last_req = int(req_id)
         self._last_kind = kind
+        now = time.monotonic()
+        after_collect = now < self._after_collect_until
+        if after_collect:
+            self.after_collect_orphans += 1
         if not corr_log_enabled():
             return
-        now = time.monotonic()
         if self._debounce > 0 and (now - self._last_log) < self._debounce:
             return
         self._last_log = now
+        event = "demux_orphan_after_collect" if after_collect else "demux_orphan"
         log_corr(
-            "demux_orphan",
+            event,
             req_id=self._last_req,
             kind=self._last_kind,
             dropped=self._dropped,
+            after_collect_total=self.after_collect_orphans if after_collect else None,
         )
         self._dropped = 0
