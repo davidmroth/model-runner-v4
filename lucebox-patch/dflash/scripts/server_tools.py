@@ -2320,11 +2320,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
             async def sse_vision() -> AsyncIterator[str]:
                 nonlocal completion_tokens, finish_reason, admission
+                vision_req: int | None = None
+                vision_q = None
                 try:
                     await _restart_daemon_if_dead()
-                    drain_pipe_residual(r_pipe)
+                    # Under --stream-tagged the demux owns r_pipe. Dual-reading
+                    # it (drain + async_iter_pipe_tokens) desyncs frames and
+                    # feeds garbage ids into detok → OverflowError / incomplete
+                    # chunked responses for *all* concurrent streams.
+                    if tagged_demux is not None:
+                        vision_req = tagged_demux.alloc_req_id()
+                        vision_q = await tagged_demux.register(vision_req)
+                    else:
+                        drain_pipe_residual(r_pipe)
                     bus.begin_request()
-                    _write_daemon_cmd(cmd_line)
+                    await _write_daemon_cmd_async(cmd_line, req_id=vision_req)
 
                     stops = normalize_stop(req.stop)
                     wall_timeout_sec = request_wall_timeout_seconds()
@@ -2341,12 +2351,26 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     text_buf = ""
                     detok = IncrementalDetokenizer(
                         tokenizer, skip_special_tokens=True)
-                    async for tok_id in async_iter_pipe_tokens(
-                        r_pipe,
-                        gen_len,
-                        bus=bus,
-                        wall_timeout=wall_timeout_sec,
-                    ):
+
+                    async def _vision_tokens() -> AsyncIterator[int]:
+                        if tagged_demux is not None and vision_req is not None:
+                            async for t in tagged_demux.iter_tokens(
+                                vision_req,
+                                gen_len,
+                                wall_timeout=wall_timeout_sec,
+                                queue=vision_q,
+                            ):
+                                yield t
+                        else:
+                            async for t in async_iter_pipe_tokens(
+                                r_pipe,
+                                gen_len,
+                                bus=bus,
+                                wall_timeout=wall_timeout_sec,
+                            ):
+                                yield t
+
+                    async for tok_id in _vision_tokens():
                         completion_tokens += 1
                         piece = detok.push(tok_id)
                         if not piece:
@@ -2387,6 +2411,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 finally:
+                    if tagged_demux is not None and vision_req is not None:
+                        await tagged_demux.unregister(vision_req)
                     _exit_daemon_admission(admission)
                     admission = None
                     _cleanup()
@@ -2402,24 +2428,31 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                 lane=lane,
             ):
                 await _restart_daemon_if_dead()
-                drain_pipe_residual(r_pipe)
+                vision_req: int | None = None
+                vision_q = None
+                if tagged_demux is not None:
+                    vision_req = tagged_demux.alloc_req_id()
+                    vision_q = await tagged_demux.register(vision_req)
+                else:
+                    drain_pipe_residual(r_pipe)
                 bus.begin_request()
-                _write_daemon_cmd(cmd_line)
+                await _write_daemon_cmd_async(cmd_line, req_id=vision_req)
 
                 # Multimodal uses AR decode: tokens hit the pipe before the
                 # ``ok N=… gen=…`` line. Read concurrently (same as text chat);
                 # do not await ``ok`` first or completion_tokens stays 0.
                 wall_timeout_sec = request_wall_timeout_seconds()
-                tokens = await asyncio.to_thread(
-                    lambda: list(
-                        iter_pipe_tokens(
-                            r_pipe,
-                            gen_len,
-                            bus=bus,
-                            wall_timeout=wall_timeout_sec,
-                        )
-                    ),
-                )
+                try:
+                    tokens = await _collect_gen_tokens(
+                        gen_len,
+                        req_id=vision_req,
+                        wall_timeout=wall_timeout_sec,
+                        use_stops=False,
+                        queue=vision_q,
+                    )
+                finally:
+                    if tagged_demux is not None and vision_req is not None:
+                        await tagged_demux.unregister(vision_req)
                 await bus.drain_timings()
 
                 text = tokenizer.decode(tokens, skip_special_tokens=True)

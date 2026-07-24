@@ -117,6 +117,9 @@ def iter_pipe_tokens(
         tok_id = struct.unpack("<i", b)[0]
         if tok_id == -1:
             break
+        if tok_id < 0:
+            # Tag marker / CONTINUE / other sentinels — never vocab.
+            continue
         if tok_id in stops:
             continue
         generated += 1
@@ -154,6 +157,8 @@ async def async_iter_pipe_tokens(
         tok_id = struct.unpack("<i", b)[0]
         if tok_id == -1:
             break
+        if tok_id < 0:
+            continue
         if tok_id in stops:
             continue
         generated += 1

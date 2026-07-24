@@ -28,17 +28,56 @@ def stable_detokenized_prefix(text: str) -> str:
 class IncrementalDetokenizer:
     """Push token ids; receive only newly stable Unicode text."""
 
-    def __init__(self, tokenizer: Any, *, skip_special_tokens: bool = True) -> None:
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        skip_special_tokens: bool = True,
+        max_token_id: int | None = None,
+    ) -> None:
         self._tokenizer = tokenizer
         self._skip_special = skip_special_tokens
         self._ids: list[int] = []
         self._emitted = ""
+        # When set, ids outside ``[0, max_token_id]`` are skipped (demux
+        # cross-talk / bare-pipe tag frames must not crash ASGI streams).
+        if max_token_id is not None:
+            self._max_token_id = int(max_token_id)
+        else:
+            self._max_token_id = self._infer_max_token_id(tokenizer)
+
+    @staticmethod
+    def _infer_max_token_id(tokenizer: Any) -> int | None:
+        for attr in ("vocab_size", "get_vocab_size"):
+            try:
+                val = getattr(tokenizer, attr)
+                n = int(val() if callable(val) else val)
+            except Exception:
+                continue
+            if n > 0:
+                return n - 1
+        return None
+
+    def _is_vocab_id(self, tok_id: int) -> bool:
+        if tok_id < 0:
+            return False
+        if self._max_token_id is not None and tok_id > self._max_token_id:
+            return False
+        return True
 
     def push(self, tok_id: int) -> str:
-        self._ids.append(int(tok_id))
-        full = self._tokenizer.decode(
-            self._ids, skip_special_tokens=self._skip_special
-        )
+        tid = int(tok_id)
+        if not self._is_vocab_id(tid):
+            return ""
+        self._ids.append(tid)
+        try:
+            full = self._tokenizer.decode(
+                self._ids, skip_special_tokens=self._skip_special
+            )
+        except (OverflowError, ValueError, TypeError):
+            # Drop the bad id that rust/HF rejected and keep streaming.
+            self._ids.pop()
+            return ""
         stable = stable_detokenized_prefix(full)
         if not stable.startswith(self._emitted):
             # Prefix invalidated (should be rare if we always withhold U+FFFD).
@@ -59,9 +98,12 @@ class IncrementalDetokenizer:
         """Flush any remaining text, including unresolved U+FFFD at EOS."""
         if not self._ids:
             return ""
-        full = self._tokenizer.decode(
-            self._ids, skip_special_tokens=self._skip_special
-        )
+        try:
+            full = self._tokenizer.decode(
+                self._ids, skip_special_tokens=self._skip_special
+            )
+        except (OverflowError, ValueError, TypeError):
+            return ""
         if full.startswith(self._emitted):
             delta = full[len(self._emitted) :]
         else:

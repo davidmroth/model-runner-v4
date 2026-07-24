@@ -1,6 +1,6 @@
 # Stream finish reliability plan
 
-**Status:** Phase A+B implemented (visible truncation + admit-hold between quanta)  
+**Status:** Phase A+B shipped; vision dual-read fix in progress (incomplete-chunked under load)  
 **Home:** Engine (`model-runner-v4` / lucebox)  
 **Trigger chats:** `1492af52-…`, `77441680-…`  
 **Related:** sticky thick pins (shipped), multi-request quantum admit, `tagged_stream_demux`, SSE keepalives (`DFLASH_SSE_KEEPALIVE_SEC`)

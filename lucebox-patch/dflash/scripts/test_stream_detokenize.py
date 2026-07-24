@@ -63,6 +63,27 @@ class IncrementalDetokenizerTests(unittest.TestCase):
         # At EOS, flush whatever decode returns (true garbage / truncated).
         self.assertEqual(dec.finish(), "\ufffd")
 
+    def test_negative_and_oob_ids_skipped(self):
+        tok = FakeByteFallbackTokenizer({(10,): "H", (10, 11): "Hi"})
+        dec = IncrementalDetokenizer(tok, max_token_id=100)
+        self.assertEqual(dec.push(-2), "")  # tag marker
+        self.assertEqual(dec.push(10**12), "")  # overflow-class id
+        self.assertEqual(dec.push(10), "H")
+        self.assertEqual(dec.push(11), "i")
+
+    def test_overflow_from_tokenizer_does_not_raise(self):
+        class BoomTok:
+            def decode(self, ids, skip_special_tokens=True):
+                if any(i > 40 for i in ids):
+                    raise OverflowError("out of range integral type conversion attempted")
+                return "x" * len(ids)
+
+        # No vocab_size → cannot pre-filter; decode OverflowError must be caught.
+        dec = IncrementalDetokenizer(BoomTok(), max_token_id=None)
+        self.assertEqual(dec.push(1), "x")
+        self.assertEqual(dec.push(99), "")  # caught, prior state kept
+        self.assertEqual(dec.push(2), "x")
+
 
 if __name__ == "__main__":
     unittest.main()
